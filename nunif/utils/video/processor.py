@@ -227,7 +227,7 @@ def _process_video(
         raise ValueError("No video stream")
 
     if start_time is not None:
-        input_container.seek(start_time * av.time_base, backward=True, any_frame=False)
+        input_container.seek(int(start_time * av.time_base), backward=True, any_frame=False)
 
     video_input_stream = input_container.streams.video[0]
     video_input_stream.thread_type = "AUTO"
@@ -594,7 +594,7 @@ def hook_frame(
         raise ValueError("No video stream")
 
     if start_time is not None:
-        input_container.seek(start_time * av.time_base, backward=True, any_frame=False)
+        input_container.seek(int(start_time * av.time_base), backward=True, any_frame=False)
 
     video_input_stream = input_container.streams.video[0]
     video_input_stream.thread_type = "AUTO"
@@ -858,7 +858,7 @@ def export_audio(
         return False
 
     if start_time is not None:
-        input_container.seek(start_time * av.time_base, backward=True, any_frame=False)
+        input_container.seek(int(start_time * av.time_base), backward=True, any_frame=False)
 
     audio_input_stream = input_container.streams.audio[0]
     output_container = av.open(output_path, "w")  # expect .m4a
