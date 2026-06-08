@@ -16,6 +16,8 @@ if "%TORCH_VER%" == "2.7.1" (
   set TRITON_WINDOWS="triton-windows<3.4"
 ) else if "%TORCH_VER%" == "2.9.1" (
   set TRITON_WINDOWS="triton-windows<3.6"
+) else if "%TORCH_VER%" == "2.12.0" (
+  set TRITON_WINDOWS="triton-windows<3.8"
 ) else (
   echo Unsupported pytorch version: %TORCH_VER%
   goto on_error
