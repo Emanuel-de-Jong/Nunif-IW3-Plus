@@ -50,11 +50,17 @@ do
     output_file="${output_dir}/batch.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --max-workers 2 --batch-size 2 ${COMMON_OPTIONS} ${extra_args}
 
+    output_file="${output_dir}/batch_yuv420p10le.mkv"
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --max-workers 2 --batch-size 2 --pix-fmt yuv420p10le ${COMMON_OPTIONS} ${extra_args}
+
     output_file="${output_dir}/batch_cuda.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --max-workers 2 --batch-size 2 --cuda-stream ${COMMON_OPTIONS} ${extra_args}
 
     output_file="${output_dir}/low_vram.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --low-vram ${COMMON_OPTIONS} ${extra_args}
+
+    output_file="${output_dir}/low_vram_yuv420p10le.mkv"
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --low-vram --pix-fmt yuv420p10le ${COMMON_OPTIONS} ${extra_args}
 
     output_file="${output_dir}/batch_ema.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --max-workers 2 --batch-size 2 --cuda-stream --ema-normalize ${COMMON_OPTIONS} ${extra_args}
@@ -64,6 +70,9 @@ do
 
     output_file="${output_dir}/vda.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_S --ema-normalize --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} ${COMMON_OPTIONS} ${extra_args}
+
+    output_file="${output_dir}/vda_yuv420p10le.mkv"
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_S --ema-normalize --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} --pix-fmt yuv420p10le ${COMMON_OPTIONS} ${extra_args}
 
     output_file="${output_dir}/inpaint_batch.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_S --method mlbw_l2_inpaint --ema-normalize --ema-buffer 30 --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} ${COMMON_OPTIONS} ${extra_args}
@@ -89,11 +98,14 @@ done
 
 output_files=(
     batch.mkv
+    batch_yuv420p10le.mkv
     batch_cuda.mkv
     low_vram.mkv
+    low_vram_yuv420p10le.mkv
     batch_ema.mkv
     low_vram_ema.mkv
     vda.mkv
+    vda_yuv420p10le.mkv
     inpaint_batch.mkv
     inpaint_vda.mkv
 )
