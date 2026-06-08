@@ -605,11 +605,11 @@ class MainFrame(wx.Frame):
 
         self.lbl_max_workers = wx.StaticText(self.grp_processor, label=T("Worker Threads"))
         self.cbo_max_workers = wx.ComboBox(self.grp_processor,
-                                           choices=[str(n) for n in (16, 8, 4, 3, 2, 0)],
+                                           choices=[str(n) for n in (16, 8, 4, 3, 2, 1, 0)],
                                            name="cbo_max_workers")
         self.cbo_max_workers.SetEditable(False)
         self.cbo_max_workers.SetToolTip(T("Video Only"))
-        self.cbo_max_workers.SetSelection(5)
+        self.cbo_max_workers.SetSelection(6)
 
         self.chk_low_vram = wx.CheckBox(self.grp_processor, label=T("Low VRAM"), name="chk_low_vram")
         self.chk_tta = wx.CheckBox(self.grp_processor, label=T("TTA"), name="chk_tta")
