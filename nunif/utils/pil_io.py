@@ -303,7 +303,7 @@ def save_image(im, filename, format="png",
         # TODO: gamma
         options = {
             "icc_profile": icc_profile,
-            "quality": 95,
+            "quality": 20,
             "method": 4,
             "lossless": True
         }
