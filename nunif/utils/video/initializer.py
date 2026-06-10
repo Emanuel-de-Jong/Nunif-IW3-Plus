@@ -35,6 +35,8 @@ def pyav_init_cuda_primary_context(max_devices=16):
     This is required to use the primary context.
     Otherwise, stream synchronization with NVDEC is not possible.
     """
+    import sys
+
     import numpy as np
     import torch
 
@@ -44,9 +46,18 @@ def pyav_init_cuda_primary_context(max_devices=16):
         return
 
     try:
+        codec = None
+        for cond in ["libx264", "libopenh264", "h264_nvenc"]:
+            if cond in av.codecs_available:
+                codec = cond
+                break
+        if codec is None:
+            print("pyav_init_cuda_primary_context: Unable to find an available H.264 codec", file=sys.stderr)
+            return
+
         output_buffer = io.BytesIO()
         with av.open(output_buffer, mode="w", format="mp4") as container:
-            stream = container.add_stream("libopenh264", rate=1)
+            stream = container.add_stream(codec, rate=1)
             stream.width = 64
             stream.height = 64
             stream.pix_fmt = "yuv420p"
@@ -64,6 +75,7 @@ def pyav_init_cuda_primary_context(max_devices=16):
                 for packet in container.demux(container.streams.video[0]):
                     for frame in packet.decode():
                         pass
+
     except:  # noqa
         pass
 
