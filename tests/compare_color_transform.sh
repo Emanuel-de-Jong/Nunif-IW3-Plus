@@ -22,7 +22,7 @@ OUTPUT2_DIR="${SCRIPT_DIR}/data/compare_color_transform/repo2"
 
 CURRENT_AV_VERSION=$(pip show av | grep Version | awk '{print $2}')
 REPO1_AV="av==15.1.0"
-REPO2_AV="av==17.0.1"
+REPO2_AV="av==17.1.0"
 
 
 IW3_OPTIONS=(-i "${VIDEO_PATH}" --yes --half-sbs --method row_flow_v3 --depth-model Any_V2_S --batch-size 2 --max-workers 2 --cuda-stream)
