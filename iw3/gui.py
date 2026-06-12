@@ -1093,6 +1093,21 @@ class MainFrame(wx.Frame):
                 output_path = path.join(output_path, basename, export_config.FILENAME)
             else:
                 output_path = path.join(output_path, export_config.FILENAME)
+        elif is_yaml(args.input):
+            if is_output_dir(output_path):
+                config = export_config.ExportConfig.load(input_path)
+                if config.type == export_config.VIDEO_TYPE:
+                    base_dir = path.dirname(args.input)
+                    basename = config.basename or path.basename(base_dir)
+                    output_path = path.join(
+                        args.output,
+                        make_output_filename(basename, args, video=True))
+                else:
+                    # image folder
+                    return True
+            else:
+                output_path = output_path
+                resume = False
         else:
             if is_output_dir(output_path):
                 output_path = path.join(
