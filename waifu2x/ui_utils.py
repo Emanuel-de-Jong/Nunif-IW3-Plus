@@ -21,6 +21,7 @@ from .model_dir import MODEL_DIR
 from .download_models import main as download_main
 
 
+IMAGE_IO_QUEUE_MAX = 16
 DEFAULT_ART_MODEL_DIR = path.join(MODEL_DIR, "swin_unet", "art")
 DEFAULT_ART_SCAN_MODEL_DIR = path.join(MODEL_DIR, "swin_unet", "art_scan")
 DEFAULT_PHOTO_MODEL_DIR = path.join(MODEL_DIR, "swin_unet", "photo")
@@ -73,7 +74,7 @@ def process_image(ctx, im, meta, args):
 
 def process_images(ctx, files, output_dir, args, title=None):
     os.makedirs(output_dir, exist_ok=True)
-    loader = ImageLoader(files=files, max_queue_size=128,
+    loader = ImageLoader(files=files, max_queue_size=IMAGE_IO_QUEUE_MAX,
                          load_func=IL.load_image,
                          load_func_kwargs={"color": "rgb", "keep_alpha": True,
                                            "exif_transpose": not args.disable_exif_transpose})
@@ -82,6 +83,11 @@ def process_images(ctx, files, output_dir, args, title=None):
         tqdm_fn = args.state["tqdm_fn"] or tqdm
         pbar = tqdm_fn(ncols=80, total=len(files), desc=title)
         for im, meta in loader:
+            if len(futures) >= IMAGE_IO_QUEUE_MAX:
+                for _ in range(IMAGE_IO_QUEUE_MAX // 2):
+                    f = futures.pop(0)
+                    f.result()
+
             output_filename = path.join(
                 output_dir,
                 make_output_filename(meta["filename"], args, video=False))
