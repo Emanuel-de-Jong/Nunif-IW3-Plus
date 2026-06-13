@@ -65,7 +65,7 @@ def autocast(device, dtype=None, enabled=True):
     elif device_is_mps(device):
         # TODO: Test on macOS
         amp_device_type = "mps"
-        amp_dtype = torch.bfloat16
+        amp_dtype = torch.float16
         enabled = False
     else:
         # For CUDA, MPS, XPU, and unknown devices, this passes through to the standard PyTorch implementation.
