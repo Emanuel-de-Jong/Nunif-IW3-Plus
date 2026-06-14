@@ -716,8 +716,6 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
 
 
 def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
-    depth_lock = threading.RLock()
-    sbs_lock = threading.RLock()
     enqueue_ticket_lock = TicketLock()
     dequeue_ticket_lock = TicketLock()
     streams = threading.local()
@@ -728,17 +726,17 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
     def _postprocess(depth_batch, reset_ema, dequeue_ticket_id, flush, device):
         # Reorder threads
         with dequeue_ticket_lock(dequeue_ticket_id):
-            with depth_lock:
-                if flush:
-                    depth_list = depth_model.flush_minmax_normalize()
-                else:
-                    depth_list = depth_model.minmax_normalize(depth_batch, reset_ema=reset_ema)
+            if flush:
+                depth_list = depth_model.flush_minmax_normalize()
+            else:
+                depth_list = depth_model.minmax_normalize(depth_batch, reset_ema=reset_ema)
 
             for depths in chunks(depth_list, args.batch_size):
                 if isinstance(depths, list):
-                    depths = torch.stack([depth.to(device) for depth in depths])
+                    depths = torch.stack(depths).to(device)
                 else:
                     depths = depths.to(device)
+
                 if frame_cpu_offload:
                     x_srcs = []
                     pts = []
@@ -751,19 +749,20 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                     x_srcs, pts = src_queue.pop(0)
                 reset_pts = [t in segment_pts for t in pts]
 
-                with sbs_lock:  # TODO: unclear whether this is actually needed
-                    if args.rgbd or args.half_rgbd:
-                        left_eyes, right_eyes = apply_rgbd(x_srcs, depths, mapper=args.mapper)
-                    else:
-                        if args.method in {"forward_fill", "forward"}:
-                            # lock all threads (sbs_lock -> ticket_lock -> depth_lock order)
-                            with enqueue_ticket_lock, dequeue_ticket_lock, depth_lock:
-                                left_eyes, right_eyes = apply_divergence(depths, x_srcs, args, side_model, reset_pts=reset_pts)
-                        else:
-                            left_eyes, right_eyes = apply_divergence(depths, x_srcs, args, side_model, reset_pts=reset_pts)
+                if args.rgbd or args.half_rgbd:
+                    left_eyes, right_eyes = apply_rgbd(x_srcs, depths, mapper=args.mapper)
+                else:
+                    left_eyes, right_eyes = apply_divergence(depths, x_srcs, args, side_model, reset_pts=reset_pts)
 
-                for i in range(left_eyes.shape[0]):
-                    yield postprocess_image(left_eyes[i], right_eyes[i], args)
+                if left_eyes is not None:
+                    for i in range(left_eyes.shape[0]):
+                        yield postprocess_image(left_eyes[i], right_eyes[i], args)
+
+            if flush and hasattr(side_model, "flush"):
+                left_eyes, right_eyes = side_model.flush(enable_amp=not args.disable_amp)
+                if left_eyes is not None:
+                    for i in range(left_eyes.shape[0]):
+                        yield postprocess_image(left_eyes[i], right_eyes[i], args)
 
     def _batch_infer(x, pts, flush, enqueue_ticket_id):
         # Reorder threads
@@ -777,10 +776,9 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                 else:
                     src_queue.append((x, pts))
 
-        if flush:
-            return None, dequeue_ticket_id
-        else:
-            with depth_lock:
+            if flush:
+                return None, dequeue_ticket_id
+            else:
                 depth_batch = depth_model.infer(x, tta=args.tta, low_vram=args.low_vram,
                                                 enable_amp=not args.disable_amp,
                                                 edge_dilation=args.edge_dilation,
@@ -815,19 +813,25 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                 with torch.cuda.device(x.device), torch.cuda.stream(stream):
                     depth_batch, dequeue_ticket_id = _batch_infer(
                         x, pts, flush=flush, enqueue_ticket_id=enqueue_ticket_id)
+                    results = _postprocess(
+                        depth_batch, reset_ema,
+                        dequeue_ticket_id=dequeue_ticket_id,
+                        flush=flush,
+                        device=device
+                    )
+                    frames = [frame for frame in results]
                     stream.synchronize()
             else:
                 depth_batch, dequeue_ticket_id = _batch_infer(
                     x, pts, flush=flush, enqueue_ticket_id=enqueue_ticket_id)
-
-            results = _postprocess(
-                depth_batch, reset_ema,
-                dequeue_ticket_id=dequeue_ticket_id,
-                flush=flush,
-                device=device
-            )
-            # Run the generator in the worker thread and return the result.
-            return [frame for frame in results]
+                results = _postprocess(
+                    depth_batch, reset_ema,
+                    dequeue_ticket_id=dequeue_ticket_id,
+                    flush=flush,
+                    device=device
+                )
+                frames = [frame for frame in results]
+            return frames
 
     def _preprocess(x, pts, flush):
         enqueue_ticket_id = enqueue_ticket_lock.new_ticket()
@@ -970,8 +974,6 @@ def save_scene_cache(video_path, segment_pts, args):
 def process_video_full(input_filename, output_path, args, depth_model, side_model):
     use_16bit = VU.pix_fmt_requires_16bit(args.pix_fmt)
     is_video_depth_anything = depth_model.get_name() == "VideoDepthAnything"
-    is_video_depth_anything_streaming = depth_model.get_name() == "VideoDepthAnythingStreaming"
-    is_inpaint_model = args.method in {"forward_inpaint", "mlbw_l2_inpaint", "monobw_inpaint"}
     ema_normalize = args.ema_normalize and args.max_fps >= 15
     if ema_normalize:
         depth_model.enable_ema(decay=args.ema_decay, buffer_size=args.ema_buffer)
@@ -1101,7 +1103,7 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
                 disable_software_fallback=args.disable_software_fallback,
             )
 
-    elif args.low_vram or args.debug_depth or is_video_depth_anything_streaming or is_inpaint_model:
+    elif args.low_vram or args.debug_depth:
         with depth_model.compile_context(enabled=args.compile), try_compile_context(side_model, enabled=args.compile):
             VU.process_video(
                 input_filename, output_filename,
