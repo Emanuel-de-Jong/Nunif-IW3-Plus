@@ -50,6 +50,9 @@ do
     output_file="${output_dir}/batch.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --max-workers 2 --batch-size 2 ${COMMON_OPTIONS} ${extra_args}
 
+    output_file="${output_dir}/batch_forward_fill.mkv"  # Use `max_workers=1` to prevent deadlocks in old code
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --method forward_fill --max-workers 1 --batch-size 2 ${COMMON_OPTIONS} ${extra_args}
+
     output_file="${output_dir}/batch_yuv420p10le.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model Any_V2_S --max-workers 2 --batch-size 2 --pix-fmt yuv420p10le ${COMMON_OPTIONS} ${extra_args}
 
@@ -74,11 +77,20 @@ do
     output_file="${output_dir}/vda_yuv420p10le.mkv"
     python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_S --ema-normalize --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} --pix-fmt yuv420p10le ${COMMON_OPTIONS} ${extra_args}
 
+    output_file="${output_dir}/vda_stream.mkv"
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_Stream_S --ema-normalize --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} ${COMMON_OPTIONS} ${extra_args}
+
+    output_file="${output_dir}/vda_stream_yuv420p10le.mkv"
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_Stream_S --ema-normalize --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} --pix-fmt yuv420p10le ${COMMON_OPTIONS} ${extra_args}
+
     output_file="${output_dir}/inpaint_batch.mkv"
-    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_S --method mlbw_l2_inpaint --ema-normalize --ema-buffer 30 --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} ${COMMON_OPTIONS} ${extra_args}
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_S --method mlbw_l2_inpaint --inpaint-max-width 1920 --ema-normalize --ema-buffer 30 --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} ${COMMON_OPTIONS} ${extra_args}
 
     output_file="${output_dir}/inpaint_vda.mkv"
-    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_S  --method mlbw_l2_inpaint --ema-normalize  --ema-buffer 30 --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} ${COMMON_OPTIONS} ${extra_args}
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_S  --method mlbw_l2_inpaint --inpaint-max-width 1920 --ema-normalize  --ema-buffer 30 --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} ${COMMON_OPTIONS} ${extra_args}
+
+    output_file="${output_dir}/inpaint_vda_stream.mkv"
+    python -m iw3.cli -y -i ${VIDEO_PATH} -o ${output_file} --depth-model VDA_Stream_S  --method mlbw_l2_inpaint --inpaint-max-width 1920 --ema-normalize  --ema-buffer 30 --batch-size 2 --scene-detect --scene-cache-dir ${CACHE_DIR} ${COMMON_OPTIONS} ${extra_args}
 
     # export
 
@@ -98,6 +110,7 @@ done
 
 output_files=(
     batch.mkv
+    batch_forward_fill.mkv
     batch_yuv420p10le.mkv
     batch_cuda.mkv
     low_vram.mkv
@@ -106,8 +119,11 @@ output_files=(
     low_vram_ema.mkv
     vda.mkv
     vda_yuv420p10le.mkv
+    vda_stream.mkv
+    vda_stream_yuv420p10le.mkv
     inpaint_batch.mkv
     inpaint_vda.mkv
+    inpaint_vda_stream.mkv
 )
 for filename in "${output_files[@]}"
 do
