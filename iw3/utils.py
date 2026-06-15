@@ -2413,13 +2413,16 @@ def iw3_main(args):
         export_main(args)
         return args
 
-    side_model = create_stereo_model(
-        args.method,
-        divergence=args.divergence * (2.0 if args.synthetic_view in {"right", "left"} else 1.0),
-        device_id=args.gpu[0],
-        inpaint_model=args.inpaint_model,
-        overlap_frames=args.inpaint_overlap_frames,
-    )
+    if not (args.rgbd or args.half_rgbd):
+        side_model = create_stereo_model(
+            args.method,
+            divergence=args.divergence * (2.0 if args.synthetic_view in {"right", "left"} else 1.0),
+            device_id=args.gpu[0],
+            inpaint_model=args.inpaint_model,
+            overlap_frames=args.inpaint_overlap_frames,
+        )
+    else:
+        side_model = None
     if (
             side_model is not None
             and len(args.gpu) > 1
