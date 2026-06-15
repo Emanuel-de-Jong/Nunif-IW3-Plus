@@ -24,7 +24,15 @@ from nunif.utils.video.hdr_metadata import get_hdr_metadata
 from nunif.utils.ui import is_image, is_video, is_text, is_output_dir, make_parent_dir, list_subdir, TorchHubDir
 from nunif.utils.ticket_lock import TicketLock
 from nunif.utils.autocrop import AutoCrop, AutoCropDummy
-from nunif.device import create_device, device_is_cuda, mps_is_available, xpu_is_available
+from nunif.device import (
+    create_device,
+    device_is_cuda,
+    mps_is_available,
+    xpu_is_available,
+    create_stream,
+    get_current_stream,
+    device_context,
+)
 from nunif.models.data_parallel import DeviceSwitchInference
 from . import export_config
 from .dilation import dilate_edge, edge_dilation_is_enabled
@@ -804,13 +812,13 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
         else:
             device = x.device
             reset_ema = [t in segment_pts for t in pts]
-            if args.cuda_stream and device_is_cuda(x.device):
+            if args.cuda_stream:
                 device_name = str(device)
                 if not hasattr(streams, device_name):
-                    setattr(streams, device_name, torch.cuda.Stream(device=x.device))
+                    setattr(streams, device_name, create_stream(device))
                 stream = getattr(streams, device_name)
-                stream.wait_stream(torch.cuda.current_stream(x.device))
-                with torch.cuda.device(x.device), torch.cuda.stream(stream):
+                stream.wait_stream(get_current_stream(device))
+                with device_context(device), stream:
                     depth_batch, dequeue_ticket_id = _batch_infer(
                         x, pts, flush=flush, enqueue_ticket_id=enqueue_ticket_id)
                     results = _postprocess(
