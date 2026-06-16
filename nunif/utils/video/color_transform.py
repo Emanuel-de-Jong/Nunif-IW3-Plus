@@ -353,34 +353,18 @@ class ColorTransform:
         assert isinstance(res, tuple)
         weight, bias = res
 
-        # Optimization: Process planes sequentially to minimize peak VRAM.
-        # 1. Start with Y plane
-        rgb = F.conv2d(y, weight[:, 0:1])
-
-        # 2. Interpolate and add U plane
         if u.shape[-2:] != y.shape[-2:]:
-            u = F.interpolate(
-                u,
+            uv = torch.cat([u, v], dim=1)
+            uv = F.interpolate(
+                uv,
                 size=y.shape[-2:],
                 mode=mode,
                 align_corners=False if mode == "bilinear" else None,
             )
-        rgb.add_(F.conv2d(u, weight[:, 1:2]))
-        del u
-
-        # 3. Interpolate and add V plane
-        if v.shape[-2:] != y.shape[-2:]:
-            v = F.interpolate(
-                v,
-                size=y.shape[-2:],
-                mode=mode,
-                align_corners=False if mode == "bilinear" else None,
-            )
-        rgb.add_(F.conv2d(v, weight[:, 2:3]))
-        del v
-
-        # 4. Add Bias and Clamp
-        rgb.add_(bias.view(1, 3, 1, 1))
+            u = uv[:, 0:1]
+            v = uv[:, 1:2]
+        yuv = torch.cat([y, u, v], dim=1)
+        rgb = F.conv2d(yuv, weight=weight, bias=bias)
         return rgb.clamp_(0.0, 1.0)
 
     @staticmethod
