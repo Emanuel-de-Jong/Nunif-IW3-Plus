@@ -17,6 +17,7 @@ import contextlib
 from nunif.initializer import gc_collect
 from nunif.utils.image_loader import ImageLoader
 from nunif.utils.pil_io import load_image_simple
+import nunif.utils.pil_io as IL
 import nunif.utils.shot_boundary_detection as SBD
 from nunif.models import compile_model
 import nunif.utils.video as VU
@@ -24,7 +25,13 @@ from nunif.utils.video.hdr_metadata import get_hdr_metadata
 from nunif.utils.ui import is_image, is_video, is_text, is_output_dir, make_parent_dir, list_subdir, TorchHubDir
 from nunif.utils.ticket_lock import TicketLock
 from nunif.utils.autocrop import AutoCrop, AutoCropDummy
-from nunif.device import create_device, device_is_cuda, mps_is_available, xpu_is_available
+from nunif.device import (
+    create_device,
+    device_is_cuda,
+    mps_is_available,
+    xpu_is_available,
+    autocast
+)
 from nunif.models.data_parallel import DeviceSwitchInference
 from . import export_config
 from .dilation import dilate_edge, edge_dilation_is_enabled
@@ -65,11 +72,15 @@ def chunks(array, n):
         yield array[i:i + n]
 
 
-def to_pil_image(x):
-    # x is already clipped to 0-1
-    assert x.dtype in {torch.float32, torch.float16}
-    x = TF.to_pil_image((x * 255).round().to(torch.uint8).cpu())
-    return x
+def to_pil_image(rgb, alpha=None):
+    # rgb is already clipped to 0-1
+    assert rgb.dtype in {torch.float32, torch.float16}
+    im = TF.to_pil_image((rgb * 255).round().to(torch.uint8).cpu())
+    if alpha is not None:
+        alpha = TF.to_pil_image((alpha * 255).round().to(torch.uint8).cpu())
+        im.putalpha(alpha)
+
+    return im
 
 
 def apply_rgbd(im, depth, mapper):
@@ -245,10 +256,20 @@ def save_image(im, output_filename, format="png", png_info=None):
             "quality": 95,
             "subsampling": "4:2:0",
         }
+        # Drop alpha channel
+        if im.mode == "RGBA":
+            new_im = Image.new("RGB", im.size, (255, 255, 255))
+            new_im.paste(im, mask=im.getchannel("A"))
+            im = new_im
     else:
         raise NotImplementedError(format)
 
     im.save(output_filename, format=format, **options)
+
+
+def save_tensor_image(rgb, output_filename, format="png", png_info=None, alpha=None):
+    im = to_pil_image(rgb, alpha=alpha)
+    save_image(im, output_filename, format=format, png_info=png_info)
 
 
 def preprocess_image(x, args):
@@ -1318,8 +1339,12 @@ def export_images(input_path, output_dir, args, title=None):
 
     loader = ImageLoader(
         files=files,
-        load_func=load_image_simple,
-        load_func_kwargs={"color": "rgb", "exif_transpose": not args.disable_exif_transpose})
+        load_func=IL.load_image,
+        load_func_kwargs=dict(
+            color="rgb",
+            exif_transpose=not args.disable_exif_transpose,
+            keep_alpha=True,
+        ))
     futures = []
     tqdm_fn = args.state["tqdm_fn"] or tqdm
     pbar = tqdm_fn(ncols=80, total=len(files), desc=title or "Images")
@@ -1328,6 +1353,7 @@ def export_images(input_path, output_dir, args, title=None):
 
     max_workers = max(args.max_workers, 8)
     with PoolExecutor(max_workers=max_workers) as pool, torch.inference_mode():
+        fill_color = torch.tensor([0.4, 0.5, 0.6], dtype=torch.float32, device=args.state["device"]).view(3, 1, 1)
         for im, meta in loader:
             basename = path.splitext(path.basename(meta["filename"]))[0] + ".png"
             rgb_file = path.join(rgb_dir, basename)
@@ -1335,22 +1361,67 @@ def export_images(input_path, output_dir, args, title=None):
             if im is None:
                 pbar.update(1)
                 continue
-            im = TF.to_tensor(im).to(args.state["device"])
-            im = preprocess_image(im, args)
-            depth = depth_model.infer(im, tta=args.tta, low_vram=args.low_vram,
-                                      enable_amp=not args.disable_amp,
-                                      edge_dilation=edge_dilation,
-                                      depth_aa=args.depth_aa)
-            depth = depth_model.minmax_normalize_chw(depth)
-            if args.export_disparity:
-                depth = get_mapper(args.mapper)(depth)
-            if args.export_depth_fit:
-                depth = F.interpolate(depth.unsqueeze(0), size=(im.shape[1], im.shape[2]),
-                                      mode="bilinear", antialias=True, align_corners=True).squeeze(0)
+
+            rgb, alpha = IL.to_tensor(im, return_alpha=True)
+            if alpha is not None and torch.all(alpha == 1.0):
+                alpha = None
+
+            rgb = rgb.to(args.state["device"])
+            if rgb.shape[0] == 1:
+                rgb = rgb.repeat(3, 1, 1)
+
+            if alpha is not None:
+                alpha = alpha.to(args.state["device"]).clamp(0, 1)
+                rgb = rgb * alpha + fill_color * (1.0 - alpha)
+                rgb = preprocess_image(rgb, args)
+                depth = depth_model.infer(rgb, tta=args.tta, low_vram=args.low_vram,
+                                          enable_amp=not args.disable_amp,
+                                          edge_dilation=0,
+                                          depth_aa=False)
+                depth_alpha = F.interpolate(
+                    alpha.unsqueeze(0),
+                    size=depth.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                    antialias=True,
+                ).squeeze(0)
+                mask = depth_alpha > 0.0
+                depth[torch.logical_not(mask)] = (depth[mask].min() + depth.min()) * 0.5
+
+                if (
+                    args.depth_aa and
+                    hasattr(depth_model, "depth_aa") and
+                    isinstance(depth_model.depth_aa, torch.nn.Module)
+                ):
+                    with autocast(device=depth.device, enabled=not args.disable_amp):
+                        depth = depth_model.depth_aa.infer(depth.unsqueeze(0)).squeeze(0)
+                if edge_dilation_is_enabled(edge_dilation):
+                    depth = dilate_edge(depth.unsqueeze(0), edge_dilation).squeeze(0)
+                depth = depth_model.minmax_normalize_chw(depth)
+
+                if args.export_disparity:
+                    depth = get_mapper(args.mapper)(depth)
+                if args.export_depth_fit:
+                    depth = F.interpolate(depth.unsqueeze(0), size=rgb.shape[-2:],
+                                          mode="bilinear", antialias=True, align_corners=True).squeeze(0)
+            else:
+                rgb = preprocess_image(rgb, args)
+                depth = depth_model.infer(rgb, tta=args.tta, low_vram=args.low_vram,
+                                          enable_amp=not args.disable_amp,
+                                          edge_dilation=edge_dilation,
+                                          depth_aa=args.depth_aa)
+
+                depth = depth_model.minmax_normalize_chw(depth)
+                if args.export_disparity:
+                    depth = get_mapper(args.mapper)(depth)
+                if args.export_depth_fit:
+                    depth = F.interpolate(depth.unsqueeze(0), size=rgb.shape[-2:],
+                                          mode="bilinear", antialias=True, align_corners=True).squeeze(0)
+
             futures.append(pool.submit(depth_model.save_normalized_depth, depth, depth_file))
 
             if not args.export_depth_only:
-                futures.append(pool.submit(save_image, to_pil_image(im), rgb_file))
+                futures.append(pool.submit(save_tensor_image, rgb, rgb_file, alpha=alpha))
 
             pbar.update(1)
             if suspend_event is not None:
@@ -1765,7 +1836,7 @@ def process_config_video(config, args, side_model):
     def batch_callback(x, depths, reset_pts, test=False):
         if not config.skip_edge_dilation and edge_dilation_is_enabled(args.edge_dilation):
             # apply --edge-dilation
-            depths = -dilate_edge(-depths, args.edge_dilation)
+            depths = dilate_edge(depths, args.edge_dilation)
         with sbs_lock:
             if test:
                 assert x.shape[0] == 1
@@ -1920,8 +1991,9 @@ def process_config_images(config, args, side_model):
 
     rgb_loader = ImageLoader(
         files=rgb_files,
-        load_func=load_image_simple,
-        load_func_kwargs={"color": "rgb"})
+        load_func=IL.load_image,
+        load_func_kwargs=dict(color="rgb", keep_alpha=True),
+    )
     depth_loader = ImageLoader(
         files=depth_files,
         load_func=BaseDepthModel.load_depth)
@@ -1935,7 +2007,7 @@ def process_config_images(config, args, side_model):
                 args.mapper = config.mapper
             else:
                 pass
-        with PoolExecutor(max_workers=4) as pool:
+        with PoolExecutor(max_workers=4) as pool, torch.inference_mode():
             tqdm_fn = args.state["tqdm_fn"] or tqdm
             pbar = tqdm_fn(ncols=80, total=len(rgb_files), desc="Images")
             stop_event = args.state["stop_event"]
@@ -1946,14 +2018,27 @@ def process_config_images(config, args, side_model):
                 depth_filename = path.splitext(path.basename(depth_meta["filename"]))[0]
                 if rgb_filename != depth_filename:
                     raise ValueError(f"No match {rgb_filename} and {depth_filename}")
-                rgb = TF.to_tensor(rgb).to(args.state["device"])
+
+                rgb, alpha = IL.to_tensor(rgb, return_alpha=True)
+                rgb = rgb.to(args.state["device"])
+                if alpha is not None and torch.all(alpha == 1.0):
+                    alpha = None
+                if rgb.shape[0] == 1:
+                    rgb = rgb.repeat(3, 1, 1)
+
                 depth = depth.to(args.state["device"])
                 if not config.skip_edge_dilation and edge_dilation_is_enabled(args.edge_dilation):
-                    depth = -dilate_edge(-depth.unsqueeze(0), args.edge_dilation).squeeze(0)
-
+                    depth = dilate_edge(depth.unsqueeze(0), args.edge_dilation).squeeze(0)
                 left_eye, right_eye = apply_divergence(depth, rgb, args, side_model)
                 sbs = postprocess_image(left_eye, right_eye, args)
                 sbs = to_pil_image(sbs)
+                if alpha is not None:
+                    alpha = alpha.to(args.state["device"]).repeat(3, 1, 1)
+                    left_alpha, right_alpha = apply_divergence(depth, alpha, args, side_model)
+                    sbs_alpha = postprocess_image(left_alpha, right_alpha, args)
+                    sbs_alpha = sbs_alpha.mean(dim=0, keepdim=True)
+                    sbs_alpha = to_pil_image(sbs_alpha)
+                    sbs.putalpha(sbs_alpha)
 
                 output_filename = path.join(
                     output_dir,
