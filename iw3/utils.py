@@ -17,6 +17,7 @@ import contextlib
 from nunif.initializer import gc_collect
 from nunif.utils.image_loader import ImageLoader
 from nunif.utils.pil_io import load_image_simple
+import nunif.utils.pil_io as IL
 import nunif.utils.shot_boundary_detection as SBD
 from nunif.models import compile_model
 import nunif.utils.video as VU
@@ -65,11 +66,15 @@ def chunks(array, n):
         yield array[i:i + n]
 
 
-def to_pil_image(x):
-    # x is already clipped to 0-1
-    assert x.dtype in {torch.float32, torch.float16}
-    x = TF.to_pil_image((x * 255).round().to(torch.uint8).cpu())
-    return x
+def to_pil_image(rgb, alpha=None):
+    # rgb is already clipped to 0-1
+    assert rgb.dtype in {torch.float32, torch.float16}
+    im = TF.to_pil_image((rgb * 255).round().to(torch.uint8).cpu())
+    if alpha is not None:
+        alpha = TF.to_pil_image((alpha * 255).round().to(torch.uint8).cpu())
+        im.putalpha(alpha)
+
+    return im
 
 
 def apply_rgbd(im, depth, mapper):
@@ -249,6 +254,11 @@ def save_image(im, output_filename, format="png", png_info=None):
         raise NotImplementedError(format)
 
     im.save(output_filename, format=format, **options)
+
+
+def save_tensor_image(rgb, output_filename, format="png", png_info=None, alpha=None):
+    im = to_pil_image(rgb, alpha=alpha)
+    save_image(im, output_filename, format=format, png_info=png_info)
 
 
 def preprocess_image(x, args):
@@ -1318,8 +1328,13 @@ def export_images(input_path, output_dir, args, title=None):
 
     loader = ImageLoader(
         files=files,
-        load_func=load_image_simple,
-        load_func_kwargs={"color": "rgb", "exif_transpose": not args.disable_exif_transpose})
+        load_func=IL.load_image,
+        load_func_kwargs=dict(
+            color="rgb",
+            exif_transpose=not args.disable_exif_transpose,
+            keep_alpha=True,
+            bg_color=128,
+        ))
     futures = []
     tqdm_fn = args.state["tqdm_fn"] or tqdm
     pbar = tqdm_fn(ncols=80, total=len(files), desc=title or "Images")
@@ -1335,22 +1350,40 @@ def export_images(input_path, output_dir, args, title=None):
             if im is None:
                 pbar.update(1)
                 continue
-            im = TF.to_tensor(im).to(args.state["device"])
-            im = preprocess_image(im, args)
-            depth = depth_model.infer(im, tta=args.tta, low_vram=args.low_vram,
+
+            rgb, alpha = IL.to_tensor(im, return_alpha=True)
+            rgb = rgb.to(args.state["device"])
+            if rgb.shape[0] == 1:
+                rgb = rgb.repeat(3, 1, 1)
+
+            rgb = preprocess_image(rgb, args)
+            depth = depth_model.infer(rgb, tta=args.tta, low_vram=args.low_vram,
                                       enable_amp=not args.disable_amp,
                                       edge_dilation=edge_dilation,
                                       depth_aa=args.depth_aa)
             depth = depth_model.minmax_normalize_chw(depth)
             if args.export_disparity:
                 depth = get_mapper(args.mapper)(depth)
+
+            if alpha is not None:
+                alpha = alpha.to(args.state["device"])
+                alpha_resized = F.interpolate(
+                    alpha.unsqueeze(0),
+                    size=depth.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                    antialias=True,
+                ).squeeze(0)
+                mask = alpha_resized > 0.0
+                depth[torch.logical_not(mask)] = 0.0
+
             if args.export_depth_fit:
                 depth = F.interpolate(depth.unsqueeze(0), size=(im.shape[1], im.shape[2]),
                                       mode="bilinear", antialias=True, align_corners=True).squeeze(0)
             futures.append(pool.submit(depth_model.save_normalized_depth, depth, depth_file))
 
             if not args.export_depth_only:
-                futures.append(pool.submit(save_image, to_pil_image(im), rgb_file))
+                futures.append(pool.submit(save_tensor_image, rgb, rgb_file, alpha=alpha))
 
             pbar.update(1)
             if suspend_event is not None:
