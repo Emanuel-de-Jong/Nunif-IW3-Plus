@@ -25,7 +25,13 @@ from nunif.utils.video.hdr_metadata import get_hdr_metadata
 from nunif.utils.ui import is_image, is_video, is_text, is_output_dir, make_parent_dir, list_subdir, TorchHubDir
 from nunif.utils.ticket_lock import TicketLock
 from nunif.utils.autocrop import AutoCrop, AutoCropDummy
-from nunif.device import create_device, device_is_cuda, mps_is_available, xpu_is_available
+from nunif.device import (
+    create_device,
+    device_is_cuda,
+    mps_is_available,
+    xpu_is_available,
+    autocast
+)
 from nunif.models.data_parallel import DeviceSwitchInference
 from . import export_config
 from .dilation import dilate_edge, edge_dilation_is_enabled
@@ -1342,6 +1348,7 @@ def export_images(input_path, output_dir, args, title=None):
 
     max_workers = max(args.max_workers, 8)
     with PoolExecutor(max_workers=max_workers) as pool, torch.inference_mode():
+        fill_color = torch.tensor([0.4, 0.5, 0.6], dtype=torch.float32, device=args.state["device"]).view(3, 1, 1)
         for im, meta in loader:
             basename = path.splitext(path.basename(meta["filename"]))[0] + ".png"
             rgb_file = path.join(rgb_dir, basename)
@@ -1358,32 +1365,54 @@ def export_images(input_path, output_dir, args, title=None):
             if rgb.shape[0] == 1:
                 rgb = rgb.repeat(3, 1, 1)
 
-            rgb = preprocess_image(rgb, args)
-            depth = depth_model.infer(rgb, tta=args.tta, low_vram=args.low_vram,
-                                      enable_amp=not args.disable_amp,
-                                      edge_dilation=edge_dilation,
-                                      depth_aa=args.depth_aa)
-
-            depth = depth_model.minmax_normalize_chw(depth)
-            if args.export_disparity:
-                depth = get_mapper(args.mapper)(depth)
-
-            if alpha is not None and not args.export_disparity:
-                # TODO: This behavior is very confusing, so I'll figure out a way to fix it later.
-                alpha = alpha.to(args.state["device"])
-                alpha_resized = F.interpolate(
+            if alpha is not None:
+                alpha = alpha.to(args.state["device"]).clamp(0, 1)
+                rgb = rgb * alpha + fill_color * (1.0 - alpha)
+                rgb = preprocess_image(rgb, args)
+                depth = depth_model.infer(rgb, tta=args.tta, low_vram=args.low_vram,
+                                          enable_amp=not args.disable_amp,
+                                          edge_dilation=0,
+                                          depth_aa=False)
+                depth_alpha = F.interpolate(
                     alpha.unsqueeze(0),
                     size=depth.shape[-2:],
                     mode="bilinear",
                     align_corners=False,
                     antialias=True,
                 ).squeeze(0)
-                mask = alpha_resized > 0.0
-                depth[torch.logical_not(mask)] = 0.0
+                mask = depth_alpha > 0.0
+                depth[torch.logical_not(mask)] = (depth[mask].min() + depth.min()) * 0.5
 
-            if args.export_depth_fit:
-                depth = F.interpolate(depth.unsqueeze(0), size=(im.shape[1], im.shape[2]),
-                                      mode="bilinear", antialias=True, align_corners=True).squeeze(0)
+                if (
+                    args.depth_aa and
+                    hasattr(depth_model, "depth_aa") and
+                    isinstance(depth_model.depth_aa, torch.nn.Module)
+                ):
+                    with autocast(device=depth.device, enabled=not args.disable_amp):
+                        depth = depth_model.depth_aa.infer(depth.unsqueeze(0)).squeeze(0)
+                if edge_dilation_is_enabled(edge_dilation):
+                    depth = dilate_edge(depth.unsqueeze(0), edge_dilation).squeeze(0)
+                depth = depth_model.minmax_normalize_chw(depth)
+
+                if args.export_disparity:
+                    depth = get_mapper(args.mapper)(depth)
+                if args.export_depth_fit:
+                    depth = F.interpolate(depth.unsqueeze(0), size=rgb.shape[-2:],
+                                          mode="bilinear", antialias=True, align_corners=True).squeeze(0)
+            else:
+                rgb = preprocess_image(rgb, args)
+                depth = depth_model.infer(rgb, tta=args.tta, low_vram=args.low_vram,
+                                          enable_amp=not args.disable_amp,
+                                          edge_dilation=edge_dilation,
+                                          depth_aa=args.depth_aa)
+
+                depth = depth_model.minmax_normalize_chw(depth)
+                if args.export_disparity:
+                    depth = get_mapper(args.mapper)(depth)
+                if args.export_depth_fit:
+                    depth = F.interpolate(depth.unsqueeze(0), size=rgb.shape[-2:],
+                                          mode="bilinear", antialias=True, align_corners=True).squeeze(0)
+
             futures.append(pool.submit(depth_model.save_normalized_depth, depth, depth_file))
 
             if not args.export_depth_only:
@@ -1958,7 +1987,7 @@ def process_config_images(config, args, side_model):
     rgb_loader = ImageLoader(
         files=rgb_files,
         load_func=IL.load_image,
-        load_func_kwargs=dict(color="rgb", keep_alpha=True, bg_color=128),
+        load_func_kwargs=dict(color="rgb", keep_alpha=True),
     )
     depth_loader = ImageLoader(
         files=depth_files,
