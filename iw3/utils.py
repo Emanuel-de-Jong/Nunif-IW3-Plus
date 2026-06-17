@@ -256,6 +256,11 @@ def save_image(im, output_filename, format="png", png_info=None):
             "quality": 95,
             "subsampling": "4:2:0",
         }
+        # Drop alpha channel
+        if im.mode == "RGBA":
+            new_im = Image.new("RGB", im.size, (255, 255, 255))
+            new_im.paste(im, mask=im.getchannel("A"))
+            im = new_im
     else:
         raise NotImplementedError(format)
 
