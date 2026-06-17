@@ -1802,7 +1802,7 @@ def process_config_video(config, args, side_model):
     def batch_callback(x, depths, reset_pts, test=False):
         if not config.skip_edge_dilation and edge_dilation_is_enabled(args.edge_dilation):
             # apply --edge-dilation
-            depths = -dilate_edge(-depths, args.edge_dilation)
+            depths = dilate_edge(depths, args.edge_dilation)
         with sbs_lock:
             if test:
                 assert x.shape[0] == 1
@@ -1994,7 +1994,7 @@ def process_config_images(config, args, side_model):
 
                 depth = depth.to(args.state["device"])
                 if not config.skip_edge_dilation and edge_dilation_is_enabled(args.edge_dilation):
-                    depth = -dilate_edge(-depth.unsqueeze(0), args.edge_dilation).squeeze(0)
+                    depth = dilate_edge(depth.unsqueeze(0), args.edge_dilation).squeeze(0)
                 left_eye, right_eye = apply_divergence(depth, rgb, args, side_model)
                 sbs = postprocess_image(left_eye, right_eye, args)
                 sbs = to_pil_image(sbs)
