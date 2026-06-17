@@ -1333,7 +1333,6 @@ def export_images(input_path, output_dir, args, title=None):
             color="rgb",
             exif_transpose=not args.disable_exif_transpose,
             keep_alpha=True,
-            bg_color=128,
         ))
     futures = []
     tqdm_fn = args.state["tqdm_fn"] or tqdm
@@ -1352,6 +1351,9 @@ def export_images(input_path, output_dir, args, title=None):
                 continue
 
             rgb, alpha = IL.to_tensor(im, return_alpha=True)
+            if alpha is not None and torch.all(alpha == 1.0):
+                alpha = None
+
             rgb = rgb.to(args.state["device"])
             if rgb.shape[0] == 1:
                 rgb = rgb.repeat(3, 1, 1)
@@ -1361,11 +1363,13 @@ def export_images(input_path, output_dir, args, title=None):
                                       enable_amp=not args.disable_amp,
                                       edge_dilation=edge_dilation,
                                       depth_aa=args.depth_aa)
+
             depth = depth_model.minmax_normalize_chw(depth)
             if args.export_disparity:
                 depth = get_mapper(args.mapper)(depth)
 
-            if alpha is not None:
+            if alpha is not None and not args.export_disparity:
+                # TODO: This behavior is very confusing, so I'll figure out a way to fix it later.
                 alpha = alpha.to(args.state["device"])
                 alpha_resized = F.interpolate(
                     alpha.unsqueeze(0),
@@ -1953,8 +1957,9 @@ def process_config_images(config, args, side_model):
 
     rgb_loader = ImageLoader(
         files=rgb_files,
-        load_func=load_image_simple,
-        load_func_kwargs={"color": "rgb"})
+        load_func=IL.load_image,
+        load_func_kwargs=dict(color="rgb", keep_alpha=True, bg_color=128),
+    )
     depth_loader = ImageLoader(
         files=depth_files,
         load_func=BaseDepthModel.load_depth)
@@ -1968,7 +1973,7 @@ def process_config_images(config, args, side_model):
                 args.mapper = config.mapper
             else:
                 pass
-        with PoolExecutor(max_workers=4) as pool:
+        with PoolExecutor(max_workers=4) as pool, torch.inference_mode():
             tqdm_fn = args.state["tqdm_fn"] or tqdm
             pbar = tqdm_fn(ncols=80, total=len(rgb_files), desc="Images")
             stop_event = args.state["stop_event"]
@@ -1979,14 +1984,27 @@ def process_config_images(config, args, side_model):
                 depth_filename = path.splitext(path.basename(depth_meta["filename"]))[0]
                 if rgb_filename != depth_filename:
                     raise ValueError(f"No match {rgb_filename} and {depth_filename}")
-                rgb = TF.to_tensor(rgb).to(args.state["device"])
+
+                rgb, alpha = IL.to_tensor(rgb, return_alpha=True)
+                rgb = rgb.to(args.state["device"])
+                if alpha is not None and torch.all(alpha == 1.0):
+                    alpha = None
+                if rgb.shape[0] == 1:
+                    rgb = rgb.repeat(3, 1, 1)
+
                 depth = depth.to(args.state["device"])
                 if not config.skip_edge_dilation and edge_dilation_is_enabled(args.edge_dilation):
                     depth = -dilate_edge(-depth.unsqueeze(0), args.edge_dilation).squeeze(0)
-
                 left_eye, right_eye = apply_divergence(depth, rgb, args, side_model)
                 sbs = postprocess_image(left_eye, right_eye, args)
                 sbs = to_pil_image(sbs)
+                if alpha is not None:
+                    alpha = alpha.to(args.state["device"]).repeat(3, 1, 1)
+                    left_alpha, right_alpha = apply_divergence(depth, alpha, args, side_model)
+                    sbs_alpha = postprocess_image(left_alpha, right_alpha, args)
+                    sbs_alpha = sbs_alpha.mean(dim=0, keepdim=True)
+                    sbs_alpha = to_pil_image(sbs_alpha)
+                    sbs.putalpha(sbs_alpha)
 
                 output_filename = path.join(
                     output_dir,
