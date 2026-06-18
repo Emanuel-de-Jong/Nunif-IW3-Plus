@@ -791,7 +791,10 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
             yield from _postprocess(depth_model.flush_minmax_normalize(), flush=True)
             return
 
-        pix_dtype = VU.get_source_dtype(frame)
+        offload_dtype = VU.get_source_dtype(frame)
+        if offload_dtype == torch.uint16:
+            offload_dtype = torch.float16
+
         x = VU.to_tensor(frame, device=args.state["device"])
 
         if frame_cpu_offload:
@@ -802,13 +805,13 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
                 if offload_resource_manager is None:
                     offload_resource_manager = VU.OffloadResourceManager(
                         size=x.shape,
-                        dtype=pix_dtype,
+                        dtype=offload_dtype,
                         device=x.device
                     )
                 # cpu buffer
                 offloaded_frame = VU.OffloadedFrame(
                     x,
-                    dtype=pix_dtype,
+                    dtype=offload_dtype,
                     manager=offload_resource_manager,
                 )
                 src_queue.append((offloaded_frame, frame.pts))
@@ -890,17 +893,17 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
             dequeue_ticket_id = dequeue_ticket_lock.new_ticket()
             if not flush:
                 if frame_cpu_offload:
-                    pix_dtype = torch.float16 if use_16bit else torch.uint8
+                    offload_dtype = torch.float16 if use_16bit else torch.uint8
                     if offload_resource_manager is None:
                         offload_resource_manager = VU.OffloadResourceManager(
                             size=x[0].shape,
-                            dtype=pix_dtype,
+                            dtype=offload_dtype,
                             device=x.device
                         )
                     for i in range(len(pts)):
                         offloaded_frame = VU.OffloadedFrame(
                             x[i],
-                            dtype=pix_dtype,
+                            dtype=offload_dtype,
                             manager=offload_resource_manager,
                             stream=offload_stream
                         )
@@ -980,8 +983,7 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
     src_queue = []
     batch_queue = []
     pts_queue = []
-    pix_dtype = None
-    pix_max = None
+    offload_dtype = None
     device = args.state["device"]
     frame_cpu_offload = device.type not in {"cpu", "mps"}
     offload_resource_manager = None
@@ -1043,7 +1045,7 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
 
     @torch.inference_mode()
     def frame_callback(frame):
-        nonlocal pix_dtype, pix_max, offload_resource_manager
+        nonlocal offload_dtype, offload_resource_manager
 
         if frame is None:
             # flush
@@ -1056,9 +1058,10 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
             yield from _postprocess(depth_list, flush=True)
             return
 
-        if pix_dtype is None:
-            pix_dtype = VU.get_source_dtype(frame)
-            pix_max = torch.iinfo(pix_dtype).max
+        if offload_dtype is None:
+            offload_dtype = VU.get_source_dtype(frame)
+            if offload_dtype == torch.uint16:
+                offload_dtype = torch.float16
 
         x = VU.to_tensor(frame, device=device)
         if frame_cpu_offload:
@@ -1068,12 +1071,12 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
                 if offload_resource_manager is None:
                     offload_resource_manager = VU.OffloadResourceManager(
                         size=x.shape,
-                        dtype=pix_dtype,
+                        dtype=offload_dtype,
                         device=x.device,
                     )
                 offloaded_frame = VU.OffloadedFrame(
                     x,
-                    dtype=pix_dtype,
+                    dtype=offload_dtype,
                     stream=offload_stream,
                     manager=offload_resource_manager
                 )
