@@ -44,6 +44,11 @@ python -m iw3.cli -y -i ${TEST_VIDEO} -o ${OUTPUT_DIR} --depth-model VDA_S --met
 # export
 python -m iw3.cli -y -i ${TEST_VIDEO} -o ${OUTPUT_DIR} --depth-model Any_S --export-disparity --export-depth-only --export-depth-fit
 python -m iw3.cli -y -i ${TEST_VIDEO_HDR} -o ${OUTPUT_DIR} --depth-model VDA_S --export --ema-normalize --ema-buffer 10 --scene-detect
+python -m iw3.cli -y -i ${TEST_IMAGE} -o ${OUTPUT_DIR} --depth-model Any_S --export --depth-aa --export-depth-fit
+
+# import
+python -m iw3.cli -y -i ${OUTPUT_DIR}/hdr/iw3_export.yml -o ${OUTPUT_DIR}
+python -m iw3.cli -y -i ${OUTPUT_DIR}/iw3_export.yml -o ${OUTPUT_DIR}
 
 # vf
 python -m iw3.cli -y -i ${TEST_VIDEO} -o ${OUTPUT_DIR} --depth-model Any_S --vf "scale=-2:320,crop=256:256"

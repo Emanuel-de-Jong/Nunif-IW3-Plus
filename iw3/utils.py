@@ -547,7 +547,7 @@ def debug_depth_image(depth, args):
     return out
 
 
-def process_image(x, args, depth_model, side_model, skip_autocrop=None, autocrop_uncrop=False):
+def process_image(x, args, depth_model, side_model, skip_autocrop=None, autocrop_uncrop=False, alpha=None, fill_color=0.0):
     assert depth_model.get_ema_buffer_size() == 1
 
     if args.autocrop is None or skip_autocrop:
@@ -556,38 +556,83 @@ def process_image(x, args, depth_model, side_model, skip_autocrop=None, autocrop
         autocrop = AutoCrop.from_image(x, mode=args.autocrop, uncrop_enabled=autocrop_uncrop)
 
     with torch.inference_mode():
+        if alpha is not None:
+            x = x * alpha + fill_color * (1.0 - alpha)
+
         x = preprocess_image(x, args)
         x = autocrop.crop(x)
-        depth = depth_model.infer(x, tta=args.tta, low_vram=args.low_vram,
-                                  enable_amp=not args.disable_amp,
-                                  edge_dilation=args.edge_dilation,
-                                  depth_aa=args.depth_aa)
-        depth = depth_model.minmax_normalize_chw(depth)
+        if alpha is not None:
+            depth = depth_model.infer(x, tta=args.tta, low_vram=args.low_vram,
+                                      enable_amp=not args.disable_amp,
+                                      edge_dilation=0,
+                                      depth_aa=False)
+            depth_alpha = F.interpolate(
+                alpha.unsqueeze(0),
+                size=depth.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            ).squeeze(0)
+            mask = depth_alpha > 0.0
+            depth[torch.logical_not(mask)] = (depth[mask].min() + depth.min()) * 0.5
+            if (
+                args.depth_aa and
+                hasattr(depth_model, "depth_aa") and
+                isinstance(depth_model.depth_aa, torch.nn.Module)
+            ):
+                with autocast(device=depth.device, enabled=not args.disable_amp):
+                    depth = depth_model.depth_aa.infer(depth.unsqueeze(0)).squeeze(0)
+            if edge_dilation_is_enabled(args.edge_dilation):
+                depth = dilate_edge(depth.unsqueeze(0), args.edge_dilation).squeeze(0)
+            depth = depth_model.minmax_normalize_chw(depth)
+        else:
+            depth = depth_model.infer(x, tta=args.tta, low_vram=args.low_vram,
+                                      enable_amp=not args.disable_amp,
+                                      edge_dilation=args.edge_dilation,
+                                      depth_aa=args.depth_aa)
+            depth = depth_model.minmax_normalize_chw(depth)
 
         if args.debug_depth:
             return debug_depth_image(depth, args)
-        elif args.rgbd or args.half_rgbd:
+
+        if alpha is not None and args.anaglyph:
+            x = x * alpha + 1.0 * (1.0 - alpha)
+
+        if args.rgbd or args.half_rgbd:
             left_eye, right_eye = apply_rgbd(x, depth, mapper=args.mapper)
             left_eye = autocrop.uncrop(left_eye)
             right_eye = autocrop.uncrop(right_eye)
             sbs = postprocess_image(left_eye, right_eye, args)
+            if alpha is not None:
+                left_alpha = alpha
+                # TODO: I am not sure whether the depth map should preserve the alpha channel
+                #       or whether the alpha channel should be filled with 1.0 for all pixels.
+                if True:
+                    right_alpha = torch.ones_like(alpha)
+                else:
+                    right_alpha = alpha
+                left_alpha = autocrop.uncrop(left_alpha)
+                right_alpha = autocrop.uncrop(right_alpha)
+                sbs_alpha = postprocess_image(left_alpha, right_alpha, args)
+                sbs = torch.cat([sbs, sbs_alpha], dim=0)
+
             return sbs
         else:
-            while True:
-                left_eye, right_eye = apply_divergence(depth, x, args, side_model)
-                if left_eye is not None:
-                    break
-            if left_eye.ndim == 4:
-                # NOTE: side_model is video inpaint model.
-                #       This may be called from test_callback
-                assert 0, "No longer reaching this block"
-                left_eye = autocrop.uncrop(left_eye[0])
-                right_eye = autocrop.uncrop(right_eye[0])
-                sbs = postprocess_image(left_eye, right_eye, args)
-            else:
-                left_eye = autocrop.uncrop(left_eye)
-                right_eye = autocrop.uncrop(right_eye)
-                sbs = postprocess_image(left_eye, right_eye, args)
+            left_eye, right_eye = apply_divergence(depth, x, args, side_model)
+            assert left_eye is not None
+            left_eye = autocrop.uncrop(left_eye)
+            right_eye = autocrop.uncrop(right_eye)
+            sbs = postprocess_image(left_eye, right_eye, args)
+
+            if alpha is not None and not args.anaglyph:
+                alpha = alpha.repeat(3, 1, 1)
+                left_alpha, right_alpha = apply_divergence(depth, alpha, args, side_model)
+                left_alpha = autocrop.uncrop(left_alpha)
+                right_alpha = autocrop.uncrop(right_alpha)
+                sbs_alpha = postprocess_image(left_alpha, right_alpha, args)
+                sbs_alpha = sbs_alpha.mean(dim=0, keepdim=True)
+                sbs = torch.cat([sbs, sbs_alpha], dim=0)
+
             return sbs
 
 
@@ -621,8 +666,14 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
 
     loader = ImageLoader(
         files=files,
-        load_func=load_image_simple,
-        load_func_kwargs={"color": "rgb", "exif_transpose": not args.disable_exif_transpose})
+        load_func=IL.load_image,
+        load_func_kwargs=dict(
+            color="rgb",
+            exif_transpose=not args.disable_exif_transpose,
+            keep_alpha=True
+        )
+    )
+
     futures = []
     tqdm_fn = args.state["tqdm_fn"] or tqdm
     pbar = tqdm_fn(ncols=80, total=len(files), desc=title)
@@ -630,7 +681,8 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
     suspend_event = args.state["suspend_event"]
 
     max_workers = max(args.max_workers, 8)
-    with PoolExecutor(max_workers=max_workers) as pool:
+    with PoolExecutor(max_workers=max_workers) as pool, torch.inference_mode():
+        fill_color = torch.tensor([0.4, 0.5, 0.6], dtype=torch.float32, device=args.state["device"]).view(3, 1, 1)
         for im, meta in loader:
             filename = meta["filename"]
             output_filename = path.join(
@@ -639,11 +691,28 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
             if im is None:
                 pbar.update(1)
                 continue
-            im = TF.to_tensor(im).to(args.state["device"])
-            output = process_image(im, args, depth_model, side_model)
-            output = to_pil_image(output)
-            f = pool.submit(save_image, output, output_filename, format=args.format)
-            #  f.result() # for debug
+
+            rgb, alpha = IL.to_tensor(im, return_alpha=True)
+            rgb = rgb.to(args.state["device"])
+            if rgb.shape[0] == 1:
+                rgb = rgb.repeat(3, 1, 1)
+
+            if alpha is not None and torch.all(alpha == 1.0):
+                alpha = None
+            if alpha is not None:
+                alpha = alpha.to(args.state["device"])
+
+            output = process_image(rgb, args, depth_model, side_model, alpha=alpha, fill_color=fill_color)
+            if output.shape[0] == 4:
+                # RGBA
+                alpha = output[3:]
+                output = output[:3]
+            else:
+                alpha = None
+
+            f = pool.submit(save_tensor_image, output, output_filename, alpha=alpha, format=args.format)
+            # f.result() # for debug
+
             futures.append(f)
             pbar.update(1)
             if suspend_event is not None:
