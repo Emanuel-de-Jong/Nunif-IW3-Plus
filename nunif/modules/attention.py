@@ -92,7 +92,7 @@ def pad_shift_mask_token(x, mask_token, window_size, shift=(True, True)):
 
 
 class MHA(nn.Module):
-    def __init__(self, embed_dim, num_heads, qkv_dim=None):
+    def __init__(self, embed_dim, num_heads, qkv_dim=None, qkv_bias=True):
         super().__init__()
         # require torch >= 2.0 (recommend torch >= 2.1.2)
         # nn.MultiheadAttention also has a bug with float attn_mask, so PyTorch 2.1 is required anyway.
@@ -103,7 +103,7 @@ class MHA(nn.Module):
             qkv_dim = embed_dim // num_heads
         self.qkv_dim = qkv_dim
         self.num_heads = num_heads
-        self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads * 3)
+        self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads * 3, bias=qkv_bias)
         self.head_proj = nn.Linear(qkv_dim * num_heads, embed_dim)
         basic_module_init(self)
 
@@ -119,7 +119,8 @@ class WindowMHA2d(nn.Module):
     """ WindowMHA
     BCHW input/output
     """
-    def __init__(self, in_channels, num_heads, window_size=(4, 4), qkv_dim=None, shift=False, shift_mask_token=False):
+    def __init__(self, in_channels, num_heads, window_size=(4, 4),
+                 qkv_dim=None, shift=False, shift_mask_token=False, qkv_bias=True):
         super().__init__()
         self.window_size = (window_size if isinstance(window_size, (tuple, list))
                             else (window_size, window_size))
@@ -141,7 +142,7 @@ class WindowMHA2d(nn.Module):
             self.shift_mask_bias = None
 
         self.num_heads = num_heads
-        self.mha = MHA(in_channels, num_heads, qkv_dim)
+        self.mha = MHA(in_channels, num_heads=num_heads, qkv_dim=qkv_dim, qkv_bias=qkv_bias)
         basic_module_init(self)
 
     def forward(self, x, attn_mask=None, layer_norm=None):
@@ -256,7 +257,7 @@ class WindowMHA3d(nn.Module):
     """ 3D WindowMHA
     BCDHW input/output
     """
-    def __init__(self, in_channels, num_heads, window_size=(4, 4, 4), qkv_dim=None, shift=False):
+    def __init__(self, in_channels, num_heads, window_size=(4, 4, 4), qkv_dim=None, shift=False, qkv_bias=True):
         super().__init__()
         self.window_size = (window_size if isinstance(window_size, (tuple, list))
                             else (window_size, window_size, window_size))
@@ -278,7 +279,7 @@ class WindowMHA3d(nn.Module):
             self.shift_mask_bias = None
 
         self.num_heads = num_heads
-        self.mha = MHA(in_channels, num_heads, qkv_dim)
+        self.mha = MHA(in_channels, num_heads=num_heads, qkv_dim=qkv_dim, qkv_bias=qkv_bias)
         basic_module_init(self)
 
     def forward(self, x, attn_mask=None, layer_norm=None):
