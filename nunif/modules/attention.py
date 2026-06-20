@@ -10,12 +10,13 @@ from .permute import (
 )
 from .init import basic_module_init
 from .replication_pad2d import ReplicationPad2dNaive
-from .attention_bias import (  # noqa
+from .attention_bias import (
     WindowScoreBias,
     WindowRelativeScoreBias,
     WindowDistanceScoreBias,
     WindowScoreBias3d,
 )
+from .rope import RoPE2d
 
 
 try:
@@ -64,7 +65,7 @@ class SEBlockNHWC(nn.Module):
         return x * z
 
 
-def sliced_sdp(q, k, v, num_heads, attn_mask=None, dropout_p=0.0, is_causal=False):
+def sliced_sdp(q, k, v, num_heads, attn_mask=None, rope=None, dropout_p=0.0, is_causal=False):
     B, QN, C = q.shape  # batch, sequence, feature
     KN = k.shape[1]
     assert C % num_heads == 0
@@ -73,6 +74,10 @@ def sliced_sdp(q, k, v, num_heads, attn_mask=None, dropout_p=0.0, is_causal=Fals
     q = q.view(B, QN, num_heads, qkv_dim).permute(0, 2, 1, 3)
     k = k.view(B, KN, num_heads, qkv_dim).permute(0, 2, 1, 3)
     v = v.view(B, KN, num_heads, qkv_dim).permute(0, 2, 1, 3)
+
+    if rope is not None:
+        q = rope(q)
+        k = rope(k)
 
     use_flash = B <= 65535  # avoid CUDA error: invalid configuration argument.
     with use_flash_attention(use_flash):
@@ -113,10 +118,11 @@ class MHA(nn.Module):
         self.head_proj = nn.Linear(qkv_dim * num_heads, embed_dim)
         basic_module_init(self)
 
-    def forward(self, x, attn_mask=None, dropout_p=0.0, is_causal=False):
+    def forward(self, x, attn_mask=None, dropout_p=0.0, is_causal=False, rope=None):
         # x.shape: batch, sequence, feature
         q, k, v = self.qkv_proj(x).split(self.qkv_dim * self.num_heads, dim=-1)
-        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask, rope=rope,
+                       dropout_p=dropout_p, is_causal=is_causal)
         x = self.head_proj(x)
         return x
 
@@ -151,7 +157,7 @@ class WindowMHA2d(nn.Module):
         self.mha = MHA(in_channels, num_heads=num_heads, qkv_dim=qkv_dim, qkv_bias=qkv_bias)
         basic_module_init(self)
 
-    def forward(self, x, attn_mask=None, layer_norm=None):
+    def forward(self, x, attn_mask=None, layer_norm=None, rope=None):
         if self.shift[0] or self.shift[1]:
             if self.shift_mask_bias is not None:
                 x = pad_shift_mask_token(x, self.shift_mask_bias, self.window_size, self.shift)
@@ -161,7 +167,7 @@ class WindowMHA2d(nn.Module):
         x = bchw_to_bnc(x, self.window_size)
         if layer_norm is not None:
             x = layer_norm(x)
-        x = self.mha(x, attn_mask=attn_mask)
+        x = self.mha(x, attn_mask=attn_mask, rope=rope)
         x = bnc_to_bchw(x, out_shape, self.window_size)
         if self.shift[0] or self.shift[1]:
             x = F.pad(x, (-self.pad_w, -self.pad_w, -self.pad_h, -self.pad_h))
@@ -603,12 +609,24 @@ def _test_bias2():
     bias()
 
 
+def _test_rope():
+    dim = 64
+    num_heads = 4
+    window_size = (8, 8)
+
+    mha = WindowMHA2d(dim, num_heads=num_heads, window_size=window_size).cuda()
+    rope = RoPE2d(dim // num_heads, *window_size).cuda()
+    x = torch.rand((4, dim, 32, 32)).cuda()
+    mha(x, rope=rope)
+
+
 if __name__ == "__main__":
     # _test_spatial_reduction()
     _test_neighborhood()
     _test_shift()
     _test_bias()
     _test_bias2()
+    _test_rope()
     _test_2d()
     _test_3d()
     pass
