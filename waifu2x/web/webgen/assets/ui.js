@@ -8,11 +8,9 @@ function on_turnstile_success(token) {
 
 function disable_buttons() {
     $("#submit-button").prop("disabled", true);
-    $("#download-button").prop("disabled", true);
 }
 function enable_buttons() {
     $("#submit-button").prop("disabled", false);
-    $("#download-button").prop("disabled", false);
 }
 
 
@@ -21,6 +19,54 @@ $(function (){
     var recaptcha_js = "https://www.recaptcha.net/recaptcha/api.js";
     var turnstile_widgetid;
     var turnstile_is_enabled = false;
+    var g_last_fingerprint = "";
+    var g_error_count = 0;
+
+    function get_fingerprint() {
+        var obj = {
+            style: $("input[name=style]:checked").val(),
+            noise: $("input[name=noise]:checked").val(),
+            scale: $("input[name=scale]:checked").val(),
+            format: $("input[name=format]:checked").val(),
+            url: $("#url").val()
+        };
+        var file = $("#file").get(0).files[0];
+        if (file) {
+            obj.file = {name: file.name, size: file.size, lastModified: file.lastModified};
+        }
+        return JSON.stringify(obj);
+    }
+
+    function parse_error_html(html) {
+        var title_match = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+        var pre_match = /<body\b[^>]*>[\s\S]*?<pre\b[^>]*>([\s\S]*?)<\/pre>/i.exec(html);
+        var title = title_match ? title_match[1].trim() : "";
+        var body_pre = pre_match ? pre_match[1].trim() : "";
+        var text = "";
+        if (title) text += title;
+        if (body_pre) text += (text ? "\n" : "") + body_pre;
+        return text;
+    }
+
+    function set_error_message(text, second, is_html, status) {
+        var count = ++g_error_count;
+        if (!second) second = 2;
+        var display_text = is_html ? parse_error_html(text) : text;
+        
+        if (display_text) {
+            $("#error_message").text(display_text).show();
+        } else if (status) {
+            $("#error_message").text("HTTP Error (" + status + ")").show();
+        } else {
+            $("#error_message").text(text).show();
+        }
+
+        setTimeout(function() {
+            if (count == g_error_count) {
+                $("#error_message").fadeOut();
+            }
+        }, second * 1000);
+    }
 
     function reset_turnstile() {
         turnstile.reset(turnstile_widgetid);
@@ -110,7 +156,62 @@ $(function (){
         }
         return default_val;
     }
-    function download_with_xhr(e) 
+    function webp_to_png(blob, callback) {
+        var url = URL.createObjectURL(blob);
+        var img = new Image();
+        img.onload = function() {
+            var width = img.width;
+            var height = img.height;
+            var canvas = document.createElement("canvas");
+            canvas.width = width;
+            canvas.height = height;
+            var gl = canvas.getContext("webgl");
+            if (gl) {
+                gl.activeTexture(gl.TEXTURE0);
+                var texture = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, texture);
+                gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                var framebuffer = gl.createFramebuffer();
+                gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+                var image_data = new ImageData(width, height);
+                gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, image_data.data);
+                
+                var has_alpha = false;
+                for (var i = 3; i < image_data.data.length; i += 4) {
+                    if (image_data.data[i] < 255) {
+                        has_alpha = true;
+                        break;
+                    }
+                }
+
+                var out_canvas = document.createElement("canvas");
+                out_canvas.width = width;
+                out_canvas.height = height;
+                var out_ctx = out_canvas.getContext("2d", {alpha: has_alpha});
+                out_ctx.putImageData(image_data, 0, 0);
+                canvas = out_canvas;
+
+                gl.deleteTexture(texture);
+                gl.deleteFramebuffer(framebuffer);
+            } else {
+                canvas.getContext("2d").drawImage(img, 0, 0);
+            }
+            canvas.toBlob(function(pngBlob) {
+                URL.revokeObjectURL(url);
+                callback(pngBlob);
+            }, "image/png");
+        };
+        img.onerror = function() {
+            URL.revokeObjectURL(url);
+            callback(blob);
+        };
+        img.src = url;
+    }
+    function request_image() 
     {
         if (typeof window.URL.createObjectURL == "undefined" ||
             typeof window.Blob == "undefined" ||
@@ -119,28 +220,82 @@ $(function (){
         {
             return;
         }
-        e.preventDefault();
-        e.stopPropagation();
+
+        var current_fingerprint = get_fingerprint();
+        if (current_fingerprint == g_last_fingerprint) {
+            console.log("skip identical request");
+            set_error_message("The request is identical to the previous one.");
+            return;
+        }
+
+        $("#error_message").hide();
         var xhr = new XMLHttpRequest();
         xhr.open('POST', '/api', true);
         xhr.responseType = 'arraybuffer';
         xhr.onload = function(e) {
-            if (this.status == 200) {
-                var blob = new Blob([this.response], {type : 'image/png'});
-                var a = document.createElement("a");
-                var url = URL.createObjectURL(blob);
-                a.href = url;
-                a.target = "_blank";
-                a.download = extract_filename(this.getResponseHeader("Content-Disposition"), uuid() + ".png");
-                document.body.appendChild(a);
-                a.click();
-                setTimeout(function () { URL.revokeObjectURL(url); }, 100);
-            } else {
-                alert("Download Error");
+            $("#loading").hide();
+            if (!turnstile_is_enabled && typeof grecaptcha == "undefined") {
+                enable_buttons();
             }
+            if (this.status == 200) {
+                g_last_fingerprint = current_fingerprint;
+                var contentType = this.getResponseHeader("Content-Type");
+                var blob = new Blob([this.response], {type : contentType});
+                var format = $("input[name=format]:checked").val();
+                var disposition = this.getResponseHeader("Content-Disposition");
+
+                var proceed = function(finalBlob) {
+                    var finalType = finalBlob.type;
+                    var ext = (finalType == "image/webp") ? "webp" : "png";
+                    var filename = extract_filename(disposition, uuid() + "." + ext);
+                    if (ext == "png") {
+                        filename = filename.replace(/\.webp$/i, ".png");
+                        if (!filename.match(/\.png$/i)) filename += ".png";
+                    } else {
+                        filename = filename.replace(/\.png$/i, ".webp");
+                        if (!filename.match(/\.webp$/i)) filename += ".webp";
+                    }
+
+                    var url = URL.createObjectURL(finalBlob);
+                    var img = $("<img>").attr("src", url).click(function() {
+                        $(this).toggleClass("zoomed");
+                    });
+                    var link = $("<a>")
+                        .attr("href", url)
+                        .attr("download", filename)
+                        .addClass("download-link")
+                        .text("Download " + filename);
+                    var item = $("<div>").addClass("result-item").append(link).append(img);
+                    $("#result").prepend(item);
+                };
+
+                if (format == "0" && contentType == "image/webp") {
+                    webp_to_png(blob, proceed);
+                } else {
+                    proceed(blob);
+                }
+            } else {
+                var contentType = this.getResponseHeader("Content-Type");
+                var error_text = "HTTP Error (" + this.status + ")";
+                var is_html = (contentType && contentType.indexOf("text/html") !== -1);
+                try {
+                    var decoded = new TextDecoder().decode(new Uint8Array(this.response));
+                    if (decoded) error_text = decoded;
+                } catch (err) {}
+                set_error_message(error_text, 10, is_html, this.status);
+            }
+        };
+        xhr.onerror = function() {
+            $("#loading").hide();
+            if (!turnstile_is_enabled && typeof grecaptcha == "undefined") {
+                enable_buttons();
+            }
+            set_error_message("Network Error", 10);
         };
         commit_recap_response();
         commit_turnstile_response();
+        $("#loading").show();
+        disable_buttons();
         xhr.send(new FormData($("form").get(0)));
     }
     function load_recaptcha()
@@ -209,12 +364,9 @@ $(function (){
     $("input[name=noise]").change(on_change_noise_level);
     $("input[name=scale]").change(on_change_scale_factor);
     $("input[name=format]").change(on_change_format);
-    $("input[name=download]").click(download_with_xhr);
     $("form").submit(function(e) {
         e.preventDefault();
-        commit_recap_response();
-        commit_turnstile_response();
-        this.submit();
+        request_image();
     });
     $(document).on({
         dragover: function() { return false; },

@@ -203,3 +203,47 @@ label {
 .g-recaptcha {
     margin: 8px;
 }
+#result {
+    margin-top: 20px;
+    text-align: center;
+}
+#result img {
+    max-width: 100%;
+    margin-bottom: 5px;
+    border: 1px solid #ddd;
+    cursor: zoom-in;
+}
+#result img.zoomed {
+    max-width: none;
+    cursor: zoom-out;
+}
+.result-item {
+    border-top: 2px solid #ccc;
+    padding-top: 10px;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+}
+.download-link {
+    display: block;
+    margin-bottom: 5px;
+    font-size: 0.9em;
+    color: #36b;
+    text-decoration: none;
+    text-align: left;
+}
+.download-link:hover {
+    text-decoration: underline;
+}
+#loading {
+    display: none;
+    color: #444;
+    font-weight: bold;
+    margin: 10px 0;
+}
+#error_message {
+    display: none;
+    color: #d33;
+    font-weight: bold;
+    margin: 10px 0;
+    white-space: pre-wrap;
+}
