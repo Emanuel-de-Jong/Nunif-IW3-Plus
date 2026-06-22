@@ -102,6 +102,37 @@ def pad_shift_mask_token(x, mask_token, window_size, shift=(True, True)):
     return x
 
 
+class LinearQKV(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, q_bias: bool, k_bias: bool, v_bias: bool) -> None:
+        assert out_features % 3 == 0
+        flags = [q_bias, k_bias, v_bias]
+        has_bias = any(flags)
+
+        super().__init__(in_features, out_features, bias=has_bias)
+
+        if has_bias and not all(flags):
+            qkv_dim = out_features // 3
+            bias_mask = torch.ones(out_features)
+            if not q_bias:
+                bias_mask[:qkv_dim] = 0.0
+            if not k_bias:
+                bias_mask[qkv_dim:qkv_dim * 2] = 0.0
+            if not v_bias:
+                bias_mask[-qkv_dim:] = 0.0
+
+            self.register_buffer("bias_mask", bias_mask, persistent=False)
+        else:
+            self.bias_mask = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bias_mask is not None:
+            bias = self.bias * self.bias_mask.to(self.bias.dtype)
+        else:
+            bias = self.bias
+
+        return F.linear(x, self.weight, bias)
+
+
 class MHA(nn.Module):
     def __init__(self, embed_dim, num_heads, qkv_dim=None, qkv_bias=True):
         super().__init__()
@@ -114,7 +145,12 @@ class MHA(nn.Module):
             qkv_dim = embed_dim // num_heads
         self.qkv_dim = qkv_dim
         self.num_heads = num_heads
-        self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads * 3, bias=qkv_bias)
+        if qkv_bias:
+            # for compatibility
+            self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads * 3, bias=qkv_bias)
+        else:
+            self.qkv_proj = LinearQKV(embed_dim, qkv_dim * num_heads * 3, q_bias=False, k_bias=False, v_bias=True)
+
         self.head_proj = nn.Linear(qkv_dim * num_heads, embed_dim)
         basic_module_init(self)
 
@@ -620,6 +656,20 @@ def _test_rope():
     mha(x, rope=rope)
 
 
+def _test_linear_qkv():
+    linear = LinearQKV(32, 32 * 3, q_bias=True, k_bias=False, v_bias=True)
+    nn.init.constant_(linear.weight, 1.0)
+    nn.init.constant_(linear.bias, 1.0)
+
+    linear = linear.cuda()
+    x = torch.ones((1, 32)).cuda()
+    q, k, v = linear(x).split(32, dim=-1)
+
+    assert torch.all(q == 32.0 + 1.0)
+    assert torch.all(k == 32.0)
+    assert torch.all(v == 32.0 + 1.0)
+
+
 if __name__ == "__main__":
     # _test_spatial_reduction()
     _test_neighborhood()
@@ -629,4 +679,5 @@ if __name__ == "__main__":
     _test_rope()
     _test_2d()
     _test_3d()
+    _test_linear_qkv()
     pass
