@@ -138,7 +138,8 @@ def setup():
     parser.add_argument("--enable-recaptcha", action="store_true", help="enable reCAPTCHA. it requires --config option")
     parser.add_argument("--enable-turnstile", action="store_true",
                         help="enable CloudFlare Turnstile. it requires --config option")
-    parser.add_argument("--disable-png", action="store_true", help="disable PNG output")
+    parser.add_argument("--prefer-webp", action="store_true",
+                        help="If browser side PNG conversion is compatible, WebP is returned.")
     parser.add_argument("--config", type=str, help="config file for API tokens")
     parser.add_argument("--no-size-limit", action="store_true", help="No file/image size limits for private server")
     parser.add_argument("--torch-threads", type=int, help="The number of threads used for intraop parallelism on CPU")
@@ -281,8 +282,6 @@ def parse_request(request):
         scale = ScaleOption(int(request.forms.get("scale", "-1")))
         noise = NoiseOption(int(request.forms.get("noise", "-1")))
         image_format = FormatOption(int(request.forms.get("format", "0")))
-        if command_args.disable_png:
-            image_format = FormatOption.WEBP
 
     except ValueError:
         bottle.abort(400, "Bad Request")
@@ -394,6 +393,19 @@ def scale_16x(im, meta):
     return im
 
 
+def requires_png(meta):
+    if "grayscale" in meta and meta["grayscale"]:
+        return True
+
+    if "depth" in meta and meta["depth"] > 8:
+        return True
+
+    if "icc_profile" in meta and meta["icc_profile"] is not None:
+        return True
+
+    return False
+
+
 @bottle.get("/api")
 def api_get():
     last_request = request.get_cookie("last_request", secret=request.headers.get("User-Agent"))
@@ -444,6 +456,10 @@ def api():
     im, meta = fetch_image(request)
     if im is None:
         bottle.abort(400, "Image Load Error")
+
+    if command_args.prefer_webp and not requires_png(meta):
+        image_format = "webp"
+
     logger.debug(f"api: image: {dump_meta(meta)}")
     if scale != ScaleOption.NONE and im.size[0] * im.size[1] > MAX_SCALE_PIXELS:
         im.close()
