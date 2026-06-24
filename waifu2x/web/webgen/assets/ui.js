@@ -237,11 +237,17 @@ $(function (){
         }
 
         $("#error_message").hide();
+        var $item = $("<div>").addClass("result-item");
+        var $loading = $("<div>").addClass("item-loading").append($("<img>").attr("src", "loading.webp"));
+        $item.append($loading);
+        $("#result").prepend($item);
+        $("#result_wrapper").show();
+
         var xhr = new XMLHttpRequest();
         xhr.open('POST', '/api', true);
         xhr.responseType = 'arraybuffer';
         xhr.onload = function(e) {
-            $("#loading").hide();
+            $loading.remove();
             if (!turnstile_is_enabled && typeof grecaptcha == "undefined") {
                 enable_buttons();
             }
@@ -273,9 +279,7 @@ $(function (){
                         .attr("download", filename)
                         .addClass("download-link")
                         .text("Download " + filename);
-                    var item = $("<div>").addClass("result-item").append(link).append(img);
-                    $("#result").prepend(item);
-                    $("#result_wrapper").show();
+                    $item.append(link).append(img);
                 };
 
                 if (format == "0" && contentType == "image/webp") {
@@ -289,22 +293,25 @@ $(function (){
                 var is_html = (contentType && contentType.indexOf("text/html") !== -1);
                 try {
                     var decoded = new TextDecoder().decode(new Uint8Array(this.response));
-                    if (decoded) error_text = decoded;
+                    if (decoded) {
+                        error_text = is_html ? parse_error_html(decoded) : decoded;
+                        if (!error_text) error_text = "HTTP Error (" + this.status + ")";
+                    }
                 } catch (err) {}
-                set_error_message(error_text, 10, is_html, this.status);
+                var $error = $("<div>").addClass("item-error").text(error_text);
+                $item.append($error);
             }
         };
         xhr.onerror = function() {
-            $("#loading").hide();
+            $loading.remove();
             if (!turnstile_is_enabled && typeof grecaptcha == "undefined") {
                 enable_buttons();
             }
-            set_error_message("Network Error", 10);
+            var $error = $("<div>").addClass("item-error").text("Network Error");
+            $item.append($error);
         };
         commit_recap_response();
         commit_turnstile_response();
-        $("#loading").show();
-        disable_buttons();
         xhr.send(new FormData($("form").get(0)));
     }
     function load_recaptcha()
