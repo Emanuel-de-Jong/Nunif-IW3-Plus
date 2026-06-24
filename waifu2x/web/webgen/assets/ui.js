@@ -224,15 +224,14 @@ $(function (){
 
         var current_fingerprint = get_fingerprint();
         if (current_fingerprint == g_last_fingerprint) {
-            console.log("skip identical request");
-            set_error_message("The request is identical to the previous one.");
+            set_error_message("Same request.");
             return;
         }
 
         var file = $("#file").get(0).files[0];
         var url = $("#url").val();
         if (!file && !url) {
-            set_error_message("Please choose a file or type a URL.");
+            set_error_message("Select a file or enter a URL.");
             return;
         }
 
