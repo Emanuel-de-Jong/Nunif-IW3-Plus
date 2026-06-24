@@ -157,6 +157,7 @@ $(function (){
         return default_val;
     }
     function webp_to_png(blob, callback) {
+        console.log("Use webp_to_png")
         var url = URL.createObjectURL(blob);
         var img = new Image();
         img.onload = function() {
@@ -228,6 +229,13 @@ $(function (){
             return;
         }
 
+        var file = $("#file").get(0).files[0];
+        var url = $("#url").val();
+        if (!file && !url) {
+            set_error_message("Please choose a file or type a URL.");
+            return;
+        }
+
         $("#error_message").hide();
         var xhr = new XMLHttpRequest();
         xhr.open('POST', '/api', true);
@@ -257,7 +265,7 @@ $(function (){
                     }
 
                     var url = URL.createObjectURL(finalBlob);
-                    var img = $("<img>").attr("src", url).click(function() {
+                    var img = $("<img>").attr("src", url).attr("alt", filename).attr("title", filename).click(function() {
                         $(this).toggleClass("zoomed");
                     });
                     var link = $("<a>")
@@ -267,6 +275,7 @@ $(function (){
                         .text("Download " + filename);
                     var item = $("<div>").addClass("result-item").append(link).append(img);
                     $("#result").prepend(item);
+                    $("#result_wrapper").show();
                 };
 
                 if (format == "0" && contentType == "image/webp") {
@@ -365,8 +374,19 @@ $(function (){
     $("input[name=scale]").change(on_change_scale_factor);
     $("input[name=format]").change(on_change_format);
     $("form").submit(function(e) {
+        if ($("#result").length > 0) {
+            e.preventDefault();
+            request_image();
+        } else {
+            commit_recap_response();
+            commit_turnstile_response();
+            // allow default submit
+        }
+    });
+    $("#clear_results").click(function(e) {
         e.preventDefault();
-        request_image();
+        e.stopPropagation();
+        location.reload();
     });
     $(document).on({
         dragover: function() { return false; },

@@ -238,8 +238,13 @@
         % end
       </form>
       <div id="error_message"></div>
-      <div id="loading">( ・∀・)φ ...</div>
-      <div id="result"></div>
+      <div id="loading">
+        <img src="loading.webp" alt="loading">
+      </div>
+      <div id="result_wrapper" style="display: none">
+        <input type="button" id="clear_results" value="Clear" class="button">
+        <div id="result"></div>
+      </div>
     </div>
     <div class="bottom-info address">
       <a href="https://github.com/nagadomi/waifu2x" class="gray-link" target="_blank">waifu2x</a>,
