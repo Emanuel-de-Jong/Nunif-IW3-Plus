@@ -238,9 +238,6 @@
         % end
       </form>
       <div id="error_message"></div>
-      <div id="loading">
-        <img src="loading.webp" alt="loading">
-      </div>
       <div id="result_wrapper" style="display: none">
         <input type="button" id="clear_results" value="{{button_clear}}" class="button">
         <div id="result"></div>

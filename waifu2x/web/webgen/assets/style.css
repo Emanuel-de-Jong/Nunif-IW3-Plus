@@ -259,12 +259,6 @@ label {
 .download-link:hover {
     text-decoration: underline;
 }
-#loading {
-    display: none;
-    color: #444;
-    font-weight: bold;
-    margin: 10px 0;
-}
 #error_message {
     display: none;
     color: #d33;
