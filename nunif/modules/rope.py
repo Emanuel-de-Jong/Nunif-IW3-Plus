@@ -57,9 +57,10 @@ class RoPE2d(nn.Module):
         """
         x: [B, num_heads, N, head_dim] (N = h * w)
         """
-        assert x.shape[-1] % 4 == 0
-        x_h = x[..., : self.head_dim // 2]
-        x_w = x[..., self.head_dim // 2 :]
+        assert x.shape[-1] == self.head_dim
+        x_float = x.to(torch.float32)
+        x_h = x_float[..., : self.head_dim // 2]
+        x_w = x_float[..., self.head_dim // 2 :]
 
         out_h = (x_h * self.cos_h) + (self.rotate_half(x_h) * self.sin_h)
         out_w = (x_w * self.cos_w) + (self.rotate_half(x_w) * self.sin_w)
@@ -80,6 +81,9 @@ def _test():
     with torch.autocast(device_type=x.device.type):
         z = rope(x)
     assert x.shape == z.shape
+
+    z = rope(x.to(torch.float16))
+    assert z.dtype == torch.float16
 
 
 if __name__ == "__main__":
