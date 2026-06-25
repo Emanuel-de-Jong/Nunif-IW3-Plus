@@ -43,7 +43,7 @@ class RoPE2d(nn.Module):
         inv_freq = 1.0 / (self.theta**exp)
         t = torch.arange(max_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
-        emb = torch.repeat_interleave(freqs, 2, dim=-1)
+        emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos(), emb.sin()
 
     @staticmethod
