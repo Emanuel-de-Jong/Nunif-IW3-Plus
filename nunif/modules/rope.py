@@ -2,26 +2,25 @@ import torch
 import torch.nn as nn
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    return x * cos + rotate_half(x) * sin
-
-
-def apply_rope_inplace(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    out = torch.empty_like(x)
     half = x.shape[-1] // 2
     i1 = (Ellipsis, slice(None, half))
     i2 = (Ellipsis, slice(half, None))
-    sin = sin[i1]  # sin[i1] == sin[i2]
-    cos = cos[i1]
-    out[i1] = x[i1] * cos - x[i2] * sin
-    out[i2] = x[i2] * cos + x[i1] * sin
-    return out
+    if True:
+        # This requires Torch 2.13 or later.
+        sin = sin[i1]  # sin[i1] == sin[i2]
+        # float32
+        out = x * cos
+        out[i1].addcmul_(x[i2], sin, value=-1)
+        out[i2].addcmul_(x[i1], sin, value=1)
+        return out.to(x.dtype)
+    else:
+        out = torch.empty_like(x)
+        sin = sin[i1]  # sin[i1] == sin[i2]
+        cos = cos[i1]
+        out[i1] = x[i1] * cos - x[i2] * sin
+        out[i2] = x[i2] * cos + x[i1] * sin
+        return out
 
 
 class RoPE2d(nn.Module):
@@ -30,12 +29,12 @@ class RoPE2d(nn.Module):
     cos_w: torch.Tensor
     sin_w: torch.Tensor
 
-    def __init__(self, head_dim: int, height: int, width: int, theta: float = 100.0) -> None:
+    def __init__(self, head_dim: int, height: int, width: int, base: float = 100.0) -> None:
         super().__init__()
         assert head_dim % 4 == 0, "head_dim must be a multiple of 4"
 
         self.head_dim = head_dim
-        self.theta = theta
+        self.base = base
         self.height = height
         self.width = width
         self.dim_chunk = head_dim // 2
@@ -60,7 +59,7 @@ class RoPE2d(nn.Module):
 
     def _get_1d_sin_cos(self, max_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
         exp = torch.arange(0, dim, 2, dtype=torch.float32) / dim
-        inv_freq = 1.0 / (self.theta**exp)
+        inv_freq = 1.0 / (self.base**exp)
         t = torch.arange(max_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
@@ -71,19 +70,11 @@ class RoPE2d(nn.Module):
         x: [B, num_heads, N, head_dim] (N = h * w)
         """
         B, num_heads, N, head_dim = x.shape
+        x_h = x[..., : self.dim_chunk].reshape(B, num_heads, self.height, self.width, self.dim_chunk)
+        x_w = x[..., self.dim_chunk :].reshape(B, num_heads, self.height, self.width, self.dim_chunk)
 
-        x_float = x.float()
-
-        x_h = x_float[..., :self.dim_chunk].reshape(B, num_heads, self.height, self.width, self.dim_chunk)
-        x_w = x_float[..., self.dim_chunk:].reshape(B, num_heads, self.height, self.width, self.dim_chunk)
-
-        if False:
-            # slow
-            out_h = apply_rope(x_h, self.cos_h, self.sin_h)
-            out_w = apply_rope(x_w, self.cos_w, self.sin_w)
-        else:
-            out_h = apply_rope_inplace(x_h, self.cos_h, self.sin_h)
-            out_w = apply_rope_inplace(x_w, self.cos_w, self.sin_w)
+        out_h = apply_rope(x_h, self.cos_h, self.sin_h)
+        out_w = apply_rope(x_w, self.cos_w, self.sin_w)
 
         out_h = out_h.reshape(B, num_heads, N, self.dim_chunk)
         out_w = out_w.reshape(B, num_heads, N, self.dim_chunk)
@@ -96,14 +87,14 @@ def _bench(do_compile):
     device = "cuda:0"
     N = 20
     LAYERS = 10
-    B = 4
+    B = 16
     S = (128, 128)
     dim = 256
     num_heads = 4
     head_dim = dim // 4
 
     rope = RoPE2d(head_dim, S[0], S[1]).cuda()
-    x = torch.rand((4, num_heads, S[0] * S[1], head_dim), dtype=torch.float16, device="cuda")
+    x = torch.rand((B, num_heads, S[0] * S[1], head_dim), dtype=torch.float16, device="cuda")
     if do_compile:
         # over 10x faster
         rope = torch.compile(rope)
