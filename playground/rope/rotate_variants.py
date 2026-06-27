@@ -55,6 +55,23 @@ def rotate_with_rotate_half_inplace(x, theta):
     return output
 
 
+def rotate_with_rotate_half_inplace2(x, theta):
+    # This is faster than `rotate_with_rotate_half_inplace` in eager mode.
+    # However, it fails to compile with Torch 2.12. It appears to have been fixed in 2.13.
+    assert x.shape[0] % 2 == 0
+    half = x.shape[0] // 2
+
+    cos = theta.cos()
+    cos = torch.cat([cos, cos], dim=-1)
+    sin = theta.sin()
+
+    output = x * cos
+    output[:half].addcmul_(x[half:], sin, value=-1)
+    output[half:].addcmul_(x[:half], sin, value=1)
+
+    return output.to(x.dtype)
+
+
 def transpose_wrapper(f):
     # A wrapper for converting between halving and odd-even splitting
 
@@ -64,6 +81,8 @@ def transpose_wrapper(f):
         output_transposed = f(x_transposed, theta)
         output = output_transposed.reshape(-1, 2).permute(1, 0).reshape((-1,)).contiguous()
         return output
+
+    _wrapper.__name__ = f.__name__
 
     return _wrapper
 
@@ -85,26 +104,18 @@ def main():
     x = torch.linspace(0, 1, N)
     theta = torch.linspace(0, torch.pi * 2, N // 2)
 
-    z1 = rotate_reference(x, theta)
-    print("rotate_reference\n", z1)
-    z2 = rotate_with_rotate_half(x, theta)
-    print("rotate_with_rotate_half\n", z2)
-    z3 = rotate_with_rotate_half_inplace(x, theta)
-    print("rotate_with_rotate_half_inplace\n", z3)
-    z4 = rotate_with_complex(x, theta)
-    print("rotate_with_complex\n", z4)
-
-    check1 = torch.all(torch.isclose(z1, z2))
-    print("rotate_reference == rotate_with_rotate_half", check1)
-    assert check1
-
-    check2 = torch.all(torch.isclose(z1, z3))
-    print("rotate_reference == rotate_with_rotate_half_inplace", check2)
-    assert check2
-
-    check3 = torch.all(torch.isclose(z1, z4))
-    print("rotate_reference == rotate_with_complex", check3)
-    assert check3
+    reference = rotate_reference(x, theta)
+    print("rotate_reference\n", reference)
+    for f in [
+        rotate_with_rotate_half,
+        rotate_with_rotate_half_inplace,
+        rotate_with_rotate_half_inplace2,
+        rotate_with_complex,
+    ]:
+        z = f(x, theta)
+        print(f"{f.__name__}\n", z)
+        check = torch.all(torch.isclose(reference, z))
+        print(f"rotate_reference == {f.__name__}", check)
 
 
 if __name__ == "__main__":
