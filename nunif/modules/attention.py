@@ -149,7 +149,7 @@ class MHA(nn.Module):
             # for compatibility
             self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads * 3, bias=qkv_bias)
         else:
-            self.qkv_proj = LinearQKV(embed_dim, qkv_dim * num_heads * 3, q_bias=False, k_bias=False, v_bias=True)
+            self.qkv_proj = LinearQKV(embed_dim, qkv_dim * num_heads * 3, q_bias=True, k_bias=False, v_bias=True)
 
         self.head_proj = nn.Linear(qkv_dim * num_heads, embed_dim)
         basic_module_init(self)
@@ -168,7 +168,7 @@ class WindowMHA2d(nn.Module):
     BCHW input/output
     """
     def __init__(self, in_channels, num_heads, window_size=(4, 4),
-                 qkv_dim=None, shift=False, shift_mask_token=False, qkv_bias=True):
+                 qkv_dim=None, shift=False, shift_mask_token=False):
         super().__init__()
         self.window_size = (window_size if isinstance(window_size, (tuple, list))
                             else (window_size, window_size))
@@ -190,10 +190,10 @@ class WindowMHA2d(nn.Module):
             self.shift_mask_bias = None
 
         self.num_heads = num_heads
-        self.mha = MHA(in_channels, num_heads=num_heads, qkv_dim=qkv_dim, qkv_bias=qkv_bias)
+        self.mha = MHA(in_channels, num_heads=num_heads, qkv_dim=qkv_dim, qkv_bias=True)
         basic_module_init(self)
 
-    def forward(self, x, attn_mask=None, layer_norm=None, rope=None):
+    def forward(self, x, attn_mask=None, layer_norm=None):
         if self.shift[0] or self.shift[1]:
             if self.shift_mask_bias is not None:
                 x = pad_shift_mask_token(x, self.shift_mask_bias, self.window_size, self.shift)
@@ -203,10 +203,92 @@ class WindowMHA2d(nn.Module):
         x = bchw_to_bnc(x, self.window_size)
         if layer_norm is not None:
             x = layer_norm(x)
-        x = self.mha(x, attn_mask=attn_mask, rope=rope)
+        x = self.mha(x, attn_mask=attn_mask)
         x = bnc_to_bchw(x, out_shape, self.window_size)
         if self.shift[0] or self.shift[1]:
             x = F.pad(x, (-self.pad_w, -self.pad_w, -self.pad_h, -self.pad_h))
+        return x
+
+
+def gen_padded_attention_mask_2d(
+        B: int,
+        H: int,
+        W: int,
+        window_h: int,
+        window_w: int,
+        pad_h: int,
+        pad_w: int,
+        device: torch.device
+) -> torch.Tensor:
+    with torch.no_grad():
+        mask_pad = torch.zeros((1, 1, H + pad_h * 2, W + pad_w * 2), device=device, dtype=torch.bool)
+        mask_pad[:, :, pad_h: pad_h + H, pad_w:pad_w + W] = True
+
+        # (num_windows, N)
+        N = window_h * window_w
+        win_mask = bchw_to_bnc(mask_pad, (window_h, window_w)).view(-1, N)
+
+        # (num_windows, 1, N, N)
+        attn_mask = ~(win_mask.unsqueeze(1) & win_mask.unsqueeze(2))
+        attn_mask = attn_mask.unsqueeze(1)
+
+        # (B * num_windows, 1, N, N)
+        num_windows = attn_mask.shape[0]
+        attn_mask = attn_mask.unsqueeze(0).expand(B, -1, -1, -1, -1).reshape(B * num_windows, 1, N, N)
+
+    return attn_mask
+
+
+class WindowMHA2dV2(nn.Module):
+    """ WindowMHA2d with RoPE2d
+    BCHW input/output
+    """
+    def __init__(self, in_channels: int, num_heads: int, window_size: int | tuple[int, int], shift: bool = False) -> None:
+        super().__init__()
+        self.window_size = (window_size if isinstance(window_size, (tuple, list))
+                            else (window_size, window_size))
+        self.shift = (shift if isinstance(shift, (tuple, list)) else (shift, shift))
+        self.pad_h = self.pad_w = 0
+        if self.shift[0]:
+            assert self.window_size[0] % 2 == 0
+            self.pad_h = self.window_size[0] // 2
+        if self.shift[1]:
+            assert self.window_size[1] % 2 == 0
+            self.pad_w = self.window_size[1] // 2
+
+        self.mha = MHA(in_channels, num_heads, qkv_bias=False)
+        self.rope = RoPE2d(in_channels // num_heads, self.window_size[0], self.window_size[1])
+        basic_module_init(self)
+
+    def forward(self, x: torch.Tensor, layer_norm: nn.Module | None = None) -> torch.Tensor:
+        B, C, H, W = x.shape
+        assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0
+
+        needs_pad = self.pad_h > 0 or self.pad_w > 0
+        if needs_pad:
+            x = F.pad(x, (self.pad_w, self.pad_w, self.pad_h, self.pad_h), mode="constant", value=0)
+            attn_mask = gen_padded_attention_mask_2d(
+                B,
+                H,
+                W,
+                self.window_size[0],
+                self.window_size[1],
+                self.pad_h,
+                self.pad_w,
+                x.device,
+            )
+        else:
+            attn_mask = None
+
+        out_shape = x.shape
+        x = bchw_to_bnc(x, self.window_size)
+        if layer_norm is not None:
+            x = layer_norm(x)
+        x = self.mha(x, attn_mask=attn_mask, rope=self.rope)
+        x = bnc_to_bchw(x, out_shape, self.window_size)
+        if needs_pad:
+            x = x[:, :, self.pad_h:self.pad_h + H, self.pad_w: self.pad_w + W]
+
         return x
 
 
