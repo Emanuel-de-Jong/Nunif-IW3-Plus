@@ -4,7 +4,9 @@ import torch.nn as nn
 from tqdm import tqdm
 from . confusion_matrix import SoftmaxConfusionMatrix
 from .. models.utils import get_model_device
-from .. modules import ClampLoss, LuminanceWeightedLoss, LuminancePSNR, PSNR
+from .. modules.clamp_loss import ClampLoss
+from .. modules.channel_weighted_loss import LuminanceWeightedLoss
+from .. modules.psnr import LuminancePSNRPerImage, PSNRPerImage
 from .. device import autocast
 from abc import ABC, abstractmethod
 from .. logger import logger
@@ -342,22 +344,22 @@ class RGBPSNREnv(I2IEnv):
     def __init__(self, model, criterion=None):
         if criterion is None:
             criterion = ClampLoss(nn.HuberLoss(0.3))
-        super().__init__(model, criterion=criterion, eval_criterion=PSNR())
+        super().__init__(model, criterion=criterion, eval_criterion=PSNRPerImage())
 
     def print_eval_result(self, psnr_loss, file=sys.stdout):
         psnr = -psnr_loss
-        print(f"Batch RGB-PSNR: {psnr}", file=file)
+        print(f"RGB-PSNR: {psnr}", file=file)
 
 
 class LuminancePSNREnv(I2IEnv):
     def __init__(self, model, criterion=None):
         if criterion is None:
             criterion = ClampLoss(LuminanceWeightedLoss(nn.HuberLoss(0.3)))
-        super().__init__(model, criterion=criterion, eval_criterion=LuminancePSNR())
+        super().__init__(model, criterion=criterion, eval_criterion=LuminancePSNRPerImage())
 
     def print_eval_result(self, psnr_loss, file=sys.stdout):
         psnr = -psnr_loss
-        print(f"Batch Y-PSNR: {psnr}", file=file)
+        print(f"Y-PSNR: {psnr}", file=file)
 
 
 class UnsupervisedEnv(BaseEnv):
