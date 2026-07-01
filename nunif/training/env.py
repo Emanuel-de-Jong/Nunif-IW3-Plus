@@ -1,15 +1,17 @@
 import sys
+from abc import ABC, abstractmethod
+
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from . confusion_matrix import SoftmaxConfusionMatrix
-from .. models.utils import get_model_device
-from .. modules.clamp_loss import ClampLoss
-from .. modules.channel_weighted_loss import LuminanceWeightedLoss
-from .. modules.psnr import LuminancePSNRPerImage, PSNRPerImage
-from .. device import autocast
-from abc import ABC, abstractmethod
-from .. logger import logger
+
+from ..device import autocast
+from ..logger import logger
+from ..models.utils import get_model_device
+from ..modules.channel_weighted_loss import LuminanceWeightedLoss
+from ..modules.clamp_loss import ClampLoss
+from ..modules.psnr import LuminancePSNRPerImage, PSNRPerImage
+from .confusion_matrix import SoftmaxConfusionMatrix
 
 
 class BaseEnv(ABC):
@@ -69,9 +71,8 @@ class BaseEnv(ABC):
                     grad_scaler.unscale_(optimizer)
                     for group in optimizer.param_groups:
                         torch.nn.utils.clip_grad_norm_(
-                            group["params"],
-                            max_norm=self.trainer.args.clip_grad_norm,
-                            error_if_nonfinite=False)
+                            group["params"], max_norm=self.trainer.args.clip_grad_norm, error_if_nonfinite=False
+                        )
                 grad_scaler.step(optimizer)
                 optimizer.zero_grad()
             grad_scaler.update()
@@ -80,9 +81,7 @@ class BaseEnv(ABC):
                 if self.trainer.args.clip_grad_norm > 0:
                     for group in optimizer.param_groups:
                         torch.nn.utils.clip_grad_norm_(
-                            group["params"],
-                            max_norm=self.trainer.args.clip_grad_norm,
-                            error_if_nonfinite=False
+                            group["params"], max_norm=self.trainer.args.clip_grad_norm, error_if_nonfinite=False
                         )
                 optimizer.step()
                 optimizer.zero_grad()
@@ -92,16 +91,18 @@ class BaseEnv(ABC):
             if len(grad_scalers) == 1:
                 grad_scaler = grad_scalers[0]
             else:
-                raise NotImplementedError("More than one grad_scaler found. You need to implement `train_backward_step`.")
+                raise NotImplementedError(
+                    "More than one grad_scaler found. You need to implement `train_backward_step`."
+                )
         else:
             grad_scaler = grad_scalers
         self.backward(loss, grad_scaler)
         if update:
             self.optimizer_step(optimizers, grad_scaler)
 
-    def calculate_adaptive_weight(self, base_loss, second_loss, param,
-                                  grad_scaler, min=1e-6, max=1., mode="norm",
-                                  adaptive_weight=1.0):
+    def calculate_adaptive_weight(
+        self, base_loss, second_loss, param, grad_scaler, min=1e-6, max=1.0, mode="norm", adaptive_weight=1.0
+    ):
         base_loss = grad_scaler.scale(base_loss)
         second_loss = grad_scaler.scale(second_loss * adaptive_weight)
         # ref. taming transformers
@@ -124,9 +125,16 @@ class BaseEnv(ABC):
             raise NotImplementedError()
         grad_ratio = torch.clamp(base_grad_strength / second_grad_strength, min, max).item()
         if False:
-            print("base", base_grad_strength.item(), "second", second_grad_strength.item(),
-                  "weight", (base_grad_strength / second_grad_strength).item(),
-                  "inv_scale", inv_scale)
+            print(
+                "base",
+                base_grad_strength.item(),
+                "second",
+                second_grad_strength.item(),
+                "weight",
+                (base_grad_strength / second_grad_strength).item(),
+                "inv_scale",
+                inv_scale,
+            )
         return grad_ratio
 
     @abstractmethod
@@ -162,7 +170,7 @@ class BaseEnv(ABC):
     @staticmethod
     def check_nan(loss):
         losses = loss if isinstance(loss, (list, tuple)) else [loss]
-        for loss in (losses):
+        for loss in losses:
             if torch.is_tensor(loss) and torch.isnan(loss).any().item():
                 return True
         return False
@@ -192,8 +200,7 @@ class BaseEnv(ABC):
                     nan_count += 1
                     if nan_count > 100:
                         raise FloatingPointError("loss is NaN over 100 times")
-            self.train_backward_step(loss, optimizers, grad_scalers,
-                                     update=t % backward_step == 0)
+            self.train_backward_step(loss, optimizers, grad_scalers, update=t % backward_step == 0)
             if self.trainer.args.ema_model:
                 if t % backward_step == 0:
                     ema_t += 1
@@ -256,7 +263,10 @@ class SoftmaxEnv(BaseEnv):
         x, y, *_ = data
         model = self.get_eval_model()
         if self.eval_tta:
-            B, TTA, = x.shape[:2]
+            (
+                B,
+                TTA,
+            ) = x.shape[:2]
             x = self.to_device(x)
             x = x.reshape(B * TTA, *x.shape[2:])
             with self.autocast():
