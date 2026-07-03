@@ -197,12 +197,16 @@ def inf_loss():
 
 def fit_size(z, y):
     if isinstance(z, (tuple, list)):
+        if z[0].ndim != 4:
+            return z, y
         if z[0].shape[2] != y.shape[2] or z[0].shape[3] != y.shape[3]:
             pad_h = (y.shape[2] - z[0].shape[2]) // 2
             pad_w = (y.shape[3] - z[0].shape[3]) // 2
             assert pad_h >= 0 or pad_w >= 0
             y = torch.nn.functional.pad(y, (-pad_w, -pad_w, -pad_h, -pad_h))
     else:
+        if z.ndim != 4:
+            return z, y
         if z.shape[2] != y.shape[2] or z.shape[3] != y.shape[3]:
             pad_h = (y.shape[2] - z.shape[2]) // 2
             pad_w = (y.shape[3] - z.shape[3]) // 2
@@ -391,7 +395,7 @@ class Waifu2xEnv(LuminancePSNREnv):
                 else:
                     z = to_dtype(self.model(x, self.to_device(privilege)), x.dtype)
                     z, y = fit_size(z, y)
-                if isinstance(z, (list, tuple)) and self.use_diff_aug:
+                if (isinstance(z, (list, tuple)) or z.ndim != 4) and self.use_diff_aug:
                     raise ValueError(f"--diff-aug does not support {self.model.name}")
                 z, y = self.diff_aug(z, y)
                 loss = self.criterion(z, y)
