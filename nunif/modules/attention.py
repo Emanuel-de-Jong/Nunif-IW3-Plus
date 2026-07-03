@@ -260,7 +260,13 @@ class WindowMHA2dV2(nn.Module):
         self.rope = RoPE2d(in_channels // num_heads, self.window_size[0], self.window_size[1])
         basic_module_init(self)
 
-    def forward(self, x: torch.Tensor, layer_norm: nn.Module | None = None) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            layer_norm: nn.Module | None = None,
+            norm_shift: torch.Tensor | None = None,
+            norm_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         B, C, H, W = x.shape
         assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0
 
@@ -284,6 +290,13 @@ class WindowMHA2dV2(nn.Module):
         x = bchw_to_bnc(x, self.window_size)
         if layer_norm is not None:
             x = layer_norm(x)
+        if norm_scale is not None and norm_shift is not None:
+            B_bnc, N_bnc, C_bnc = x.shape
+            num_windows = B_bnc // B
+            x = x.view(B, num_windows, N_bnc, C_bnc)
+            x = x * (1.0 + norm_scale.view(B, 1, 1, C)) + norm_shift.view(B, 1, 1, C)
+            x = x.view(B_bnc, N_bnc, C)
+
         x = self.mha(x, attn_mask=attn_mask, rope=self.rope)
         x = bnc_to_bchw(x, out_shape, self.window_size)
         if needs_pad:
