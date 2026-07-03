@@ -237,8 +237,9 @@ class Waifu2xEnv(LuminancePSNREnv):
                  discriminator,
                  discriminator_criterion,
                  sampler, use_diff_aug=False, use_diff_aug_downsample=False, use_diff_aug_noise=False,
-                 adaptive_weight_ema=None):
-        super().__init__(model, criterion)
+                 adaptive_weight_ema=None,
+                 eval_criterion=None):
+        super().__init__(model, criterion, eval_criterion=eval_criterion)
         self.discriminator = discriminator
         self.discriminator_criterion = discriminator_criterion
         self.adaptive_weight_ema = adaptive_weight_ema
@@ -640,6 +641,7 @@ class Waifu2xTrainer(Trainer):
         else:
             discriminator_criterion = None
 
+        eval_criterion = IdentityLoss() if self.args.loss == "ident" else None
         return Waifu2xEnv(
             self.model, criterion=criterion,
             discriminator=self.discriminator,
@@ -648,7 +650,8 @@ class Waifu2xTrainer(Trainer):
             use_diff_aug=self.args.diff_aug,
             use_diff_aug_downsample=self.args.diff_aug_downsample,
             use_diff_aug_noise=self.args.diff_aug_noise,
-            adaptive_weight_ema=self.adaptive_weight_ema
+            adaptive_weight_ema=self.adaptive_weight_ema,
+            eval_criterion=eval_criterion,
         )
 
     def setup(self):

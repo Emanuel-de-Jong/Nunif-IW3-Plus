@@ -351,10 +351,12 @@ class I2IEnv(BaseEnv):
 
 
 class RGBPSNREnv(I2IEnv):
-    def __init__(self, model, criterion=None):
+    def __init__(self, model, criterion=None, eval_criterion=None):
         if criterion is None:
             criterion = ClampLoss(nn.HuberLoss(0.3))
-        super().__init__(model, criterion=criterion, eval_criterion=PSNRPerImage())
+        if eval_criterion is None:
+            eval_criterion = PSNRPerImage()
+        super().__init__(model, criterion=criterion, eval_criterion=eval_criterion)
 
     def print_eval_result(self, psnr_loss, file=sys.stdout):
         psnr = -psnr_loss
@@ -362,10 +364,12 @@ class RGBPSNREnv(I2IEnv):
 
 
 class LuminancePSNREnv(I2IEnv):
-    def __init__(self, model, criterion=None):
+    def __init__(self, model, criterion=None, eval_criterion=None):
         if criterion is None:
             criterion = ClampLoss(LuminanceWeightedLoss(nn.HuberLoss(0.3)))
-        super().__init__(model, criterion=criterion, eval_criterion=LuminancePSNRPerImage())
+        if eval_criterion is None:
+            eval_criterion = LuminancePSNRPerImage()
+        super().__init__(model, criterion=criterion, eval_criterion=eval_criterion)
 
     def print_eval_result(self, psnr_loss, file=sys.stdout):
         psnr = -psnr_loss
