@@ -362,6 +362,8 @@ class OverlapWindowMHA2dV2(nn.Module):
         # head_dim = (in_channels // 2) // (num_heads // 2) = (in_channels // num_heads)
         assert in_channels % 8 == 0
 
+        self.num_heads = num_heads // 2
+        self.qkv_dim = in_channels // num_heads
         self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
         self.pad_h = self.pad_w = 0
         assert self.window_size[0] % 2 == 0
@@ -369,12 +371,12 @@ class OverlapWindowMHA2dV2(nn.Module):
         assert self.window_size[1] % 2 == 0
         self.pad_w = self.window_size[1] // 2
 
-        self.in_proj = nn.Linear(in_channels, in_channels)
-        self.out_proj = nn.Linear(in_channels, in_channels)
-        self.mha = MHA(in_channels // 2, num_heads // 2, qkv_bias=False)
+        # TODO: use LinearQKV
+        self.qkv_proj = nn.Linear(in_channels, self.qkv_dim * self.num_heads * 3 * 2)
+        self.head_proj = nn.Linear(in_channels, in_channels)
         self.rope = RoPE2d((in_channels // 2) // (num_heads // 2), self.window_size[0], self.window_size[1])
-        basic_module_init(self.in_proj)
-        basic_module_init(self.out_proj)
+        basic_module_init(self.qkv_proj)
+        basic_module_init(self.head_proj)
 
     def forward(
         self,
@@ -382,23 +384,25 @@ class OverlapWindowMHA2dV2(nn.Module):
         layer_norm: nn.Module | None = None,
         norm_shift: torch.Tensor | None = None,
         norm_scale: torch.Tensor | None = None,
+        bhwc=False,
     ) -> torch.Tensor:
         B, C, H, W = x.shape
         assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0
 
-        # BHWC -> BHWC
-        x = x.permute(0, 2, 3, 1)
+        if not bhwc:
+            # BHWC -> BHWC
+            x = x.permute(0, 2, 3, 1)
         if layer_norm is not None:
             x = layer_norm(x)
         if norm_scale is not None and norm_shift is not None:
             x = x * (1.0 + norm_scale.view(B, 1, 1, C)) + norm_shift.view(B, 1, 1, C)
 
-        x1, x2 = self.in_proj(x).chunk(2, dim=-1)
-
+        # (q1, k1, v1), (q2, k2, v2)
+        x1, x2 = self.qkv_proj(x).chunk(2, dim=-1)
         x2 = F.pad(x2, (0, 0, self.pad_w, self.pad_w, self.pad_h, self.pad_h, 0, 0), mode="constant", value=0)
 
-        x1_out_shape = x1.shape
-        x2_out_shape = x2.shape
+        x1_out_shape = (x1.shape[0], x1.shape[1], x1.shape[2], x1.shape[3] // 3)
+        x2_out_shape = (x2.shape[0], x2.shape[1], x2.shape[2], x2.shape[3] // 3)
 
         x1 = bhwc_to_bnc(x1, self.window_size)
         x2 = bhwc_to_bnc(x2, self.window_size)
@@ -420,8 +424,9 @@ class OverlapWindowMHA2dV2(nn.Module):
 
         x = torch.cat((x1, x2), dim=0)
         attn_mask = torch.cat((x1_atten_mask, x2_atten_mask), dim=0)
-        x = self.mha(x, attn_mask=attn_mask, rope=self.rope)
 
+        q, k, v = x.split(self.qkv_dim * self.num_heads, dim=-1)
+        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask, rope=self.rope)
         x1 = x[:B1]
         x2 = x[B1:]
         x1 = bnc_to_bhwc(x1, x1_out_shape, self.window_size)
@@ -429,10 +434,11 @@ class OverlapWindowMHA2dV2(nn.Module):
         x2 = x2[:, self.pad_h : self.pad_h + H, self.pad_w : self.pad_w + W, :]
 
         x = torch.cat((x1, x2), dim=-1)
-        x = self.out_proj(x)
+        x = self.head_proj(x)
 
-        # BHWC -> BCHW
-        x = x.permute(0, 3, 1, 2)
+        if not bhwc:
+            # BHWC -> BCHW
+            x = x.permute(0, 3, 1, 2)
 
         return x
 
