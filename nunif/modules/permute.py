@@ -104,9 +104,15 @@ def bchw_to_bnc(x, window_size):
 
 
 def bhwc_to_bnc(x, window_size):
-    # NOTE: not optimized
-    x = bhwc_to_bchw(x)
-    x = bchw_to_bnc(x, window_size=window_size)
+    B, H, W, C = x.shape
+    SH, SW = window_size if isinstance(window_size, (list, tuple)) else [window_size, window_size]
+    assert H % SH == 0 and W % SW == 0
+
+    oh = H // SH
+    ow = W // SW
+    x = x.view(B, oh, SH, ow, SW, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(B * oh * ow, SH * SW, C)
+
     return x
 
 
@@ -124,6 +130,22 @@ def bnc_to_bchw(x, out_shape, window_size):
     x = x.permute(0, 5, 1, 3, 2, 4)
     # OB, (H * SH), (W * SW), C
     x = x.reshape(OB, C, OH, OW)
+
+    return x
+
+
+def bnc_to_bhwc(x, out_shape, window_size):
+    B, N, C = x.shape
+    OB, OH, OW, OC = out_shape
+    SH, SW = window_size if isinstance(window_size, (list, tuple)) else [window_size, window_size]
+
+    assert OH % SH == 0 and OW % SW == 0
+    H = OH // SH
+    W = OW // SW
+
+    x = x.view(OB, H, W, SH, SW, C)
+    x = x.permute(0, 1, 3, 2, 4, 5)
+    x = x.reshape(OB, OH, OW, OC)
 
     return x
 
@@ -293,7 +315,6 @@ def _test_3d_bnc():
     assert x.shape == (4 * 3 * 3 * 2, 2 * 2 * 3, 3)
     x = bnc_to_bcdhw(x, original_shape, (2, 2, 3))
     assert src.shape == x.shape and (src - x).abs().sum() == 0
-
 
 
 def _test_window():
