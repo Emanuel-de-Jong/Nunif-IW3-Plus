@@ -106,22 +106,34 @@ def pad_shift_mask_token(x, mask_token, window_size, shift=(True, True)):
 
 
 class LinearQKV(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, q_bias: bool, k_bias: bool, v_bias: bool) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        q_bias: bool,
+        k_bias: bool,
+        v_bias: bool,
+        groups: int = 1,
+    ) -> None:
         assert out_features % 3 == 0
+        assert out_features % groups == 0
+        assert (out_features // groups) % 3 == 0
+
+        self.groups = groups
         flags = [q_bias, k_bias, v_bias]
         has_bias = any(flags)
 
         super().__init__(in_features, out_features, bias=has_bias)
 
         if has_bias and not all(flags):
-            qkv_dim = out_features // 3
-            bias_mask = torch.ones(out_features)
-            if not q_bias:
-                bias_mask[:qkv_dim] = 0.0
-            if not k_bias:
-                bias_mask[qkv_dim : qkv_dim * 2] = 0.0
-            if not v_bias:
-                bias_mask[-qkv_dim:] = 0.0
+            qkv_dim_per_group = (out_features // groups) // 3
+
+            q_m = torch.ones(qkv_dim_per_group) if q_bias else torch.zeros(qkv_dim_per_group)
+            k_m = torch.ones(qkv_dim_per_group) if k_bias else torch.zeros(qkv_dim_per_group)
+            v_m = torch.ones(qkv_dim_per_group) if v_bias else torch.zeros(qkv_dim_per_group)
+
+            local_mask = torch.cat([q_m, k_m, v_m], dim=0)
+            bias_mask = local_mask.repeat(groups)
 
             self.register_buffer("bias_mask", bias_mask, persistent=False)
         else:
@@ -371,8 +383,14 @@ class OverlapWindowMHA2dV2(nn.Module):
         assert self.window_size[1] % 2 == 0
         self.pad_w = self.window_size[1] // 2
 
-        # TODO: use LinearQKV
-        self.qkv_proj = nn.Linear(in_channels, self.qkv_dim * self.num_heads * 3 * 2)
+        self.qkv_proj = LinearQKV(
+            in_channels,
+            self.qkv_dim * self.num_heads * 3 * 2,
+            q_bias=True,
+            k_bias=False,
+            v_bias=True,
+            groups=2,
+        )
         self.head_proj = nn.Linear(in_channels, in_channels)
         self.rope = RoPE2d((in_channels // 2) // (num_heads // 2), self.window_size[0], self.window_size[1])
         basic_module_init(self.qkv_proj)
@@ -814,6 +832,24 @@ def _test_linear_qkv():
     x = torch.ones((1, 32)).cuda()
     q, k, v = linear(x).split(32, dim=-1)
 
+    assert torch.all(q == 32.0 + 1.0)
+    assert torch.all(k == 32.0)
+    assert torch.all(v == 32.0 + 1.0)
+
+    linear = LinearQKV(32, 32 * 2 * 3, q_bias=True, k_bias=False, v_bias=True, groups=2)
+    nn.init.constant_(linear.weight, 1.0)
+    nn.init.constant_(linear.bias, 1.0)
+
+    linear = linear.cuda()
+    x = torch.ones((1, 32)).cuda()
+    x1, x2 = linear(x).chunk(2, dim=-1)
+
+    q, k, v = x1.chunk(3, dim=-1)
+    assert torch.all(q == 32.0 + 1.0)
+    assert torch.all(k == 32.0)
+    assert torch.all(v == 32.0 + 1.0)
+
+    q, k, v = x2.chunk(3, dim=-1)
     assert torch.all(q == 32.0 + 1.0)
     assert torch.all(k == 32.0)
     assert torch.all(v == 32.0 + 1.0)
