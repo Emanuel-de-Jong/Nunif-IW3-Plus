@@ -6,6 +6,7 @@ from .permute import (
     bchw_to_bnc, bnc_to_bchw,
     bcdhw_to_bnc, bnc_to_bcdhw,
     bchw_to_bhwc, bhwc_to_bchw,
+    bhwc_to_bnc, bnc_to_bhwc,
     window_partition2d,
 )
 from .init import basic_module_init
@@ -355,43 +356,89 @@ class WindowSpatialReductionMHA2d(nn.Module):
         return x
 
 
-class OverlapWindowMHA2d(nn.Module):
-    # NOTE: Not much optimization. Not used.
-    def __init__(self, in_channels, num_heads, window_size=(4, 4), qkv_dim=None):
+class OverlapWindowMHA2dV2(nn.Module):
+    def __init__(self, in_channels: int, num_heads: int, window_size: int | tuple[int, int]) -> None:
         super().__init__()
+        # num_heads -> num_heads // 2
+        assert num_heads >= 2 and num_heads % 2 == 0
+        # in_channels -> in_channels // 2
+        # head_dim = (in_channels // 2) // (num_heads // 2) = (in_channels // num_heads)
+        assert in_channels % 8 == 0
+
         self.window_size = (window_size if isinstance(window_size, (tuple, list))
                             else (window_size, window_size))
+        self.pad_h = self.pad_w = 0
+        assert self.window_size[0] % 2 == 0
         self.pad_h = self.window_size[0] // 2
+        assert self.window_size[1] % 2 == 0
         self.pad_w = self.window_size[1] // 2
-        self.num_heads = num_heads
-        if qkv_dim is None:
-            assert in_channels % num_heads == 0
-            qkv_dim = in_channels // num_heads
-        self.qkv_dim = qkv_dim
-        self.qkv_proj = nn.Conv2d(in_channels, qkv_dim * num_heads * 3, kernel_size=1, stride=1, padding=0)
-        self.head_proj = nn.Conv2d(qkv_dim * num_heads, in_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward_mha(self, x, attn_mask=None):
-        q, k, v = x.split(self.qkv_dim * self.num_heads, dim=-1)
-        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask)
-        return x
+        self.in_proj = nn.Linear(in_channels, in_channels)
+        self.out_proj = nn.Linear(in_channels, in_channels)
+        self.mha = MHA(in_channels // 2, num_heads // 2, qkv_bias=False)
+        self.rope = RoPE2d((in_channels // 2) // (num_heads // 2), self.window_size[0], self.window_size[1])
+        basic_module_init(self.in_proj)
+        basic_module_init(self.out_proj)
 
-    def forward(self, x, attn_mask=None, layer_norm=None):
+    def forward(
+            self,
+            x: torch.Tensor,
+            layer_norm: nn.Module | None = None,
+            norm_shift: torch.Tensor | None = None,
+            norm_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, C, H, W = x.shape
+        assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0
+
+        # BHWC -> BHWC
+        x = x.permute(0, 2, 3, 1)
         if layer_norm is not None:
-            x = bhwc_to_bchw(layer_norm(bchw_to_bhwc(x)))
-        x = self.qkv_proj(x)
-        x1 = x
-        x2 = F.pad(x, [self.pad_w, self.pad_w, self.pad_h, self.pad_h], mode="constant", value=0)
-        out_shape1 = x1.shape
-        out_shape2 = x2.shape
-        x1 = bchw_to_bnc(x1, self.window_size)
-        x2 = bchw_to_bnc(x2, self.window_size)
-        x1 = self.forward_mha(x1, attn_mask=attn_mask)
-        x2 = self.forward_mha(x2, attn_mask=attn_mask)
-        x1 = bnc_to_bchw(x1, (out_shape1[0], x1.shape[-1], *out_shape1[2:]), self.window_size)
-        x2 = bnc_to_bchw(x2, (out_shape2[0], x2.shape[-1], *out_shape2[2:]), self.window_size)
-        x2 = F.pad(x2, [-self.pad_w, -self.pad_w, -self.pad_h, -self.pad_h])
-        x = self.head_proj(x1 + x2)
+            x = layer_norm(x)
+        if norm_scale is not None and norm_shift is not None:
+            x = x * (1.0 + norm_scale.view(B, 1, 1, C)) + norm_shift.view(B, 1, 1, C)
+
+        x1, x2 = self.in_proj(x).chunk(2, dim=-1)
+
+        x2 = F.pad(x2, (0, 0, self.pad_w, self.pad_w, self.pad_h, self.pad_h, 0, 0), mode="constant", value=0)
+
+        x1_out_shape = x1.shape
+        x2_out_shape = x2.shape
+
+        x1 = bhwc_to_bnc(x1, self.window_size)
+        x2 = bhwc_to_bnc(x2, self.window_size)
+        x2_atten_mask = gen_padded_attention_mask_2d(
+            B,
+            H,
+            W,
+            self.window_size[0],
+            self.window_size[1],
+            self.pad_h,
+            self.pad_w,
+            x.device,
+        )
+
+        B1 = x1.shape[0]
+        x1_atten_mask = torch.ones(
+            (x1.shape[0], 1, x1.shape[1], x1.shape[1]),
+            dtype=x2_atten_mask.dtype,
+            device=x2_atten_mask.device
+        )
+
+        x = torch.cat((x1, x2), dim=0)
+        attn_mask = torch.cat((x1_atten_mask, x2_atten_mask), dim=0)
+        x = self.mha(x, attn_mask=attn_mask, rope=self.rope)
+
+        x1 = x[:B1]
+        x2 = x[B1:]
+        x1 = bnc_to_bhwc(x1, x1_out_shape, self.window_size)
+        x2 = bnc_to_bhwc(x2, x2_out_shape, self.window_size)
+        x2 = x2[:, self.pad_h:self.pad_h + H, self.pad_w: self.pad_w + W, :]
+
+        x = torch.cat((x1, x2), dim=-1)
+        x = self.out_proj(x)
+
+        # BHWC -> BCHW
+        x = x.permute(0, 3, 1, 2)
 
         return x
 
@@ -740,15 +787,15 @@ def _test_bias2():
     bias()
 
 
-def _test_rope():
+def _test_2d_v2():
     dim = 64
     num_heads = 4
     window_size = (8, 8)
 
-    mha = WindowMHA2d(dim, num_heads=num_heads, window_size=window_size).cuda()
-    rope = RoPE2d(dim // num_heads, *window_size).cuda()
-    x = torch.rand((4, dim, 32, 32)).cuda()
-    mha(x, rope=rope)
+    # uses RoPE2d
+    mha = WindowMHA2dV2(dim, num_heads=num_heads, window_size=window_size).cuda()
+    x = torch.zeros((4, dim, 32, 32)).cuda()
+    mha(x)
 
 
 def _test_linear_qkv():
@@ -765,13 +812,23 @@ def _test_linear_qkv():
     assert torch.all(v == 32.0 + 1.0)
 
 
+def _test_overlap_v2():
+    dim = 64
+    num_heads = 4
+    window_size = (8, 8)
+    x = torch.zeros((4, dim, 32, 32)).cuda()
+    mha = OverlapWindowMHA2dV2(dim, num_heads=num_heads, window_size=window_size).cuda()
+    mha(x)
+
+
 if __name__ == "__main__":
     # _test_spatial_reduction()
+    _test_overlap_v2()
     _test_neighborhood()
     _test_shift()
     _test_bias()
     _test_bias2()
-    _test_rope()
+    _test_2d_v2()
     _test_2d()
     _test_3d()
     _test_linear_qkv()
