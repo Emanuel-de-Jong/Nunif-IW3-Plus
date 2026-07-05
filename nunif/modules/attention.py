@@ -1,24 +1,27 @@
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from contextlib import nullcontext
-from .permute import (
-    bchw_to_bnc, bnc_to_bchw,
-    bcdhw_to_bnc, bnc_to_bcdhw,
-    bchw_to_bhwc, bhwc_to_bchw,
-    bhwc_to_bnc, bnc_to_bhwc,
-    window_partition2d,
-)
-from .init import basic_module_init
-from .replication_pad2d import ReplicationPad2dNaive
+
 from .attention_bias import (
-    WindowScoreBias,
-    WindowRelativeScoreBias,
     WindowDistanceScoreBias,
+    WindowRelativeScoreBias,
+    WindowScoreBias,
     WindowScoreBias3d,
 )
+from .init import basic_module_init
+from .permute import (
+    bcdhw_to_bnc,
+    bchw_to_bnc,
+    bhwc_to_bnc,
+    bnc_to_bcdhw,
+    bnc_to_bchw,
+    bnc_to_bhwc,
+    window_partition2d,
+)
+from .replication_pad2d import ReplicationPad2dNaive
 from .rope import RoPE2d
-
 
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -30,13 +33,14 @@ try:
             return sdpa_kernel([SDPBackend.MATH])
 
 except ModuleNotFoundError:
+
     def use_flash_attention(flag):
         return torch.backends.cuda.sdp_kernel(enable_flash=flag, enable_math=True, enable_mem_efficient=flag)
 
 
 class SEBlock(nn.Module):
-    """ from Squeeze-and-Excitation Networks
-    """
+    """from Squeeze-and-Excitation Networks"""
+
     def __init__(self, in_channels, reduction=8, bias=False):
         super(SEBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, in_channels // reduction, 1, 1, 0, bias=bias)
@@ -82,9 +86,7 @@ def sliced_sdp(q, k, v, num_heads, attn_mask=None, rope=None, dropout_p=0.0, is_
 
     use_flash = B <= 65535  # avoid CUDA error: invalid configuration argument.
     with use_flash_attention(use_flash):
-        x = F.scaled_dot_product_attention(q, k, v,
-                                           attn_mask=attn_mask, dropout_p=dropout_p,
-                                           is_causal=is_causal)
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
     # B, N, (H, C // H)
     return x.permute(0, 2, 1, 3).reshape(B, QN, qkv_dim * num_heads)
 
@@ -117,7 +119,7 @@ class LinearQKV(nn.Linear):
             if not q_bias:
                 bias_mask[:qkv_dim] = 0.0
             if not k_bias:
-                bias_mask[qkv_dim:qkv_dim * 2] = 0.0
+                bias_mask[qkv_dim : qkv_dim * 2] = 0.0
             if not v_bias:
                 bias_mask[-qkv_dim:] = 0.0
 
@@ -139,7 +141,9 @@ class MHA(nn.Module):
         super().__init__()
         # require torch >= 2.0 (recommend torch >= 2.1.2)
         # nn.MultiheadAttention also has a bug with float attn_mask, so PyTorch 2.1 is required anyway.
-        assert hasattr(F, "scaled_dot_product_attention"), "torch version does not support F.scaled_dot_product_attention"
+        assert hasattr(F, "scaled_dot_product_attention"), (
+            "torch version does not support F.scaled_dot_product_attention"
+        )
 
         if qkv_dim is None:
             assert embed_dim % num_heads == 0
@@ -158,23 +162,22 @@ class MHA(nn.Module):
     def forward(self, x, attn_mask=None, dropout_p=0.0, is_causal=False, rope=None):
         # x.shape: batch, sequence, feature
         q, k, v = self.qkv_proj(x).split(self.qkv_dim * self.num_heads, dim=-1)
-        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask, rope=rope,
-                       dropout_p=dropout_p, is_causal=is_causal)
+        x = sliced_sdp(
+            q, k, v, self.num_heads, attn_mask=attn_mask, rope=rope, dropout_p=dropout_p, is_causal=is_causal
+        )
         x = self.head_proj(x)
         return x
 
 
 class WindowMHA2d(nn.Module):
-    """ WindowMHA
+    """WindowMHA
     BCHW input/output
     """
-    def __init__(self, in_channels, num_heads, window_size=(4, 4),
-                 qkv_dim=None, shift=False, shift_mask_token=False):
+
+    def __init__(self, in_channels, num_heads, window_size=(4, 4), qkv_dim=None, shift=False, shift_mask_token=False):
         super().__init__()
-        self.window_size = (window_size if isinstance(window_size, (tuple, list))
-                            else (window_size, window_size))
-        self.shift = (shift if isinstance(shift, (tuple, list))
-                      else (shift, shift))
+        self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
+        self.shift = shift if isinstance(shift, (tuple, list)) else (shift, shift)
         self.pad_h = self.pad_w = 0
         if self.shift[0] or self.shift[1]:
             if self.shift[0]:
@@ -212,18 +215,11 @@ class WindowMHA2d(nn.Module):
 
 
 def gen_padded_attention_mask_2d(
-        B: int,
-        H: int,
-        W: int,
-        window_h: int,
-        window_w: int,
-        pad_h: int,
-        pad_w: int,
-        device: torch.device
+    B: int, H: int, W: int, window_h: int, window_w: int, pad_h: int, pad_w: int, device: torch.device
 ) -> torch.Tensor:
     with torch.no_grad():
         mask_pad = torch.zeros((1, 1, H + pad_h * 2, W + pad_w * 2), device=device, dtype=torch.bool)
-        mask_pad[:, :, pad_h: pad_h + H, pad_w:pad_w + W] = True
+        mask_pad[:, :, pad_h : pad_h + H, pad_w : pad_w + W] = True
 
         # (num_windows, N)
         N = window_h * window_w
@@ -241,14 +237,16 @@ def gen_padded_attention_mask_2d(
 
 
 class WindowMHA2dV2(nn.Module):
-    """ WindowMHA2d with RoPE2d
+    """WindowMHA2d with RoPE2d
     BCHW input/output
     """
-    def __init__(self, in_channels: int, num_heads: int, window_size: int | tuple[int, int], shift: bool = False) -> None:
+
+    def __init__(
+        self, in_channels: int, num_heads: int, window_size: int | tuple[int, int], shift: bool = False
+    ) -> None:
         super().__init__()
-        self.window_size = (window_size if isinstance(window_size, (tuple, list))
-                            else (window_size, window_size))
-        self.shift = (shift if isinstance(shift, (tuple, list)) else (shift, shift))
+        self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
+        self.shift = shift if isinstance(shift, (tuple, list)) else (shift, shift)
         self.pad_h = self.pad_w = 0
         if self.shift[0]:
             assert self.window_size[0] % 2 == 0
@@ -262,11 +260,11 @@ class WindowMHA2dV2(nn.Module):
         basic_module_init(self)
 
     def forward(
-            self,
-            x: torch.Tensor,
-            layer_norm: nn.Module | None = None,
-            norm_shift: torch.Tensor | None = None,
-            norm_scale: torch.Tensor | None = None,
+        self,
+        x: torch.Tensor,
+        layer_norm: nn.Module | None = None,
+        norm_shift: torch.Tensor | None = None,
+        norm_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, C, H, W = x.shape
         assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0
@@ -301,7 +299,7 @@ class WindowMHA2dV2(nn.Module):
         x = self.mha(x, attn_mask=attn_mask, rope=self.rope)
         x = bnc_to_bchw(x, out_shape, self.window_size)
         if needs_pad:
-            x = x[:, :, self.pad_h:self.pad_h + H, self.pad_w: self.pad_w + W]
+            x = x[:, :, self.pad_h : self.pad_h + H, self.pad_w : self.pad_w + W]
 
         return x
 
@@ -315,8 +313,7 @@ class WindowSpatialReductionMHA2d(nn.Module):
             raise NotImplementedError()
         assert kernel_size in {2, 3}
         super().__init__()
-        self.window_size = (window_size if isinstance(window_size, (tuple, list))
-                            else (window_size, window_size))
+        self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
         if qkv_dim is None:
             assert in_channels % num_heads == 0
             qkv_dim = in_channels // num_heads
@@ -349,7 +346,7 @@ class WindowSpatialReductionMHA2d(nn.Module):
         q = self.q_proj(x)
 
         # mha
-        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask, dropout_p=0., is_causal=False)
+        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         x = self.head_proj(x)
         x = bnc_to_bchw(x, out_shape, self.window_size)
 
@@ -365,8 +362,7 @@ class OverlapWindowMHA2dV2(nn.Module):
         # head_dim = (in_channels // 2) // (num_heads // 2) = (in_channels // num_heads)
         assert in_channels % 8 == 0
 
-        self.window_size = (window_size if isinstance(window_size, (tuple, list))
-                            else (window_size, window_size))
+        self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
         self.pad_h = self.pad_w = 0
         assert self.window_size[0] % 2 == 0
         self.pad_h = self.window_size[0] // 2
@@ -381,11 +377,11 @@ class OverlapWindowMHA2dV2(nn.Module):
         basic_module_init(self.out_proj)
 
     def forward(
-            self,
-            x: torch.Tensor,
-            layer_norm: nn.Module | None = None,
-            norm_shift: torch.Tensor | None = None,
-            norm_scale: torch.Tensor | None = None,
+        self,
+        x: torch.Tensor,
+        layer_norm: nn.Module | None = None,
+        norm_shift: torch.Tensor | None = None,
+        norm_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, C, H, W = x.shape
         assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0
@@ -419,9 +415,7 @@ class OverlapWindowMHA2dV2(nn.Module):
 
         B1 = x1.shape[0]
         x1_atten_mask = torch.ones(
-            (x1.shape[0], 1, x1.shape[1], x1.shape[1]),
-            dtype=x2_atten_mask.dtype,
-            device=x2_atten_mask.device
+            (x1.shape[0], 1, x1.shape[1], x1.shape[1]), dtype=x2_atten_mask.dtype, device=x2_atten_mask.device
         )
 
         x = torch.cat((x1, x2), dim=0)
@@ -432,7 +426,7 @@ class OverlapWindowMHA2dV2(nn.Module):
         x2 = x[B1:]
         x1 = bnc_to_bhwc(x1, x1_out_shape, self.window_size)
         x2 = bnc_to_bhwc(x2, x2_out_shape, self.window_size)
-        x2 = x2[:, self.pad_h:self.pad_h + H, self.pad_w: self.pad_w + W, :]
+        x2 = x2[:, self.pad_h : self.pad_h + H, self.pad_w : self.pad_w + W, :]
 
         x = torch.cat((x1, x2), dim=-1)
         x = self.out_proj(x)
@@ -444,15 +438,16 @@ class OverlapWindowMHA2dV2(nn.Module):
 
 
 class WindowMHA3d(nn.Module):
-    """ 3D WindowMHA
+    """3D WindowMHA
     BCDHW input/output
     """
+
     def __init__(self, in_channels, num_heads, window_size=(4, 4, 4), qkv_dim=None, shift=False, qkv_bias=True):
         super().__init__()
-        self.window_size = (window_size if isinstance(window_size, (tuple, list))
-                            else (window_size, window_size, window_size))
-        self.shift = (shift if isinstance(shift, (tuple, list))
-                      else (shift, shift, shift))
+        self.window_size = (
+            window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size, window_size)
+        )
+        self.shift = shift if isinstance(shift, (tuple, list)) else (shift, shift, shift)
         self.pad_h = self.pad_w = self.pad_d = 0
         if any(self.shift):
             if self.shift[0]:
@@ -491,7 +486,9 @@ class WindowMHA3d(nn.Module):
 class CrossMHA(nn.Module):
     def __init__(self, embed_dim, num_heads, qkv_dim=None):
         super().__init__()
-        assert hasattr(F, "scaled_dot_product_attention"), "torch version does not support F.scaled_dot_product_attention"
+        assert hasattr(F, "scaled_dot_product_attention"), (
+            "torch version does not support F.scaled_dot_product_attention"
+        )
 
         if qkv_dim is None:
             assert embed_dim % num_heads == 0
@@ -515,8 +512,7 @@ class CrossMHA(nn.Module):
 class WindowCrossMHA2d(nn.Module):
     def __init__(self, in_channels, num_heads, window_size=(4, 4), qkv_dim=None):
         super().__init__()
-        self.window_size = (window_size if isinstance(window_size, (tuple, list))
-                            else (window_size, window_size))
+        self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
         self.num_heads = num_heads
         self.mha = CrossMHA(in_channels, num_heads, qkv_dim)
 
@@ -572,10 +568,10 @@ class WindowGMLP2d(nn.Module):
     WindowGMLP2d
     BCHW input/output
     """
+
     def __init__(self, in_channels, window_size=(4, 4), mlp_ratio=2, shift=False, shift_mask_token=False):
         super().__init__()
-        self.window_size = (window_size if isinstance(window_size, (tuple, list))
-                            else (window_size, window_size))
+        self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
         self.shift = shift
         if self.shift:
             assert self.window_size[0] % 2 == 0 and self.window_size[1] % 2 == 0
@@ -614,12 +610,13 @@ class WindowGMLP3d(nn.Module):
     3D WindowGMLP
     BCDHW input/output
     """
+
     def __init__(self, in_channels, window_size=(4, 4, 4), mlp_ratio=2, shift=False):
         super().__init__()
-        self.window_size = (window_size if isinstance(window_size, (tuple, list))
-                            else (window_size, window_size, window_size))
-        self.shift = (shift if isinstance(shift, (tuple, list))
-                      else (shift, shift, shift))
+        self.window_size = (
+            window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size, window_size)
+        )
+        self.shift = shift if isinstance(shift, (tuple, list)) else (shift, shift, shift)
         self.pad_h = self.pad_w = self.pad_d = 0
 
         if any(self.shift):
@@ -654,12 +651,16 @@ class WindowGMLP3d(nn.Module):
 
 def _test_spatial_reduction():
     import time
+
     kernel_size = 2
     for window_size in (8, 12, 16, 24, 32, 48):
         x = torch.zeros((16, 64, 96, 96)).cuda()
         mha1 = WindowMHA2d(64, 4, window_size=window_size).cuda().eval()
-        mha2 = WindowSpatialReductionMHA2d(64, 4, window_size=window_size,
-                                           kernel_size=kernel_size, reduction=2).cuda().eval()
+        mha2 = (
+            WindowSpatialReductionMHA2d(64, 4, window_size=window_size, kernel_size=kernel_size, reduction=2)
+            .cuda()
+            .eval()
+        )
         mha1 = torch.compile(mha1)
         mha2 = torch.compile(mha2)
 
@@ -705,7 +706,7 @@ def _test_spatial_reduction():
 
 
 def _test_neighborhood():
-    from . flex_attention import WindowNeighborhoodMHA2d
+    from .flex_attention import WindowNeighborhoodMHA2d
 
     with torch.no_grad():
         x = torch.rand((1, 32, 32, 32))

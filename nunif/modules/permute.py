@@ -43,8 +43,7 @@ class BHWCToBCHW(nn.Module):
 
 
 def pixel_unshuffle(x, window_size):
-    """ reference implementation of F.pixel_unshuffle + non-square window
-    """
+    """reference implementation of F.pixel_unshuffle + non-square window"""
     B, C, H, W = x.shape
     SH, SW = window_size if isinstance(window_size, (list, tuple)) else [window_size, window_size]
     SS = SH * SW
@@ -63,8 +62,7 @@ def pixel_unshuffle(x, window_size):
 
 
 def pixel_shuffle(x, window_size):
-    """ reference implementation of F.pixel_shuffle + non-square window
-    """
+    """reference implementation of F.pixel_shuffle + non-square window"""
     B, C, H, W = x.shape
     SH, SW = window_size if isinstance(window_size, (list, tuple)) else [window_size, window_size]
     SS = SH * SW
@@ -258,7 +256,7 @@ def _test_bhwc():
     assert x.shape == (4, 2, 2, 3)
     x = bhwc_to_bchw(x)
     assert x.shape == (4, 3, 2, 2)
-    assert (x - src).abs().sum() == 0.
+    assert (x - src).abs().sum() == 0.0
     print("pass _test_bhwc")
 
 
@@ -270,22 +268,22 @@ def _test_pixel_shuffle():
     assert x.shape == (4, 3 * 2 * 2, 3, 3)
     x = pixel_shuffle(x, 2)
     assert x.shape == (4, 3, 6, 6)
-    assert (x - src).abs().sum() == 0.
+    assert (x - src).abs().sum() == 0.0
 
     x = pixel_unshuffle(x, (2, 3))
     assert x.shape == (4, 3 * 2 * 3, 3, 2)
     x = pixel_shuffle(x, (2, 3))
     assert x.shape == (4, 3, 6, 6)
-    assert (x - src).abs().sum() == 0.
+    assert (x - src).abs().sum() == 0.0
 
     # compatible
     x1 = pixel_unshuffle(x, 2)
     x2 = F.pixel_unshuffle(x, 2)
-    assert x1.shape == x2.shape and (x1 - x2).abs().sum() == 0.
+    assert x1.shape == x2.shape and (x1 - x2).abs().sum() == 0.0
 
     x1 = pixel_shuffle(x1, 2)
     x2 = F.pixel_shuffle(x2, 2)
-    assert x1.shape == x2.shape and (x1 - x2).abs().sum() == 0.
+    assert x1.shape == x2.shape and (x1 - x2).abs().sum() == 0.0
     print("pass _test_pixel_shuffle")
 
 
