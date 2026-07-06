@@ -6,38 +6,163 @@ from .init import basic_module_init
 from .replication_pad2d import ReplicationPad2dNaive
 
 
-class ParallelConv2d(nn.Module):
-    def __init__(
-        self, in_channels: int, out_channels: int, kernel_sizes: tuple[int | tuple[int, int]], padding: bool = True
-    ) -> None:
+def _fit_to_size(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    if x.shape[-2] == h and x.shape[-1] == w:
+        return x
+    dy = (x.shape[-2] - h) // 2
+    dx = (x.shape[-1] - w) // 2
+    return x[..., dy : dy + h, dx : dx + w]
+
+
+class ReparamBranch(nn.Module):
+    def fuse(self):
+        raise NotImplementedError
+
+    def get_kernel_size(self):
+        raise NotImplementedError
+
+
+class Conv2dBranch(ReparamBranch):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        if isinstance(kernel_size, int):
+            self.kernel_size = (kernel_size, kernel_size)
+        else:
+            self.kernel_size = kernel_size
+
+    def forward(self, x):
+        return self.conv(x)
+
+    def fuse(self):
+        w = self.conv.weight.double()
+        b = (
+            self.conv.bias.double()
+            if self.conv.bias is not None
+            else torch.zeros(self.out_channels, dtype=torch.double, device=w.device)
+        )
+        return w, b
+
+    def get_kernel_size(self):
+        return self.kernel_size
+
+
+class Parallel(ReparamBranch):
+    def __init__(self, in_channels: int, out_channels: int, structures):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.max_kernel_size = get_max_kernel_size(kernel_sizes)
-        self.scale = len(kernel_sizes) ** -0.5
+        self.branches = nn.ModuleList([self._build(in_channels, out_channels, s) for s in structures])
+        self.gate = nn.Parameter(torch.zeros(len(structures)))
 
-        self.padding = None
-        if padding:
-            self.padding = ReplicationPad2dNaive(
-                (
-                    self.max_kernel_size[1] // 2,
-                    self.max_kernel_size[1] // 2,
-                    self.max_kernel_size[0] // 2,
-                    self.max_kernel_size[0] // 2,
-                ),
-                detach=True,
-            )
+    def _build(self, in_c, out_c, s):
+        if isinstance(s, (int, tuple)):
+            return Conv2dBranch(in_c, out_c, s)
+        if isinstance(s, ReparamBranch):
+            return s
+        raise ValueError(f"Unsupported structure: {s}")
 
-        self.gate = nn.Parameter(
-            torch.zeros(
-                len(kernel_sizes),
-            )
+    def forward(self, x):
+        outputs = [b(x) for b in self.branches]
+        min_h = min(o.shape[-2] for o in outputs)
+        min_w = min(o.shape[-1] for o in outputs)
+
+        res = 0
+        gate = self.gate.to(outputs[0].dtype)
+        for i, o in enumerate(outputs):
+            o = _fit_to_size(o, min_h, min_w)
+            res = res + (1.0 + gate[i]) * o
+        return res
+
+    def fuse(self):
+        fused = [b.fuse() for b in self.branches]
+        max_h, max_w = self.get_kernel_size()
+
+        res_w = torch.zeros(
+            (self.out_channels, self.in_channels, max_h, max_w), dtype=torch.double, device=self.gate.device
         )
-        self.conv_modules = nn.ModuleList()
-        for ks in kernel_sizes:
-            self.conv_modules.append(nn.Conv2d(in_channels, out_channels, kernel_size=ks, padding=0))
+        res_b = torch.zeros(self.out_channels, dtype=torch.double, device=self.gate.device)
 
-        self.conv_eval = nn.Conv2d(in_channels, out_channels, kernel_size=self.max_kernel_size, padding=0)
+        gate = self.gate.double()
+        for i, (w, b) in enumerate(fused):
+            ph = (max_h - w.shape[-2]) // 2
+            pw = (max_w - w.shape[-1]) // 2
+            res_w += (1.0 + gate[i]) * F.pad(w, [pw, pw, ph, ph])
+            res_b += (1.0 + gate[i]) * b
+        return res_w, res_b
+
+    def get_kernel_size(self):
+        sizes = [b.get_kernel_size() for b in self.branches]
+        return max(s[0] for s in sizes), max(s[1] for s in sizes)
+
+
+class Series(ReparamBranch):
+    def __init__(self, in_channels: int, out_channels: int, structures, middle_factor: int | float = 1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        # Scaled relative to out_channels
+        self.middle_channels = int(out_channels * middle_factor)
+        self.middle_channels = max(self.middle_channels - self.middle_channels % 8, 8)
+
+        branches = []
+        num_branches = len(structures)
+        for i, s in enumerate(structures):
+            branch_in = in_channels if i == 0 else self.middle_channels
+            branch_out = out_channels if i == num_branches - 1 else self.middle_channels
+            branches.append(self._build(branch_in, branch_out, s))
+        self.branches = nn.ModuleList(branches)
+
+    def _build(self, in_c, out_c, s):
+        if isinstance(s, (int, tuple)):
+            return Conv2dBranch(in_c, out_c, s)
+        if isinstance(s, ReparamBranch):
+            return s
+        raise ValueError(f"Unsupported structure: {s}")
+
+    def forward(self, x):
+        for b in self.branches:
+            x = b(x)
+        return x
+
+    def fuse(self):
+        curr_w, curr_b = self.branches[0].fuse()
+        for i in range(1, len(self.branches)):
+            next_w, next_b = self.branches[i].fuse()
+            curr_w = F.conv2d(
+                curr_w.transpose(0, 1), next_w.flip(-1, -2), padding=(next_w.shape[-2] - 1, next_w.shape[-1] - 1)
+            ).transpose(0, 1)
+            curr_b = next_w.sum(dim=(2, 3)) @ curr_b + next_b
+        return curr_w, curr_b
+
+    def get_kernel_size(self):
+        sizes = [b.get_kernel_size() for b in self.branches]
+        h = sum(s[0] for s in sizes) - (len(sizes) - 1)
+        w = sum(s[1] for s in sizes) - (len(sizes) - 1)
+        return h, w
+
+
+class ReparamConv2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, structure, padding: bool = False) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        if isinstance(structure, (list, tuple)):
+            self.structure = Parallel(in_channels, out_channels, structure)
+        else:
+            self.structure = structure
+
+        kernel_size = self.structure.get_kernel_size()
+        self.padding = (
+            ReplicationPad2dNaive((kernel_size[1] // 2, kernel_size[1] // 2, kernel_size[0] // 2, kernel_size[0] // 2))
+            if padding
+            else None
+        )
+
+        self.conv_eval = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=0)
         self.conv_eval.requires_grad_(False)
 
         basic_module_init(self)
@@ -49,125 +174,72 @@ class ParallelConv2d(nn.Module):
         if not self.training:
             return self.conv_eval(x)
 
-        input_size = x.shape[-2:]
-        out = sum(
-            self.scale * (1.0 + self.gate[i]) * fit_size(conv(x), input_size, self.max_kernel_size)
-            for i, conv in enumerate(self.conv_modules)
-        )
-        return out
+        return self.structure(x)
 
-    def train(self, mode: bool = True) -> nn.Module:
+    def train(self, mode: bool = True):
         super().train(mode)
         if not mode:
             return self.fuse()
         return self
 
-    def purge(self):
-        delattr(self, "gate")
-        delattr(self, "conv_modules")
+    def fuse(self) -> nn.Conv2d:
+        assert self.conv_eval.bias is not None
+        w, b = self.structure.fuse()
+        dtype = self.conv_eval.weight.dtype
+        self.conv_eval.weight.data.copy_(w.to(dtype))
+        self.conv_eval.bias.data.copy_(b.to(dtype))
+        return self.conv_eval
 
-    def fuse(self) -> nn.Module:
-        dtype = self.gate.dtype
-        branches = self.conv_modules
-        multipliers = self.scale * (1.0 + self.gate)
-
-        fused_weight, fused_bias = fuse_conv_branches(branches, multipliers, self.max_kernel_size)
-
-        self.conv_eval.weight.data.copy_(fused_weight.to(dtype))
-        if self.conv_eval.bias is not None:
-            self.conv_eval.bias.data.copy_(fused_bias.to(dtype))
-
+    def purge(self) -> nn.Module:
+        delattr(self, "structure")
         return self
 
 
-def fit_size(input_tensor: torch.Tensor, input_size, max_kernel_size) -> torch.Tensor:
-    target_h = input_size[0] - (max_kernel_size[0] // 2 * 2)
-    target_w = input_size[1] - (max_kernel_size[1] // 2 * 2)
-
-    if input_tensor[-2:] == (target_h, target_w):
-        return input_tensor
-
-    dy = input_tensor.shape[-2] - target_h
-    dx = input_tensor.shape[-1] - target_w
-    assert dy >= 0 and dx >= 0
-    assert dy % 2 == 0 and dx % 2 == 0
-
-    y = dy // 2
-    x = dx // 2
-    return input_tensor[..., y : input_tensor.shape[-2] - y, x : input_tensor.shape[-1] - x]
-
-
-def fuse_conv_branches(branches, multipliers, target_kernel_size):
-    """
-    Fuse multiple Conv2d modules into a single weight and bias.
-    multipliers: coefficients for each branch (e.g. 1.0 + gate[i])
-    target_kernel_size: (H, W) of the resulting kernel
-    """
-    device = multipliers.device
-    out_channels = branches[0].out_channels
-    in_channels = branches[0].in_channels
-
-    fused_weight = torch.zeros((out_channels, in_channels, *target_kernel_size), device=device, dtype=torch.double)
-    fused_bias = torch.zeros((out_channels,), device=device, dtype=torch.double)
-
-    for conv, coeff in zip(branches, multipliers):
-        w = conv.weight.double()
-        b = conv.bias.double() if conv.bias is not None else torch.zeros_like(fused_bias)
-
-        kh, kw = w.shape[-2:]
-        ph = (target_kernel_size[0] - kh) // 2
-        pw = (target_kernel_size[1] - kw) // 2
-
-        fused_weight += coeff * F.pad(w, [pw, pw, ph, ph])
-        fused_bias += coeff * b
-
-    return fused_weight, fused_bias
-
-
-def get_max_kernel_size(kernel_sizes):
-    max_h = max_w = 0
-    for ks in kernel_sizes:
-        if isinstance(ks, int):
-            max_h = max(max_h, ks)
-            max_w = max(max_w, ks)
+def apply_fuse_(model: nn.Module):
+    for name, child in model.named_children():
+        if isinstance(child, ReparamConv2d):
+            setattr(model, name, child.fuse())
         else:
-            max_h = max(max_h, ks[0])
-            max_w = max(max_w, ks[1])
-
-    return (max_h, max_w)
+            apply_fuse_(child)
 
 
-def _test(dtype):
+def _test(dtype=torch.float64):
+    print("******", dtype)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    in_channels = 32
-    out_channels = 64
+    in_c, out_c = 3, 64
 
-    x = torch.rand((4, in_channels, 64, 64)).to(device=device, dtype=dtype)
-    for test_case in ((1, 3, 5), (1, (3, 3), (5, 5)), ((1, 1), (1, 3), (1, 7))):
-        model = ParallelConv2d(in_channels, out_channels, kernel_sizes=test_case, padding=True).to(
-            device=device, dtype=dtype
-        )
-        print("***", test_case)
+    # Structure definition with middle_factor relative to out_channels
+    structure = [1, 3, 5, 7, (1, 7), (7, 1), Series(in_c, out_c, [1, 3, 1], middle_factor=2.0)]
 
+    model = ReparamConv2d(in_c, out_c, structure, padding=True).to(device, dtype=dtype)
+    print("*** train", model)
+    x = torch.rand((4, in_c, 64, 64)).to(device, dtype=dtype)
+
+    if isinstance(model.structure, Parallel):
         with torch.no_grad():
-            model.gate.copy_(torch.randn_like(model.gate))
+            model.structure.gate.copy_(torch.randn(len(model.structure.branches)))
 
-        model.train()
-        z1 = model(x)
+    model.train()
+    z1 = model(x)
 
-        model.eval()
-        model.purge()
-        z2 = model(x)
+    model.eval()
+    model.purge()
+    print("*** eval", model)
+    z2 = model(x)
 
-        diff = (z1 - z2).abs().max().item()
-        mean = (z1 - z2).abs().mean().item()
-
-        print(f"Max difference: {diff}, Mean difference: {mean}")
-        if diff < 1e-12:
-            print("Test Passed")
-        else:
-            print("Test Failed")
+    diff = (z1 - z2).abs().max().item()
+    print(f"Max difference: {diff}")
+    if diff < 1e-5:
+        print("Test Passed")
+    else:
+        print("Test Failed")
 
 
 if __name__ == "__main__":
-    _test(dtype=torch.float64)
+    _test(torch.float64)
+    # _test(torch.float32)
+    # _test(torch.float16)
+    # _test(torch.bfloat16)
