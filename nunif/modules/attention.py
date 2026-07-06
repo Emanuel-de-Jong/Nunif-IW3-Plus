@@ -366,14 +366,19 @@ class WindowSpatialReductionMHA2d(nn.Module):
 
 
 class OverlapWindowMHA2dV2(nn.Module):
-    def __init__(self, in_channels: int, num_heads: int, window_size: int | tuple[int, int]) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        num_heads: int,
+        window_size: int | tuple[int, int],
+        bhwc=False,
+    ) -> None:
         super().__init__()
+        self.bhwc = bhwc
         # num_heads -> num_heads // 2
         assert num_heads >= 2 and num_heads % 2 == 0
         # in_channels -> in_channels // 2
         # head_dim = (in_channels // 2) // (num_heads // 2) = (in_channels // num_heads)
-        assert in_channels % 8 == 0
-
         self.num_heads = num_heads // 2
         self.qkv_dim = in_channels // num_heads
         self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
@@ -402,14 +407,13 @@ class OverlapWindowMHA2dV2(nn.Module):
         layer_norm: nn.Module | None = None,
         norm_shift: torch.Tensor | None = None,
         norm_scale: torch.Tensor | None = None,
-        bhwc=False,
     ) -> torch.Tensor:
-        B, C, H, W = x.shape
+        if not self.bhwc:
+            x = x.permute(0, 2, 3, 1)  # BCHW -> BHWC
+
+        B, H, W, C = x.shape
         assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0
 
-        if not bhwc:
-            # BHWC -> BHWC
-            x = x.permute(0, 2, 3, 1)
         if layer_norm is not None:
             x = layer_norm(x)
         if norm_scale is not None and norm_shift is not None:
@@ -454,9 +458,8 @@ class OverlapWindowMHA2dV2(nn.Module):
         x = torch.cat((x1, x2), dim=-1)
         x = self.head_proj(x)
 
-        if not bhwc:
-            # BHWC -> BCHW
-            x = x.permute(0, 3, 1, 2)
+        if not self.bhwc:
+            x = x.permute(0, 3, 1, 2)  # BHWC -> BCHW
 
         return x
 
