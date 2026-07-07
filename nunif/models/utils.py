@@ -93,7 +93,7 @@ def get_model_device(model):
         return next(model.parameters()).device
 
 
-_COMPILER_SUPPORTED_DEVICES = {}
+_COMPILER_SUPPORTED_DEVICES: dict[str, bool] = {}
 
 
 def _test_func(x):

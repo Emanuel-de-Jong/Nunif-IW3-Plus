@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import copy
 from functools import lru_cache
+from collections.abc import Callable
 
 
 class Model(nn.Module):
@@ -42,7 +43,7 @@ class Model(nn.Module):
         raise NotImplementedError()
 
 
-_tile_size_validators = {}
+_tile_size_validators: dict[str, Callable[[int], bool]] = {}
 
 
 def _register_tile_size_validator(name, func):
