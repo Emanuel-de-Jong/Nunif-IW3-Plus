@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import fuse_conv_bn_eval
 
 from .init import basic_module_init
+from .norm import ReparamBatchNorm2d, apply_batch_max_iteration_, apply_frozen_bn_  # noqa
 from .replication_pad2d import ReplicationPad2dNaive
 
 
@@ -23,9 +25,22 @@ class ReparamBranch(nn.Module):
 
 
 class Conv2dBranch(ReparamBranch):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride=1, padding=0):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        use_bn=False,
+        bn_layer=nn.BatchNorm2d,
+    ):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=not use_bn)
+        if use_bn:
+            self.bn = bn_layer(out_channels)
+        else:
+            self.bn = nn.Identity()
         self.in_channels = in_channels
         self.out_channels = out_channels
         if isinstance(kernel_size, int):
@@ -34,13 +49,18 @@ class Conv2dBranch(ReparamBranch):
             self.kernel_size = kernel_size
 
     def forward(self, x):
-        return self.conv(x)
+        return self.bn(self.conv(x))
 
     def fuse(self):
-        w = self.conv.weight.double()
+        if not isinstance(self.bn, nn.Identity):
+            conv = fuse_conv_bn_eval(self.conv, self.bn)
+        else:
+            conv = self.conv
+
+        w = conv.weight.double()
         b = (
-            self.conv.bias.double()
-            if self.conv.bias is not None
+            conv.bias.double()
+            if conv.bias is not None
             else torch.zeros(self.out_channels, dtype=torch.double, device=w.device)
         )
         return w, b
@@ -50,16 +70,21 @@ class Conv2dBranch(ReparamBranch):
 
 
 class Parallel(ReparamBranch):
-    def __init__(self, in_channels: int, out_channels: int, structures):
+    def __init__(self, in_channels: int, out_channels: int, structures, use_bn=False, bn_layer=nn.BatchNorm2d):
         super().__init__()
+        if isinstance(use_bn, bool):
+            use_bn = [use_bn] * len(structures)
+        self.use_bn = use_bn
+        self.bn_layer = bn_layer
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.branches = nn.ModuleList([self._build(in_channels, out_channels, s) for s in structures])
-        self.gate = nn.Parameter(torch.zeros(len(structures)))
+        self.branches = nn.ModuleList(
+            [self._build(in_channels, out_channels, s, use_bn=self.use_bn[i]) for i, s in enumerate(structures)]
+        )
 
-    def _build(self, in_c, out_c, s):
+    def _build(self, in_c, out_c, s, use_bn):
         if isinstance(s, (int, tuple)):
-            return Conv2dBranch(in_c, out_c, s)
+            return Conv2dBranch(in_c, out_c, s, use_bn=use_bn, bn_layer=self.bn_layer)
         if isinstance(s, ReparamBranch):
             return s
         raise ValueError(f"Unsupported structure: {s}")
@@ -70,27 +95,24 @@ class Parallel(ReparamBranch):
         min_w = min(o.shape[-1] for o in outputs)
 
         res = 0
-        gate = self.gate.to(outputs[0].dtype)
         for i, o in enumerate(outputs):
             o = _fit_to_size(o, min_h, min_w)
-            res = res + (1.0 + gate[i]) * o
+            res = res + o
         return res
 
     def fuse(self):
+        device = self.branches[0].conv.weight.device
         fused = [b.fuse() for b in self.branches]
         max_h, max_w = self.get_kernel_size()
 
-        res_w = torch.zeros(
-            (self.out_channels, self.in_channels, max_h, max_w), dtype=torch.double, device=self.gate.device
-        )
-        res_b = torch.zeros(self.out_channels, dtype=torch.double, device=self.gate.device)
+        res_w = torch.zeros((self.out_channels, self.in_channels, max_h, max_w), dtype=torch.double, device=device)
+        res_b = torch.zeros(self.out_channels, dtype=torch.double, device=device)
 
-        gate = self.gate.double()
         for i, (w, b) in enumerate(fused):
             ph = (max_h - w.shape[-2]) // 2
             pw = (max_w - w.shape[-1]) // 2
-            res_w += (1.0 + gate[i]) * F.pad(w, [pw, pw, ph, ph])
-            res_b += (1.0 + gate[i]) * b
+            res_w += F.pad(w, [pw, pw, ph, ph])
+            res_b += b
         return res_w, res_b
 
     def get_kernel_size(self):
@@ -99,8 +121,20 @@ class Parallel(ReparamBranch):
 
 
 class Series(ReparamBranch):
-    def __init__(self, in_channels: int, out_channels: int, structures, middle_factor: int | float = 1):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        structures,
+        middle_factor: int | float = 1,
+        use_bn=False,
+        bn_layer=nn.BatchNorm2d,
+    ):
         super().__init__()
+        if isinstance(use_bn, bool):
+            use_bn = [use_bn] * len(structures)
+        self.use_bn = use_bn
+        self.bn_layer = bn_layer
         self.in_channels = in_channels
         self.out_channels = out_channels
         # Scaled relative to out_channels
@@ -112,12 +146,12 @@ class Series(ReparamBranch):
         for i, s in enumerate(structures):
             branch_in = in_channels if i == 0 else self.middle_channels
             branch_out = out_channels if i == num_branches - 1 else self.middle_channels
-            branches.append(self._build(branch_in, branch_out, s))
+            branches.append(self._build(branch_in, branch_out, s, use_bn=self.use_bn[i]))
         self.branches = nn.ModuleList(branches)
 
-    def _build(self, in_c, out_c, s):
+    def _build(self, in_c, out_c, s, use_bn):
         if isinstance(s, (int, tuple)):
-            return Conv2dBranch(in_c, out_c, s)
+            return Conv2dBranch(in_c, out_c, s, use_bn=use_bn, bn_layer=self.bn_layer)
         if isinstance(s, ReparamBranch):
             return s
         raise ValueError(f"Unsupported structure: {s}")
@@ -145,13 +179,21 @@ class Series(ReparamBranch):
 
 
 class ReparamConv2d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, structure, padding: bool = False) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        structure,
+        padding: bool = False,
+        use_bn=False,
+        bn_layer=nn.BatchNorm2d,
+    ) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
 
         if isinstance(structure, (list, tuple)):
-            self.structure = Parallel(in_channels, out_channels, structure)
+            self.structure = Parallel(in_channels, out_channels, structure, use_bn=use_bn, bn_layer=bn_layer)
         else:
             self.structure = structure
 
@@ -163,8 +205,6 @@ class ReparamConv2d(nn.Module):
         )
 
         self.conv_eval = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=0)
-        self.conv_eval.requires_grad_(False)
-
         basic_module_init(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -178,8 +218,11 @@ class ReparamConv2d(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
+        self.conv_eval.requires_grad_(False)
+
         if not mode:
             return self.fuse()
+
         return self
 
     def fuse(self) -> nn.Conv2d:
@@ -207,24 +250,34 @@ def _test(dtype=torch.float64):
     print("******", dtype)
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     in_c, out_c = 3, 64
 
     # Structure definition with middle_factor relative to out_channels
-    structure = [1, 3, 5, 7, (1, 7), (7, 1), Series(in_c, out_c, [1, 3, 1], middle_factor=2.0)]
+    # bn_layer = nn.BatchNorm2d
+    bn_layer = ReparamBatchNorm2d
+    structure = [
+        1,
+        3,
+        5,
+        7,
+        (1, 7),
+        (7, 1),
+        Series(in_c, out_c, [1, 3, 1], middle_factor=2.0, use_bn=(False, True, False), bn_layer=bn_layer),
+    ]
+    model = ReparamConv2d(in_c, out_c, structure, padding=True, use_bn=True, bn_layer=bn_layer).to(device, dtype=dtype)
+    apply_batch_max_iteration_(model, 100)
 
-    model = ReparamConv2d(in_c, out_c, structure, padding=True).to(device, dtype=dtype)
     print("*** train", model)
     x = torch.rand((4, in_c, 64, 64)).to(device, dtype=dtype)
 
-    if isinstance(model.structure, Parallel):
-        with torch.no_grad():
-            model.structure.gate.copy_(torch.randn(len(model.structure.branches)))
-
     model.train()
-    z1 = model(x)
+    for i in range(100):
+        model(x)
 
+    apply_frozen_bn_(model)
+
+    z1 = model(x)
     model.eval()
     model.purge()
     print("*** eval", model)

@@ -6,6 +6,7 @@ import torch
 from torchvision.models.swin_transformer import ShiftedWindowAttentionV2, ShiftedWindowAttention
 from ..modules.norm import LayerNormNoBias2d, RMSNorm, RMSNorm1
 from ..modules.fusion import Lerp, AdaptiveWeight, AdaptiveWeightedAdd
+from ..modules.norm import ReparamBatchNorm2d
 
 
 def configure_optim_groups(model, weight_decay=0.01):
@@ -39,6 +40,7 @@ def configure_optim_groups(model, weight_decay=0.01):
         Lerp,
         AdaptiveWeight,
         AdaptiveWeightedAdd,
+        ReparamBatchNorm2d,
     )
     for mn, m in model.named_modules():
         for pn, p in m.named_parameters():
