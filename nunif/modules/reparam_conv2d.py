@@ -24,7 +24,42 @@ class ReparamBranch(nn.Module):
         raise NotImplementedError
 
 
+class Shortcut(ReparamBranch):
+    conv: None | nn.Conv2d
+
+    def __init__(self, in_channels: int, out_channels: int | None = None):
+        super().__init__()
+        self.in_channels = in_channels
+        if out_channels is None:
+            out_channels = in_channels
+        self.out_channels = out_channels
+        if in_channels != out_channels:
+            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        else:
+            self.conv = None
+
+    def forward(self, x):
+        if self.conv is not None:
+            return self.conv(x)
+        else:
+            return x
+
+    def fuse(self):
+        if self.conv is not None:
+            w = self.conv.weight.double()
+            b = torch.zeros(self.out_channels, dtype=torch.double, device=w.device)
+        else:
+            w = torch.eye(self.in_channels, dtype=torch.double).reshape(self.in_channels, self.in_channels, 1, 1)
+            b = torch.zeros(self.in_channels, dtype=torch.double)
+        return w, b
+
+    def get_kernel_size(self):
+        return (1, 1)
+
+
 class Conv2dBranch(ReparamBranch):
+    dropout: nn.Dropout | nn.Identity
+
     def __init__(
         self,
         in_channels: int,
@@ -113,9 +148,15 @@ class Parallel(ReparamBranch):
         return res
 
     def fuse(self):
-        device = self.branches[0].conv.weight.device
         fused = [b.fuse() for b in self.branches]
         max_h, max_w = self.get_kernel_size()
+
+        # Find device
+        device = torch.device("cpu")
+        for w, b in fused:
+            if w.device.type != "cpu":
+                device = w.device
+                break
 
         res_w = torch.zeros((self.out_channels, self.in_channels, max_h, max_w), dtype=torch.double, device=device)
         res_b = torch.zeros(self.out_channels, dtype=torch.double, device=device)
@@ -123,8 +164,8 @@ class Parallel(ReparamBranch):
         for i, (w, b) in enumerate(fused):
             ph = (max_h - w.shape[-2]) // 2
             pw = (max_w - w.shape[-1]) // 2
-            res_w += F.pad(w, [pw, pw, ph, ph])
-            res_b += b
+            res_w += F.pad(w.to(device), [pw, pw, ph, ph])
+            res_b += b.to(device)
         return res_w, res_b
 
     def get_kernel_size(self):
@@ -180,6 +221,12 @@ class Series(ReparamBranch):
         curr_w, curr_b = self.branches[0].fuse()
         for i in range(1, len(self.branches)):
             next_w, next_b = self.branches[i].fuse()
+            device = next_w.device if next_w.device.type != "cpu" else curr_w.device
+            curr_w = curr_w.to(device)
+            curr_b = curr_b.to(device)
+            next_w = next_w.to(device)
+            next_b = next_b.to(device)
+
             curr_w = F.conv2d(
                 curr_w.transpose(0, 1), next_w.flip(-1, -2), padding=(next_w.shape[-2] - 1, next_w.shape[-1] - 1)
             ).transpose(0, 1)
@@ -269,7 +316,7 @@ def _test(dtype=torch.float64):
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    in_c, out_c = 3, 64
+    in_c, out_c = 64, 64
 
     # Structure definition with middle_factor relative to out_channels
     # bn_layer = nn.BatchNorm2d
@@ -281,6 +328,7 @@ def _test(dtype=torch.float64):
         7,
         (1, 7),
         (7, 1),
+        Shortcut(in_c),
         Series(in_c, out_c, [1, 3, 1], middle_factor=2.0, use_bn=(False, True, False), bn_layer=bn_layer),
     ]
     model = ReparamConv2d(in_c, out_c, structure, padding=True, use_bn=True, bn_layer=bn_layer).to(device, dtype=dtype)
@@ -307,6 +355,25 @@ def _test(dtype=torch.float64):
         print("Test Passed")
     else:
         print("Test Failed")
+
+    # test Shortcut with channel mismatch
+    in_c2, out_c2 = 16, 32
+    structure2 = [
+        Shortcut(in_c2, out_c2),
+        Conv2dBranch(in_c2, out_c2, 3),
+    ]
+    model = ReparamConv2d(in_c2, out_c2, structure2, padding=True).to(device, dtype=dtype)
+    x = torch.rand((4, in_c2, 64, 64)).to(device, dtype=dtype)
+    model.train()
+    z1 = model(x)
+    model.eval()
+    z2 = model(x)
+    diff = (z1 - z2).abs().max().item()
+    print(f"Shortcut(mismatch) Max difference: {diff}")
+    if diff < 1e-5:
+        print("Shortcut(mismatch) Test Passed")
+    else:
+        print("Shortcut(mismatch) Test Failed")
 
 
 if __name__ == "__main__":
