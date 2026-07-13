@@ -105,49 +105,6 @@ def pad_shift_mask_token(x, mask_token, window_size, shift=(True, True)):
     return x
 
 
-class LinearQKV(nn.Linear):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        q_bias: bool,
-        k_bias: bool,
-        v_bias: bool,
-        groups: int = 1,
-    ) -> None:
-        assert out_features % 3 == 0
-        assert out_features % groups == 0
-        assert (out_features // groups) % 3 == 0
-
-        self.groups = groups
-        flags = [q_bias, k_bias, v_bias]
-        has_bias = any(flags)
-
-        super().__init__(in_features, out_features, bias=has_bias)
-
-        if has_bias and not all(flags):
-            qkv_dim_per_group = (out_features // groups) // 3
-
-            q_m = torch.ones(qkv_dim_per_group) if q_bias else torch.zeros(qkv_dim_per_group)
-            k_m = torch.ones(qkv_dim_per_group) if k_bias else torch.zeros(qkv_dim_per_group)
-            v_m = torch.ones(qkv_dim_per_group) if v_bias else torch.zeros(qkv_dim_per_group)
-
-            local_mask = torch.cat([q_m, k_m, v_m], dim=0)
-            bias_mask = local_mask.repeat(groups)
-
-            self.register_buffer("bias_mask", bias_mask, persistent=False)
-        else:
-            self.bias_mask = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.bias_mask is not None:
-            bias = self.bias * self.bias_mask.to(self.bias.dtype)
-        else:
-            bias = self.bias
-
-        return F.linear(x, self.weight, bias)
-
-
 class MHA(nn.Module):
     def __init__(self, embed_dim, num_heads, qkv_dim=None, qkv_bias=True):
         super().__init__()
@@ -162,12 +119,7 @@ class MHA(nn.Module):
             qkv_dim = embed_dim // num_heads
         self.qkv_dim = qkv_dim
         self.num_heads = num_heads
-        if qkv_bias:
-            # for compatibility
-            self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads * 3, bias=qkv_bias)
-        else:
-            self.qkv_proj = LinearQKV(embed_dim, qkv_dim * num_heads * 3, q_bias=True, k_bias=False, v_bias=True)
-
+        self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads * 3, bias=qkv_bias)
         self.head_proj = nn.Linear(qkv_dim * num_heads, embed_dim)
         basic_module_init(self)
 
@@ -388,14 +340,7 @@ class OverlapWindowMHA2dV2(nn.Module):
         assert self.window_size[1] % 2 == 0
         self.pad_w = self.window_size[1] // 2
 
-        self.qkv_proj = LinearQKV(
-            in_channels,
-            self.qkv_dim * self.num_heads * 3 * 2,
-            q_bias=True,
-            k_bias=False,
-            v_bias=True,
-            groups=2,
-        )
+        self.qkv_proj = nn.Linear(in_channels, self.qkv_dim * self.num_heads * 3 * 2, bias=False)
         self.head_proj = nn.Linear(in_channels, in_channels)
         self.rope = RoPE2d((in_channels // 2) // (num_heads // 2), self.window_size[0], self.window_size[1])
         basic_module_init(self.qkv_proj)
@@ -826,38 +771,6 @@ def _test_2d_v2():
     mha(x)
 
 
-def _test_linear_qkv():
-    linear = LinearQKV(32, 32 * 3, q_bias=True, k_bias=False, v_bias=True)
-    nn.init.constant_(linear.weight, 1.0)
-    nn.init.constant_(linear.bias, 1.0)
-
-    linear = linear.cuda()
-    x = torch.ones((1, 32)).cuda()
-    q, k, v = linear(x).split(32, dim=-1)
-
-    assert torch.all(q == 32.0 + 1.0)
-    assert torch.all(k == 32.0)
-    assert torch.all(v == 32.0 + 1.0)
-
-    linear = LinearQKV(32, 32 * 2 * 3, q_bias=True, k_bias=False, v_bias=True, groups=2)
-    nn.init.constant_(linear.weight, 1.0)
-    nn.init.constant_(linear.bias, 1.0)
-
-    linear = linear.cuda()
-    x = torch.ones((1, 32)).cuda()
-    x1, x2 = linear(x).chunk(2, dim=-1)
-
-    q, k, v = x1.chunk(3, dim=-1)
-    assert torch.all(q == 32.0 + 1.0)
-    assert torch.all(k == 32.0)
-    assert torch.all(v == 32.0 + 1.0)
-
-    q, k, v = x2.chunk(3, dim=-1)
-    assert torch.all(q == 32.0 + 1.0)
-    assert torch.all(k == 32.0)
-    assert torch.all(v == 32.0 + 1.0)
-
-
 def _test_overlap_v2():
     dim = 64
     num_heads = 4
@@ -877,5 +790,4 @@ if __name__ == "__main__":
     _test_2d_v2()
     _test_2d()
     _test_3d()
-    _test_linear_qkv()
     pass
