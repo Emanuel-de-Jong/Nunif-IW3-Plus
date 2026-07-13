@@ -34,6 +34,7 @@ class Conv2dBranch(ReparamBranch):
         padding=0,
         use_bn=False,
         bn_layer=nn.BatchNorm2d,
+        dropout_p=0.0,
     ):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=not use_bn)
@@ -41,6 +42,10 @@ class Conv2dBranch(ReparamBranch):
             self.bn = bn_layer(out_channels)
         else:
             self.bn = nn.Identity()
+        if dropout_p > 0.0:
+            self.dropout = nn.Dropout(p=dropout_p)
+        else:
+            self.dropout = nn.Identity()
         self.in_channels = in_channels
         self.out_channels = out_channels
         if isinstance(kernel_size, int):
@@ -49,7 +54,7 @@ class Conv2dBranch(ReparamBranch):
             self.kernel_size = kernel_size
 
     def forward(self, x):
-        return self.bn(self.conv(x))
+        return self.dropout(self.bn(self.conv(x)))
 
     def fuse(self):
         if not isinstance(self.bn, nn.Identity):
@@ -70,21 +75,28 @@ class Conv2dBranch(ReparamBranch):
 
 
 class Parallel(ReparamBranch):
-    def __init__(self, in_channels: int, out_channels: int, structures, use_bn=False, bn_layer=nn.BatchNorm2d):
+    def __init__(
+        self, in_channels: int, out_channels: int, structures, use_bn=False, bn_layer=nn.BatchNorm2d, dropout_p=0.0
+    ):
         super().__init__()
         if isinstance(use_bn, bool):
             use_bn = [use_bn] * len(structures)
+        if isinstance(dropout_p, (int, float)):
+            dropout_p = [dropout_p] * len(structures)
         self.use_bn = use_bn
         self.bn_layer = bn_layer
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.branches = nn.ModuleList(
-            [self._build(in_channels, out_channels, s, use_bn=self.use_bn[i]) for i, s in enumerate(structures)]
+            [
+                self._build(in_channels, out_channels, s, use_bn=self.use_bn[i], dropout_p=dropout_p[i])
+                for i, s in enumerate(structures)
+            ]
         )
 
-    def _build(self, in_c, out_c, s, use_bn):
+    def _build(self, in_c, out_c, s, use_bn, dropout_p):
         if isinstance(s, (int, tuple)):
-            return Conv2dBranch(in_c, out_c, s, use_bn=use_bn, bn_layer=self.bn_layer)
+            return Conv2dBranch(in_c, out_c, s, use_bn=use_bn, bn_layer=self.bn_layer, dropout_p=dropout_p)
         if isinstance(s, ReparamBranch):
             return s
         raise ValueError(f"Unsupported structure: {s}")
@@ -129,10 +141,13 @@ class Series(ReparamBranch):
         middle_factor: int | float = 1,
         use_bn=False,
         bn_layer=nn.BatchNorm2d,
+        dropout_p=0.0,
     ):
         super().__init__()
         if isinstance(use_bn, bool):
             use_bn = [use_bn] * len(structures)
+        if isinstance(dropout_p, (int, float)):
+            dropout_p = [dropout_p] * len(structures)
         self.use_bn = use_bn
         self.bn_layer = bn_layer
         self.in_channels = in_channels
@@ -146,12 +161,12 @@ class Series(ReparamBranch):
         for i, s in enumerate(structures):
             branch_in = in_channels if i == 0 else self.middle_channels
             branch_out = out_channels if i == num_branches - 1 else self.middle_channels
-            branches.append(self._build(branch_in, branch_out, s, use_bn=self.use_bn[i]))
+            branches.append(self._build(branch_in, branch_out, s, use_bn=self.use_bn[i], dropout_p=dropout_p[i]))
         self.branches = nn.ModuleList(branches)
 
-    def _build(self, in_c, out_c, s, use_bn):
+    def _build(self, in_c, out_c, s, use_bn, dropout_p):
         if isinstance(s, (int, tuple)):
-            return Conv2dBranch(in_c, out_c, s, use_bn=use_bn, bn_layer=self.bn_layer)
+            return Conv2dBranch(in_c, out_c, s, use_bn=use_bn, bn_layer=self.bn_layer, dropout_p=dropout_p)
         if isinstance(s, ReparamBranch):
             return s
         raise ValueError(f"Unsupported structure: {s}")
@@ -187,13 +202,16 @@ class ReparamConv2d(nn.Module):
         padding: bool = False,
         use_bn=False,
         bn_layer=nn.BatchNorm2d,
+        dropout_p=0.0,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
 
         if isinstance(structure, (list, tuple)):
-            self.structure = Parallel(in_channels, out_channels, structure, use_bn=use_bn, bn_layer=bn_layer)
+            self.structure = Parallel(
+                in_channels, out_channels, structure, use_bn=use_bn, bn_layer=bn_layer, dropout_p=dropout_p
+            )
         else:
             self.structure = structure
 
