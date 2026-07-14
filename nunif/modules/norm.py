@@ -49,31 +49,14 @@ class GroupNormNoBias(nn.Module):
         return x
 
 
-class RMSNorm(nn.Module):
-    # NHWC: normalized_shape=in_channels, dim=-1
-    # NCHW: normalized_shape=(1, in_channels, 1, 1), dim=1
-    def __init__(self, normalized_shape, dim=-1):
-        super().__init__()
-        self.dim = dim
-        self.weight = nn.Parameter(torch.ones(normalized_shape, dtype=torch.float32))
+class RMSNorm1(nn.RMSNorm):
+    # 0-centered ver
+    def reset_parameters(self) -> None:
+        if self.elementwise_affine:
+            nn.init.zeros_(self.weight)
 
-    def forward(self, x):
-        scale = torch.rsqrt(torch.mean(x.to(torch.float32) ** 2, dim=self.dim, keepdim=True) + 1e-6)
-        scale = scale * self.weight.to(torch.float32)
-        return x * scale.to(x.dtype)
-
-
-class RMSNorm1(nn.Module):
-    # 1-centered ver
-    def __init__(self, normalized_shape, dim=-1):
-        super().__init__()
-        self.dim = dim
-        self.weight = nn.Parameter(torch.zeros(normalized_shape, dtype=torch.float32))
-
-    def forward(self, x):
-        scale = torch.rsqrt(torch.mean(x.to(torch.float32) ** 2, dim=self.dim, keepdim=True) + 1e-6)
-        scale = scale * (1.0 + self.weight.to(torch.float32))
-        return x * scale.to(x.dtype)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(x, self.normalized_shape, self.weight + 1.0, self.eps)
 
 
 class FastLayerNorm(nn.LayerNorm):

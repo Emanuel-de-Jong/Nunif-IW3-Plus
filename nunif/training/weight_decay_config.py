@@ -4,7 +4,7 @@
 # Adding modules used in this repo by nagadomi
 import torch
 from torchvision.models.swin_transformer import ShiftedWindowAttentionV2, ShiftedWindowAttention
-from ..modules.norm import LayerNormNoBias2d, RMSNorm, RMSNorm1
+from ..modules.norm import LayerNormNoBias2d
 from ..modules.fusion import Lerp, AdaptiveWeight, AdaptiveWeightedAdd
 from ..modules.norm import ReparamBatchNorm2d
 
@@ -35,8 +35,6 @@ def configure_optim_groups(model, weight_decay=0.01):
         torch.nn.GroupNorm,
         torch.nn.RMSNorm,
         LayerNormNoBias2d,
-        RMSNorm,
-        RMSNorm1,
         Lerp,
         AdaptiveWeight,
         AdaptiveWeightedAdd,
