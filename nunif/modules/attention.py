@@ -70,15 +70,22 @@ class SEBlockNHWC(nn.Module):
         return x * z
 
 
-def sliced_sdp(q, k, v, num_heads, attn_mask=None, rope=None, dropout_p=0.0, is_causal=False):
-    B, QN, C = q.shape  # batch, sequence, feature
+def sliced_sdp(q, k, v, num_heads, attn_mask=None, rope=None, dropout_p=0.0, is_causal=False, num_kv_heads=None):
+    B, QN, _ = q.shape  # batch, sequence, feature
     KN = k.shape[1]
-    assert C % num_heads == 0
-    qkv_dim = C // num_heads
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
+    assert q.shape[-1] % num_heads == 0
+    assert k.shape[-1] % num_kv_heads == 0
+    assert k.shape == v.shape
+    assert num_heads % num_kv_heads == 0
+    q_dim = q.shape[-1] // num_heads
+    kv_dim = k.shape[-1] // num_kv_heads
+
     # B, H, N, C // H
-    q = q.view(B, QN, num_heads, qkv_dim).permute(0, 2, 1, 3)
-    k = k.view(B, KN, num_heads, qkv_dim).permute(0, 2, 1, 3)
-    v = v.view(B, KN, num_heads, qkv_dim).permute(0, 2, 1, 3)
+    q = q.view(B, QN, num_heads, q_dim).permute(0, 2, 1, 3)
+    k = k.view(B, KN, num_kv_heads, kv_dim).permute(0, 2, 1, 3)
+    v = v.view(B, KN, num_kv_heads, kv_dim).permute(0, 2, 1, 3)
 
     if rope is not None:
         q = rope(q)
@@ -86,9 +93,17 @@ def sliced_sdp(q, k, v, num_heads, attn_mask=None, rope=None, dropout_p=0.0, is_
 
     use_flash = B <= 65535  # avoid CUDA error: invalid configuration argument.
     with use_flash_attention(use_flash):
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            enable_gqa=num_heads != num_kv_heads,
+        )
     # B, N, (H, C // H)
-    return x.permute(0, 2, 1, 3).reshape(B, QN, qkv_dim * num_heads)
+    return x.permute(0, 2, 1, 3).reshape(B, QN, q_dim * num_heads)
 
 
 def pad_shift_mask_token(x, mask_token, window_size, shift=(True, True)):
@@ -106,7 +121,7 @@ def pad_shift_mask_token(x, mask_token, window_size, shift=(True, True)):
 
 
 class MHA(nn.Module):
-    def __init__(self, embed_dim, num_heads, qkv_dim=None, qkv_bias=True):
+    def __init__(self, embed_dim, num_heads, qkv_dim=None, qkv_bias=True, num_kv_heads=None):
         super().__init__()
         # require torch >= 2.0 (recommend torch >= 2.1.2)
         # nn.MultiheadAttention also has a bug with float attn_mask, so PyTorch 2.1 is required anyway.
@@ -114,20 +129,33 @@ class MHA(nn.Module):
             "torch version does not support F.scaled_dot_product_attention"
         )
 
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
         if qkv_dim is None:
             assert embed_dim % num_heads == 0
             qkv_dim = embed_dim // num_heads
         self.qkv_dim = qkv_dim
         self.num_heads = num_heads
-        self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads * 3, bias=qkv_bias)
+        self.num_kv_heads = num_kv_heads
+        self.qkv_proj = nn.Linear(embed_dim, qkv_dim * num_heads + qkv_dim * num_kv_heads * 2, bias=qkv_bias)
         self.head_proj = nn.Linear(qkv_dim * num_heads, embed_dim)
         basic_module_init(self)
 
     def forward(self, x, attn_mask=None, dropout_p=0.0, is_causal=False, rope=None):
         # x.shape: batch, sequence, feature
-        q, k, v = self.qkv_proj(x).split(self.qkv_dim * self.num_heads, dim=-1)
+        q, k, v = self.qkv_proj(x).split(
+            (self.qkv_dim * self.num_heads, self.qkv_dim * self.num_kv_heads, self.qkv_dim * self.num_kv_heads), dim=-1
+        )
         x = sliced_sdp(
-            q, k, v, self.num_heads, attn_mask=attn_mask, rope=rope, dropout_p=dropout_p, is_causal=is_causal
+            q,
+            k,
+            v,
+            self.num_heads,
+            attn_mask=attn_mask,
+            rope=rope,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            num_kv_heads=self.num_kv_heads,
         )
         x = self.head_proj(x)
         return x
@@ -206,7 +234,12 @@ class WindowMHA2dV2(nn.Module):
     """
 
     def __init__(
-        self, in_channels: int, num_heads: int, window_size: int | tuple[int, int], shift: bool = False
+        self,
+        in_channels: int,
+        num_heads: int,
+        window_size: int | tuple[int, int],
+        shift: bool = False,
+        num_kv_heads: int | None = None,
     ) -> None:
         super().__init__()
         self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
@@ -219,7 +252,7 @@ class WindowMHA2dV2(nn.Module):
             assert self.window_size[1] % 2 == 0
             self.pad_w = self.window_size[1] // 2
 
-        self.mha = MHA(in_channels, num_heads, qkv_bias=False)
+        self.mha = MHA(in_channels, num_heads, qkv_bias=False, num_kv_heads=num_kv_heads)
         self.rope = RoPE2d(in_channels // num_heads, self.window_size[0], self.window_size[1])
         basic_module_init(self)
 
@@ -780,8 +813,20 @@ def _test_overlap_v2():
     mha(x)
 
 
+def _test_gqa():
+    dim = 64
+    num_q_heads = 4
+    num_kv_heads = 2
+    window_size = (8, 8)
+
+    mha = WindowMHA2dV2(dim, num_heads=num_q_heads, window_size=window_size, num_kv_heads=num_kv_heads).cuda()
+    x = torch.zeros((4, dim, 32, 32)).cuda()
+    mha(x)
+
+
 if __name__ == "__main__":
     # _test_spatial_reduction()
+    _test_gqa()
     _test_overlap_v2()
     _test_neighborhood()
     _test_shift()
