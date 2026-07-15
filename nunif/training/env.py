@@ -155,9 +155,10 @@ class BaseEnv(ABC):
         return loss
 
     def to_device(self, input, device=None):
-        device = device or getattr(self, "device")
+        device = torch.device(device or getattr(self, "device"))
+        non_blocking = device.type in {"cuda", "xpu"}
         if torch.is_tensor(input):
-            return input.to(device)
+            return input.to(device, non_blocking=non_blocking)
         if isinstance(input, (tuple, list)):
             new_list = [self.to_device(elm, device) for elm in input]
             return tuple(new_list) if isinstance(input, tuple) else new_list
