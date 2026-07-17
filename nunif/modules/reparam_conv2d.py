@@ -56,20 +56,10 @@ class Shortcut(ReparamBranch):
             b = torch.zeros(self.out_channels, dtype=torch.double, device=w.device)
         else:
             # identity
+            assert self.in_channels == self.out_channels
             w = torch.zeros((self.out_channels, self.in_channels // self.groups, 1, 1), dtype=torch.double)
-            if self.groups == 1:
-                w.data.copy_(
-                    torch.eye(self.in_channels, dtype=torch.double).reshape(self.in_channels, self.in_channels, 1, 1)
-                )
-            else:
-                # depthwise or grouped identity
-                # w shape: (out_c, in_c // groups, 1, 1)
-                # For identity, each output channel i comes from input channel i
-                # In grouped conv weight:
-                # w[i, 0, 0, 0] = 1.0 where i is the index in out_channels
-                # (assuming in_c == out_c for identity)
-                for i in range(self.out_channels):
-                    w[i, 0, 0, 0] = 1.0
+            for i in range(self.out_channels):
+                w[i, i % (self.in_channels // self.groups), 0, 0] = 1.0
             b = torch.zeros(self.out_channels, dtype=torch.double)
         return w, b
 
@@ -166,7 +156,7 @@ class Parallel(ReparamBranch):
                 in_c, out_c, s, groups=groups, use_bn=use_bn, bn_layer=self.bn_layer, dropout_p=dropout_p
             )
         if isinstance(s, ReparamBranch):
-            assert s.groups == groups
+            assert s.groups == groups, f"nested structure.groups ({s.groups}) must match parent groups ({groups})"
             return s
         raise ValueError(f"Unsupported structure: {s}")
 
@@ -230,13 +220,13 @@ class Series(ReparamBranch):
         self.bn_layer = bn_layer
         self.in_channels = in_channels
         self.out_channels = out_channels
+        assert in_channels % groups == 0 and out_channels % groups == 0
+
+        # Scaled relative to out_channels
+        self.middle_channels = int(out_channels * middle_factor)
         if groups > 1:
-            # depthwise fusion requires in == out == middle == groups
-            self.middle_channels = groups
-            assert in_channels == groups and out_channels == groups
+            self.middle_channels = max(self.middle_channels - self.middle_channels % groups, groups)
         else:
-            # Scaled relative to out_channels
-            self.middle_channels = int(out_channels * middle_factor)
             self.middle_channels = max(self.middle_channels - self.middle_channels % 8, 8)
 
         branches = []
@@ -255,7 +245,7 @@ class Series(ReparamBranch):
                 in_c, out_c, s, groups=groups, use_bn=use_bn, bn_layer=self.bn_layer, dropout_p=dropout_p
             )
         if isinstance(s, ReparamBranch):
-            assert s.groups == groups
+            assert s.groups == groups, f"nested structure.groups ({s.groups}) must match parent groups ({groups})"
             return s
         raise ValueError(f"Unsupported structure: {s}")
 
@@ -274,37 +264,18 @@ class Series(ReparamBranch):
             next_w = next_w.to(device)
             next_b = next_b.to(device)
 
-            if self.groups == 1:
-                curr_w = F.conv2d(
-                    curr_w.transpose(0, 1), next_w.flip(-1, -2), padding=(next_w.shape[-2] - 1, next_w.shape[-1] - 1)
-                ).transpose(0, 1)
-                curr_b = next_w.sum(dim=(2, 3)) @ curr_b + next_b
-            else:
-                # Grouped/Depthwise fusion
-                # Treat curr_w as input data, next_w as kernel
-                # input shape: (1, out_channels_curr, h, w)
-                # weight shape: (out_channels_next, out_channels_curr // groups, kh, kw)
-                out_channels_curr = curr_w.shape[0]
-                out_channels_next = next_w.shape[0]
-                fused_w = F.conv2d(
-                    curr_w.reshape(1, out_channels_curr, curr_w.shape[-2], curr_w.shape[-1]),
-                    next_w.flip(-1, -2),
-                    groups=self.groups,
-                    padding=(next_w.shape[-2] - 1, next_w.shape[-1] - 1),
-                )
-                curr_w = fused_w.reshape(
-                    out_channels_next, out_channels_curr // self.groups, fused_w.shape[-2], fused_w.shape[-1]
-                )
-                # Bias fusion
-                # next_w.sum(dim=(2, 3)) shape: (out_channels_next, out_channels_curr // groups)
-                # next_w_sum as 1x1 grouped conv weight
-                next_w_sum = next_w.sum(dim=(2, 3)).unsqueeze(-1).unsqueeze(-1)
-                curr_b = (
-                    F.conv2d(curr_b.reshape(1, out_channels_curr, 1, 1), next_w_sum, groups=self.groups).reshape(
-                        out_channels_next
-                    )
-                    + next_b
-                )
+            # Weight fusion
+            fused_w = F.conv2d(
+                curr_w.transpose(0, 1),
+                next_w.flip(-1, -2),
+                groups=self.groups,
+                padding=(next_w.shape[-2] - 1, next_w.shape[-1] - 1),
+            )
+            curr_w = fused_w.transpose(0, 1)
+
+            # Bias fusion
+            next_w_sum = next_w.sum(dim=(2, 3)).unsqueeze(-1).unsqueeze(-1)
+            curr_b = F.conv2d(curr_b.reshape(1, -1, 1, 1), next_w_sum, groups=self.groups).reshape(-1) + next_b
 
         return curr_w, curr_b
 
@@ -343,14 +314,17 @@ class ReparamConv2d(nn.Module):
                 dropout_p=dropout_p,
             )
         else:
+            if hasattr(structure, "groups"):
+                assert structure.groups == groups, f"structure.groups ({structure.groups}) must match groups ({groups})"
             self.structure = structure
 
         kernel_size = self.structure.get_kernel_size()
-        self.padding = (
-            ReplicationPad2dNaive((kernel_size[1] // 2, kernel_size[1] // 2, kernel_size[0] // 2, kernel_size[0] // 2))
-            if padding
-            else None
-        )
+        if padding:
+            pad_h = kernel_size[0] - 1
+            pad_w = kernel_size[1] - 1
+            self.padding = ReplicationPad2dNaive((pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2))
+        else:
+            self.padding = None
 
         self.conv_eval = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, groups=groups, padding=0)
         basic_module_init(self)
@@ -366,7 +340,6 @@ class ReparamConv2d(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.conv_eval.requires_grad_(False)
 
         if not mode:
             return self.fuse()
@@ -384,6 +357,9 @@ class ReparamConv2d(nn.Module):
     def purge(self) -> nn.Module:
         delattr(self, "structure")
         return self
+
+    def get_kernel_size(self):
+        return self.structure.get_kernel_size()
 
 
 def apply_fuse_(model: nn.Module):
@@ -478,6 +454,26 @@ def _test(dtype=torch.float64):
         print("Depthwise Test Passed")
     else:
         print("Depthwise Test Failed")
+
+    # test Grouped
+    in_c4, out_c4, groups4 = 64, 128, 4
+    structure4 = [
+        3,
+        Shortcut(in_c4, out_c4, groups=groups4),
+        Series(in_c4, out_c4, [3, 3], groups=groups4),
+    ]
+    model = ReparamConv2d(in_c4, out_c4, structure4, groups=groups4, padding=True).to(device, dtype=dtype)
+    x = torch.rand((4, in_c4, 64, 64)).to(device, dtype=dtype)
+    model.train()
+    z1 = model(x)
+    model.eval()
+    z2 = model(x)
+    diff = (z1 - z2).abs().max().item()
+    print(f"Grouped Max difference: {diff}")
+    if diff < 1e-5:
+        print("Grouped Test Passed")
+    else:
+        print("Grouped Test Failed")
 
 
 if __name__ == "__main__":
