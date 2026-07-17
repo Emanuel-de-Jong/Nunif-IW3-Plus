@@ -17,6 +17,10 @@ def _fit_to_size(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
 
 
 class ReparamBranch(nn.Module):
+    def __init__(self, groups: int = 1):
+        super().__init__()
+        self.groups = groups
+
     def fuse(self):
         raise NotImplementedError
 
@@ -27,14 +31,16 @@ class ReparamBranch(nn.Module):
 class Shortcut(ReparamBranch):
     conv: None | nn.Conv2d
 
-    def __init__(self, in_channels: int, out_channels: int | None = None):
-        super().__init__()
+    def __init__(self, in_channels: int, out_channels: int | None = None, groups: int = 1):
+        super().__init__(groups=groups)
         self.in_channels = in_channels
         if out_channels is None:
             out_channels = in_channels
         self.out_channels = out_channels
+        assert in_channels % groups == 0 and out_channels % groups == 0
+
         if in_channels != out_channels:
-            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, groups=groups, bias=False)
         else:
             self.conv = None
 
@@ -49,8 +55,22 @@ class Shortcut(ReparamBranch):
             w = self.conv.weight.double()
             b = torch.zeros(self.out_channels, dtype=torch.double, device=w.device)
         else:
-            w = torch.eye(self.in_channels, dtype=torch.double).reshape(self.in_channels, self.in_channels, 1, 1)
-            b = torch.zeros(self.in_channels, dtype=torch.double)
+            # identity
+            w = torch.zeros((self.out_channels, self.in_channels // self.groups, 1, 1), dtype=torch.double)
+            if self.groups == 1:
+                w.data.copy_(
+                    torch.eye(self.in_channels, dtype=torch.double).reshape(self.in_channels, self.in_channels, 1, 1)
+                )
+            else:
+                # depthwise or grouped identity
+                # w shape: (out_c, in_c // groups, 1, 1)
+                # For identity, each output channel i comes from input channel i
+                # In grouped conv weight:
+                # w[i, 0, 0, 0] = 1.0 where i is the index in out_channels
+                # (assuming in_c == out_c for identity)
+                for i in range(self.out_channels):
+                    w[i, 0, 0, 0] = 1.0
+            b = torch.zeros(self.out_channels, dtype=torch.double)
         return w, b
 
     def get_kernel_size(self):
@@ -67,12 +87,16 @@ class Conv2dBranch(ReparamBranch):
         kernel_size,
         stride=1,
         padding=0,
+        groups: int = 1,
         use_bn=False,
         bn_layer=nn.BatchNorm2d,
         dropout_p=0.0,
     ):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=not use_bn)
+        super().__init__(groups=groups)
+        assert in_channels % groups == 0 and out_channels % groups == 0
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=padding, groups=groups, bias=not use_bn
+        )
         if use_bn:
             self.bn = bn_layer(out_channels)
         else:
@@ -111,9 +135,16 @@ class Conv2dBranch(ReparamBranch):
 
 class Parallel(ReparamBranch):
     def __init__(
-        self, in_channels: int, out_channels: int, structures, use_bn=False, bn_layer=nn.BatchNorm2d, dropout_p=0.0
+        self,
+        in_channels: int,
+        out_channels: int,
+        structures,
+        groups: int = 1,
+        use_bn=False,
+        bn_layer=nn.BatchNorm2d,
+        dropout_p=0.0,
     ):
-        super().__init__()
+        super().__init__(groups=groups)
         if isinstance(use_bn, bool):
             use_bn = [use_bn] * len(structures)
         if isinstance(dropout_p, (int, float)):
@@ -124,15 +155,18 @@ class Parallel(ReparamBranch):
         self.out_channels = out_channels
         self.branches = nn.ModuleList(
             [
-                self._build(in_channels, out_channels, s, use_bn=self.use_bn[i], dropout_p=dropout_p[i])
+                self._build(in_channels, out_channels, s, groups=groups, use_bn=self.use_bn[i], dropout_p=dropout_p[i])
                 for i, s in enumerate(structures)
             ]
         )
 
-    def _build(self, in_c, out_c, s, use_bn, dropout_p):
+    def _build(self, in_c, out_c, s, groups, use_bn, dropout_p):
         if isinstance(s, (int, tuple)):
-            return Conv2dBranch(in_c, out_c, s, use_bn=use_bn, bn_layer=self.bn_layer, dropout_p=dropout_p)
+            return Conv2dBranch(
+                in_c, out_c, s, groups=groups, use_bn=use_bn, bn_layer=self.bn_layer, dropout_p=dropout_p
+            )
         if isinstance(s, ReparamBranch):
+            assert s.groups == groups
             return s
         raise ValueError(f"Unsupported structure: {s}")
 
@@ -158,7 +192,9 @@ class Parallel(ReparamBranch):
                 device = w.device
                 break
 
-        res_w = torch.zeros((self.out_channels, self.in_channels, max_h, max_w), dtype=torch.double, device=device)
+        res_w = torch.zeros(
+            (self.out_channels, self.in_channels // self.groups, max_h, max_w), dtype=torch.double, device=device
+        )
         res_b = torch.zeros(self.out_channels, dtype=torch.double, device=device)
 
         for i, (w, b) in enumerate(fused):
@@ -179,12 +215,13 @@ class Series(ReparamBranch):
         in_channels: int,
         out_channels: int,
         structures,
+        groups: int = 1,
         middle_factor: int | float = 1,
         use_bn=False,
         bn_layer=nn.BatchNorm2d,
         dropout_p=0.0,
     ):
-        super().__init__()
+        super().__init__(groups=groups)
         if isinstance(use_bn, bool):
             use_bn = [use_bn] * len(structures)
         if isinstance(dropout_p, (int, float)):
@@ -193,22 +230,32 @@ class Series(ReparamBranch):
         self.bn_layer = bn_layer
         self.in_channels = in_channels
         self.out_channels = out_channels
-        # Scaled relative to out_channels
-        self.middle_channels = int(out_channels * middle_factor)
-        self.middle_channels = max(self.middle_channels - self.middle_channels % 8, 8)
+        if groups > 1:
+            # depthwise fusion requires in == out == middle == groups
+            self.middle_channels = groups
+            assert in_channels == groups and out_channels == groups
+        else:
+            # Scaled relative to out_channels
+            self.middle_channels = int(out_channels * middle_factor)
+            self.middle_channels = max(self.middle_channels - self.middle_channels % 8, 8)
 
         branches = []
         num_branches = len(structures)
         for i, s in enumerate(structures):
             branch_in = in_channels if i == 0 else self.middle_channels
             branch_out = out_channels if i == num_branches - 1 else self.middle_channels
-            branches.append(self._build(branch_in, branch_out, s, use_bn=self.use_bn[i], dropout_p=dropout_p[i]))
+            branches.append(
+                self._build(branch_in, branch_out, s, groups=groups, use_bn=self.use_bn[i], dropout_p=dropout_p[i])
+            )
         self.branches = nn.ModuleList(branches)
 
-    def _build(self, in_c, out_c, s, use_bn, dropout_p):
+    def _build(self, in_c, out_c, s, groups, use_bn, dropout_p):
         if isinstance(s, (int, tuple)):
-            return Conv2dBranch(in_c, out_c, s, use_bn=use_bn, bn_layer=self.bn_layer, dropout_p=dropout_p)
+            return Conv2dBranch(
+                in_c, out_c, s, groups=groups, use_bn=use_bn, bn_layer=self.bn_layer, dropout_p=dropout_p
+            )
         if isinstance(s, ReparamBranch):
+            assert s.groups == groups
             return s
         raise ValueError(f"Unsupported structure: {s}")
 
@@ -227,10 +274,38 @@ class Series(ReparamBranch):
             next_w = next_w.to(device)
             next_b = next_b.to(device)
 
-            curr_w = F.conv2d(
-                curr_w.transpose(0, 1), next_w.flip(-1, -2), padding=(next_w.shape[-2] - 1, next_w.shape[-1] - 1)
-            ).transpose(0, 1)
-            curr_b = next_w.sum(dim=(2, 3)) @ curr_b + next_b
+            if self.groups == 1:
+                curr_w = F.conv2d(
+                    curr_w.transpose(0, 1), next_w.flip(-1, -2), padding=(next_w.shape[-2] - 1, next_w.shape[-1] - 1)
+                ).transpose(0, 1)
+                curr_b = next_w.sum(dim=(2, 3)) @ curr_b + next_b
+            else:
+                # Grouped/Depthwise fusion
+                # Treat curr_w as input data, next_w as kernel
+                # input shape: (1, out_channels_curr, h, w)
+                # weight shape: (out_channels_next, out_channels_curr // groups, kh, kw)
+                out_channels_curr = curr_w.shape[0]
+                out_channels_next = next_w.shape[0]
+                fused_w = F.conv2d(
+                    curr_w.reshape(1, out_channels_curr, curr_w.shape[-2], curr_w.shape[-1]),
+                    next_w.flip(-1, -2),
+                    groups=self.groups,
+                    padding=(next_w.shape[-2] - 1, next_w.shape[-1] - 1),
+                )
+                curr_w = fused_w.reshape(
+                    out_channels_next, out_channels_curr // self.groups, fused_w.shape[-2], fused_w.shape[-1]
+                )
+                # Bias fusion
+                # next_w.sum(dim=(2, 3)) shape: (out_channels_next, out_channels_curr // groups)
+                # next_w_sum as 1x1 grouped conv weight
+                next_w_sum = next_w.sum(dim=(2, 3)).unsqueeze(-1).unsqueeze(-1)
+                curr_b = (
+                    F.conv2d(curr_b.reshape(1, out_channels_curr, 1, 1), next_w_sum, groups=self.groups).reshape(
+                        out_channels_next
+                    )
+                    + next_b
+                )
+
         return curr_w, curr_b
 
     def get_kernel_size(self):
@@ -247,6 +322,7 @@ class ReparamConv2d(nn.Module):
         out_channels: int,
         structure,
         padding: bool = False,
+        groups: int = 1,
         use_bn=False,
         bn_layer=nn.BatchNorm2d,
         dropout_p=0.0,
@@ -254,10 +330,17 @@ class ReparamConv2d(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.groups = groups
 
         if isinstance(structure, (list, tuple)):
             self.structure = Parallel(
-                in_channels, out_channels, structure, use_bn=use_bn, bn_layer=bn_layer, dropout_p=dropout_p
+                in_channels,
+                out_channels,
+                structure,
+                groups=groups,
+                use_bn=use_bn,
+                bn_layer=bn_layer,
+                dropout_p=dropout_p,
             )
         else:
             self.structure = structure
@@ -269,7 +352,7 @@ class ReparamConv2d(nn.Module):
             else None
         )
 
-        self.conv_eval = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=0)
+        self.conv_eval = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, groups=groups, padding=0)
         basic_module_init(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -374,6 +457,27 @@ def _test(dtype=torch.float64):
         print("Shortcut(mismatch) Test Passed")
     else:
         print("Shortcut(mismatch) Test Failed")
+
+    # test Depthwise
+    in_c3, out_c3, groups3 = 32, 32, 32
+    structure3 = [
+        3,
+        5,
+        Shortcut(in_c3, out_c3, groups=groups3),
+        Series(in_c3, out_c3, [1, 3, 1], groups=groups3),
+    ]
+    model = ReparamConv2d(in_c3, out_c3, structure3, groups=groups3, padding=True).to(device, dtype=dtype)
+    x = torch.rand((4, in_c3, 64, 64)).to(device, dtype=dtype)
+    model.train()
+    z1 = model(x)
+    model.eval()
+    z2 = model(x)
+    diff = (z1 - z2).abs().max().item()
+    print(f"Depthwise Max difference: {diff}")
+    if diff < 1e-5:
+        print("Depthwise Test Passed")
+    else:
+        print("Depthwise Test Failed")
 
 
 if __name__ == "__main__":
