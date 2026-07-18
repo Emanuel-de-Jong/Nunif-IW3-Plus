@@ -59,6 +59,19 @@ class RMSNorm1(nn.RMSNorm):
         return F.rms_norm(x, self.normalized_shape, self.weight + 1.0, self.eps)
 
 
+class RMSNorm2d(nn.Module):
+    # 0-centered ver
+    def __init__(self, in_channels):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones((1, in_channels, 1, 1), dtype=torch.float32))
+        nn.init.zeros_(self.weight)
+
+    def forward(self, x):
+        scale = torch.rsqrt(torch.mean(x.float() ** 2, dim=1, keepdim=True) + 1e-5)
+        scale = scale * (1.0 + self.weight)
+        return x * scale.to(x.dtype)
+
+
 class FastLayerNorm(nn.LayerNorm):
     """
     Idea from timm fast_layer_norm.
