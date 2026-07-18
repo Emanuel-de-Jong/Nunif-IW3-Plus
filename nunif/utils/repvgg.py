@@ -4,6 +4,10 @@
 
 import torch
 import torch.nn as nn
+from torchvision.models.feature_extraction import (
+    create_feature_extractor,
+    get_graph_node_names,
+)
 
 
 class RepVGGBlock(nn.Module):
@@ -49,8 +53,29 @@ class RepVGG(nn.Module):
         x = self.linear(x)
         return x
 
+    def create_feature_extractor(self, return_nodes: list[str] | dict[str, str]) -> torch.fx.GraphModule:
+        return create_feature_extractor(self, return_nodes=return_nodes)
+
+    def get_graph_node_names(self) -> list[str]:
+        train_nodes, eval_nodes = get_graph_node_names(self)
+        return eval_nodes
+
 
 B1_CHECKPOINT_URL = "https://github.com/nagadomi/nunif/releases/download/0.0.0/RepVGG-B1-deploy.pth"
+B1_FEATURE_NODES = {
+    # 1/2
+    "stage0.nonlinearity": "l2",
+    # 1/4
+    "stage1.3.nonlinearity": "l4",
+    # 1/8
+    "stage2.5.nonlinearity": "l8",
+    # 1/16
+    "stage3.7.nonlinearity": "l16_h",
+    # too close to "stage4.0.nonlinearity"
+    "stage3.15.nonlinearity": "l16",
+    # 1/32
+    "stage4.0.nonlinearity": "l32",
+}
 
 
 def create_RepVGG_B1(url=B1_CHECKPOINT_URL):
@@ -102,5 +127,21 @@ def _test_model():
         print(f"{i + 1}: {CLASS_LABELS[cid]}({cid}):  {prob}")
 
 
+def _test_features():
+    from pprint import pprint
+
+    model = create_RepVGG_B1().cuda()
+    feature_extractor = model.create_feature_extractor(B1_FEATURE_NODES)
+    x = torch.rand((4, 3, 224, 224)).cuda()
+    features = feature_extractor(x)
+    print("** features, len=", len(features))
+    for name, vec in features.items():
+        print(name, vec.shape)
+
+    print("** get_graph_node_names")
+    pprint(model.get_graph_node_names())
+
+
 if __name__ == "__main__":
+    # _test_features()
     _test_model()
