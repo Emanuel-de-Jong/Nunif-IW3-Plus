@@ -238,7 +238,7 @@ class WindowMHA2dV2(nn.Module):
         in_channels: int,
         num_heads: int,
         window_size: int | tuple[int, int],
-        shift: bool = False,
+        shift: bool | tuple[bool, bool] | list[bool] = False,
         num_kv_heads: int | None = None,
     ) -> None:
         super().__init__()
@@ -799,9 +799,10 @@ def _test_2d_v2():
     window_size = (8, 8)
 
     # uses RoPE2d
-    mha = WindowMHA2dV2(dim, num_heads=num_heads, window_size=window_size).cuda()
     x = torch.zeros((4, dim, 32, 32)).cuda()
-    mha(x)
+    for shift in [False, True, (True, False), (False, True)]:
+        mha = WindowMHA2dV2(dim, num_heads=num_heads, window_size=window_size, shift=shift).cuda()
+        assert mha(x).shape == x.shape
 
 
 def _test_overlap_v2():
