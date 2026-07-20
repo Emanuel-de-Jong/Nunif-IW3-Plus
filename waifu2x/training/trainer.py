@@ -34,7 +34,7 @@ from nunif.modules.fft_loss import YRGBL1FFTGradientLoss
 from nunif.modules.lpips import LPIPSWith
 from nunif.modules.weighted_loss import WeightedLoss
 from nunif.modules.dct_loss import DCTLoss
-from nunif.modules.dinov2 import DINOv2PoolWith, DINOv2CosineWith
+from nunif.modules.dinov2 import DINOv2PoolWith, DINOv2CosineWith, DINOv2AlignmentLoss
 from dino.models.l4sn import L4SNWith
 from nunif.modules.identity_loss import IdentityLoss
 from nunif.modules.transforms import DiffPairRandomTranslate, DiffPairRandomRotate, DiffPairRandomDownsample
@@ -85,6 +85,7 @@ LOSS_FUNCTIONS = {
 
     "dct": lambda: DCTLoss(clamp=True),
     "dctirm": lambda: _dctirm(),
+    "dctirm_dino_align": lambda: DINOv2AlignmentLoss(_dctirm(), weight=0.01),
     "dctir24": lambda: WeightedLoss(
         (DCTLoss(window_size=24, clamp=True, random_rotate=True, overlap=True),),
         weights=(1.0,),
