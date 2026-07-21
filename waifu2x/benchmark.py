@@ -119,9 +119,9 @@ def make_input_waifu2x(gt, args):
     elif args.method == "noise":
         x, gt = add_jpeg_noise(x, gt, args)
     elif args.method == "noise_scale":
-        x, gt = add_jpeg_noise(resize(x, 0.5, filter_type=filter, blur=args.blur), gt, args)
+        x, gt = add_jpeg_noise(resize(x, 0.5, filter_type=args.filter, blur=args.blur), gt, args)
     elif args.method == "noise_scale4x":
-        x, gt = add_jpeg_noise(resize(x, 0.25, filter_type=filter, blur=args.blur), gt, args)
+        x, gt = add_jpeg_noise(resize(x, 0.25, filter_type=args.filter, blur=args.blur), gt, args)
     return x, gt
 
 
