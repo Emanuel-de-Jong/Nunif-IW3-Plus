@@ -254,7 +254,6 @@ class WindowMHA2dV2(nn.Module):
 
         self.mha = MHA(in_channels, num_heads, qkv_bias=False, num_kv_heads=num_kv_heads)
         self.rope = RoPE2d(in_channels // num_heads, self.window_size[0], self.window_size[1])
-        basic_module_init(self)
 
     def forward(
         self,
@@ -297,6 +296,78 @@ class WindowMHA2dV2(nn.Module):
         x = bnc_to_bchw(x, out_shape, self.window_size)
         if needs_pad:
             x = x[:, :, self.pad_h : self.pad_h + H, self.pad_w : self.pad_w + W]
+
+        return x
+
+
+class WindowMHA2dCLV2(nn.Module):
+    """WindowMHA2d with RoPE2d
+    BHWC input/output
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        num_heads: int,
+        window_size: int | tuple[int, int],
+        shift: bool | tuple[bool, bool] | list[bool] = False,
+        num_kv_heads: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.window_size = window_size if isinstance(window_size, (tuple, list)) else (window_size, window_size)
+        self.shift = shift if isinstance(shift, (tuple, list)) else (shift, shift)
+        self.pad_h = self.pad_w = 0
+        if self.shift[0]:
+            assert self.window_size[0] % 2 == 0
+            self.pad_h = self.window_size[0] // 2
+        if self.shift[1]:
+            assert self.window_size[1] % 2 == 0
+            self.pad_w = self.window_size[1] // 2
+
+        self.mha = MHA(in_channels, num_heads, qkv_bias=False, num_kv_heads=num_kv_heads)
+        self.rope = RoPE2d(in_channels // num_heads, self.window_size[0], self.window_size[1])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        layer_norm: nn.Module | None = None,
+        norm_shift: torch.Tensor | None = None,
+        norm_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, H, W, C = x.shape
+        assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0
+
+        needs_pad = self.pad_h > 0 or self.pad_w > 0
+        if needs_pad:
+            x = F.pad(x, (0, 0, self.pad_w, self.pad_w, self.pad_h, self.pad_h), mode="constant", value=0)
+            attn_mask = gen_padded_attention_mask_2d(
+                B,
+                H,
+                W,
+                self.window_size[0],
+                self.window_size[1],
+                self.pad_h,
+                self.pad_w,
+                x.device,
+            )
+        else:
+            attn_mask = None
+
+        out_shape = x.shape
+        x = bhwc_to_bnc(x, self.window_size)
+        if layer_norm is not None:
+            x = layer_norm(x)
+        if norm_scale is not None and norm_shift is not None:
+            B_bnc, N_bnc, C_bnc = x.shape
+            num_windows = B_bnc // B
+            x = x.view(B, num_windows, N_bnc, C_bnc)
+            x = x * (1.0 + norm_scale.view(B, 1, 1, C)) + norm_shift.view(B, 1, 1, C)
+            x = x.view(B_bnc, N_bnc, C)
+
+        x = self.mha(x, attn_mask=attn_mask, rope=self.rope)
+        x = bnc_to_bhwc(x, out_shape, self.window_size)
+        if needs_pad:
+            x = x[:, self.pad_h : self.pad_h + H, self.pad_w : self.pad_w + W, :]
 
         return x
 
@@ -805,6 +876,28 @@ def _test_2d_v2():
         assert mha(x).shape == x.shape
 
 
+def _test_2d_cl_v2():
+    dim = 64
+    num_heads = 4
+    window_size = (8, 8)
+    x = torch.rand((4, dim, 32, 32)).cuda()
+    x_cl = x.permute(0, 2, 3, 1).contiguous()
+
+    for shift in [False, True, (True, False), (False, True)]:
+        mha = WindowMHA2dV2(dim, num_heads=num_heads, window_size=window_size, shift=shift).cuda().eval()
+        mha_cl = WindowMHA2dCLV2(dim, num_heads=num_heads, window_size=window_size, shift=shift).cuda().eval()
+
+        # sync weights
+        mha_cl.mha.load_state_dict(mha.mha.state_dict())
+
+        with torch.inference_mode():
+            y = mha(x)
+            y_cl = mha_cl(x_cl)
+            diff = (y - y_cl.permute(0, 3, 1, 2)).abs().max()
+            # print(f"shift={shift} diff={diff}")
+            assert diff < 1e-4
+
+
 def _test_overlap_v2():
     dim = 64
     num_heads = 4
@@ -834,6 +927,7 @@ if __name__ == "__main__":
     _test_bias()
     _test_bias2()
     _test_2d_v2()
+    _test_2d_cl_v2()
     _test_2d()
     _test_3d()
     pass
