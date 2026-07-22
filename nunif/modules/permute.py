@@ -80,6 +80,40 @@ def pixel_shuffle(x, window_size):
     return x
 
 
+def pixel_unshuffle_bhwc(x, window_size):
+    B, H, W, C = x.shape
+    SH, SW = window_size if isinstance(window_size, (list, tuple)) else [window_size, window_size]
+    SS = SH * SW
+    assert H % SH == 0 and W % SW == 0
+
+    oc = C * SS
+    oh = H // SH
+    ow = W // SW
+
+    x = x.reshape(B, oh, SH, ow, SW, C)
+    x = x.permute(0, 1, 3, 5, 2, 4)
+    x = x.reshape(B, oh, ow, oc)
+
+    return x
+
+
+def pixel_shuffle_bhwc(x, window_size):
+    B, H, W, C = x.shape
+    SH, SW = window_size if isinstance(window_size, (list, tuple)) else [window_size, window_size]
+    SS = SH * SW
+    assert C % SS == 0
+
+    oc = C // SS
+    oh = H * SH
+    ow = W * SW
+
+    x = x.reshape(B, H, W, oc, SH, SW)
+    x = x.permute(0, 1, 4, 2, 5, 3)
+    x = x.reshape(B, oh, ow, oc)
+
+    return x
+
+
 def bchw_to_bnc(x, window_size):
     # For sequential model, e.g. transformer, lstm
     # b = B * (h // window_size) * (w // window_size)
@@ -287,6 +321,24 @@ def _test_pixel_shuffle():
     print("pass _test_pixel_shuffle")
 
 
+def _test_pixel_shuffle_bchw():
+    import torch.nn.functional as F
+
+    x = torch.rand((4, 3, 6, 6))
+    x_bhwc = bchw_to_bhwc(x)
+
+    x1 = pixel_unshuffle_bhwc(x_bhwc, 2)
+    x2 = F.pixel_unshuffle(x, 2)
+
+    assert bhwc_to_bchw(x1).shape == x2.shape and (bhwc_to_bchw(x1) - x2).abs().sum() == 0.0
+
+    x1 = pixel_shuffle_bhwc(x1, 2)
+    x2 = F.pixel_shuffle(x2, 2)
+    assert bhwc_to_bchw(x1).shape == x2.shape and (bhwc_to_bchw(x1) - x2).abs().sum() == 0.0
+
+    print("pass _test_pixel_shuffle_bchw")
+
+
 def _test_bnc():
     src = x = torch.rand((4, 3, 6, 6))
     original_shape = x.shape
@@ -326,6 +378,7 @@ def _test_window():
 if __name__ == "__main__":
     _test_bhwc()
     _test_pixel_shuffle()
+    _test_pixel_shuffle_bchw()
     _test_bnc()
     _test_3d_bnc()
     _test_window()
