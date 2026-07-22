@@ -104,7 +104,7 @@ def configure_optim_groups(model, weight_decay=0.01):
     return optim_groups
 
 
-def configure_adamw(model, lr=0.001, betas=(0.9, 0.999), weight_decay=0.01):
+def configure_adamw(model, lr=0.001, betas=(0.9, 0.999), weight_decay=0.01, fused=None):
     optim_groups = configure_optim_groups(model, weight_decay=weight_decay)
-    optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=betas)
+    optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=betas, fused=fused)
     return optimizer

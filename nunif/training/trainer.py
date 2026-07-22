@@ -199,6 +199,14 @@ class Trainer(ABC):
                 lr=lr,
                 weight_decay=weight_decay,
                 betas=(adam_beta1, 0.999))
+        elif optimizer_type == "adamw_fused":
+            return configure_adamw(
+                model,
+                lr=lr,
+                weight_decay=weight_decay,
+                betas=(adam_beta1, 0.999),
+                fused=True,
+            )
         elif optimizer_type == "sgd":
             return optim.SGD(
                 model.parameters(),
@@ -378,7 +386,7 @@ def create_trainer_default_parser():
                         help="eval interval")
 
     parser.add_argument("--optimizer", type=str,
-                        choices=["adam", "adamw", "sgd", "lion",
+                        choices=["adam", "adamw", "adamw_fused", "sgd", "lion",
                                  "sgd_schedulefree", "adamw_schedulefree", "radam_schedulefree"], default="adam",
                         help="optimizer")
     parser.add_argument("--weight-decay", type=float, default=1e-4,
