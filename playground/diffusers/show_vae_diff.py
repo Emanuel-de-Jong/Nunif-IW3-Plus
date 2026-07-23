@@ -27,9 +27,9 @@ VAE_OPTIONS = {
 def safe_pad(x, mod):
     # make the image size a multiple of 8 to avoid image size changes in encode/decode
     c, h, w = x.shape
-    pad_bottom = mod - h % mod
-    pad_right = mod - w % mod
-    if pad_bottom != 0 or pad_right != 0:
+    pad_bottom = mod - h % mod if h % mod != 0 else 0
+    pad_right = mod - w % mod if w % mod != 0 else 0
+    if h != 0 or w != 0:
         x = TF.pad(x, (0, 0, pad_right, pad_bottom), padding_mode="edge")
     return x
 
@@ -59,7 +59,7 @@ def main():
         vae = AutoencoderKLQwenImage.from_pretrained(
             torch_dtype=torch.float32, use_auth_token=False, **VAE_OPTIONS[args.vae]
         ).cuda()
-        mod = 8
+        mod = 32
 
     vae.eval()
     with torch.no_grad():
@@ -67,6 +67,8 @@ def main():
         x = safe_pad(x, mod)
         pil_io.to_image(x).show()
         time.sleep(1)
+
+        x = (x - 0.5) / 0.5
 
         if args.vae == "sd-mse":
             mu = vae.encode(x.cuda()).latent_dist.mode()
@@ -81,6 +83,9 @@ def main():
             y = y.squeeze(2)
 
         y = y.squeeze(0).cpu()
+        y = ((y * 0.5) + 0.5).clamp(0, 1)
+        x = ((x * 0.5) + 0.5).clamp(0, 1)
+
         pil_io.to_image(y).show()
         time.sleep(1)
 
