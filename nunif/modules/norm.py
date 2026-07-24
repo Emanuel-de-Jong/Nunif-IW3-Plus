@@ -56,7 +56,7 @@ class RMSNorm1(nn.RMSNorm):
             nn.init.zeros_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(x, self.normalized_shape, self.weight + 1.0, self.eps)
+        return F.rms_norm(x, self.normalized_shape, self.weight + 1.0, self.eps).to(x.dtype)
 
 
 class RMSNorm2d(nn.Module):
