@@ -18,7 +18,9 @@ exclude = [
 
 [lint]
 select = ["E", "F", "I"]
-ignore = []
+ignore = [
+       "RUF007",  # Prefer `itertools.pairwise()` over `zip()` when iterating over successive pair.
+]
 
 
 [lint.isort]
