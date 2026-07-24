@@ -231,6 +231,7 @@ def main():
         ctx.half()
         args.disable_amp = True
     if args.compile:
+        args.batch_size = 1
         ctx.compile()
         ctx.warmup(tile_size=args.tile_size, batch_size=args.batch_size, enable_amp=not args.disable_amp)
 
