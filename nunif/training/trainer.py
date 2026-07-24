@@ -2,6 +2,7 @@ import os
 from os import path
 import argparse
 from multiprocessing import cpu_count
+import inspect
 import torch
 import torch.optim as optim
 import torch.optim.swa_utils as swa_utils
@@ -221,6 +222,10 @@ class Trainer(ABC):
                 warmup_steps=self.args.warmup_epoch * num_samples // (self.args.batch_size * self.args.backward_step))
         elif optimizer_type == "adamw_schedulefree":
             assert schedulefree is not None
+            sig = inspect.signature(schedulefree.AdamWScheduleFree)
+            kwargs = dict()
+            if "inner_momentum" in sig.parameters:
+                kwargs.update(dict(inner_momentum=0.9))
             optim_groups = configure_optim_groups(model, weight_decay=weight_decay)
             optimizer = schedulefree.AdamWScheduleFree(
                 optim_groups,
@@ -228,7 +233,7 @@ class Trainer(ABC):
                 betas=(adam_beta1, 0.999),
                 warmup_steps=self.args.warmup_epoch * num_samples // (self.args.batch_size * self.args.backward_step),
                 weight_decay=weight_decay,
-                # inner_momentum=0.9,  # Not yet released in pip
+                **kwargs,
             )
             return optimizer
         elif optimizer_type == "radam_schedulefree":
