@@ -223,8 +223,13 @@ class Trainer(ABC):
             assert schedulefree is not None
             optim_groups = configure_optim_groups(model, weight_decay=weight_decay)
             optimizer = schedulefree.AdamWScheduleFree(
-                optim_groups, lr=lr, betas=(adam_beta1, 0.999),
-                warmup_steps=self.args.warmup_epoch * num_samples // (self.args.batch_size * self.args.backward_step))
+                optim_groups,
+                lr=lr,
+                betas=(adam_beta1, 0.999),
+                warmup_steps=self.args.warmup_epoch * num_samples // (self.args.batch_size * self.args.backward_step),
+                weight_decay=weight_decay,
+                # inner_momentum=0.9,  # Not yet released in pip
+            )
             return optimizer
         elif optimizer_type == "radam_schedulefree":
             assert schedulefree is not None
