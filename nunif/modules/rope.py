@@ -34,7 +34,7 @@ class RoPE2d(nn.Module):
         head_dim: int,
         height: int,
         width: int,
-        base: float = 100.0,
+        base: float = 10000.0,
     ) -> None:
         super().__init__()
         assert head_dim % 4 == 0, "head_dim must be a multiple of 4"
@@ -124,6 +124,35 @@ def _bench(do_compile):
     print(f"GPU Max Memory Allocated {max_vram_mb}MB")
 
 
+def _visualize():
+    from .permute import bchw_to_bnc, bnc_to_bchw
+    import torchvision.transforms.functional as TF
+    from torchvision.utils import make_grid
+    import time
+    C = 32
+    IMG_SIZE = 32
+    WINDOW = 8
+    x = torch.ones((1, C, IMG_SIZE, IMG_SIZE))
+    out_shape = x.shape
+    rope = RoPE2d(C, WINDOW, WINDOW, base=10000)
+    x = bchw_to_bnc(x, WINDOW)
+    x = x.unsqueeze(1)
+    x = rope(x)
+    x = x.squeeze(1)
+    x = bnc_to_bchw(x, out_shape, WINDOW)
+
+    images = []
+    for i in range(C):
+        img = x[0, i:(i + 1)]
+        img = (img + 2 ** 0.5) / (2 ** 0.5 * 2)
+        images.append(img)
+
+    img = make_grid(images, nrow=C // 2, padding=2, normalize=False)
+    TF.to_pil_image(img).show()
+
+
+
 if __name__ == "__main__":
     _bench(do_compile=False)
     _bench(do_compile=True)
+    # _visualize()
