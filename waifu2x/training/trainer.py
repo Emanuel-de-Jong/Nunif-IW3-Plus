@@ -269,10 +269,10 @@ class Waifu2xEnv(LuminancePSNREnv):
         if self.trainer.args.hard_example == "none":
             return
         if isinstance(loss, (list, tuple)):
-            if any(math.isnan(val) for val in loss):
+            if any(torch.any(torch.isnan(val.detach())) for val in loss):
                 return
         else:
-            if math.isnan(loss):
+            if torch.any(torch.isnan(loss.detach())):
                 return
 
         index = data[-1]
