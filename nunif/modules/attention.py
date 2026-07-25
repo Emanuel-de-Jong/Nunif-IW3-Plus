@@ -218,7 +218,7 @@ def gen_padded_attention_mask_2d(
         win_mask = bchw_to_bnc(mask_pad, (window_h, window_w)).view(-1, N)
 
         # (num_windows, 1, N, N)
-        attn_mask = ~(win_mask.unsqueeze(1) & win_mask.unsqueeze(2))
+        attn_mask = win_mask.unsqueeze(1) & win_mask.unsqueeze(2)
         attn_mask = attn_mask.unsqueeze(1)
 
         # (B * num_windows, 1, N, N)
@@ -918,8 +918,16 @@ def _test_gqa():
     mha(x)
 
 
+def _test_gen_padded_attention_mask_2d():
+    print("_test_gen_padded_attention_mask_2d")
+    mask = gen_padded_attention_mask_2d(1, 4, 4, 2, 2, 1, 1, torch.device("cpu"))
+    print(mask.shape)
+    print(mask)
+
+
 if __name__ == "__main__":
     # _test_spatial_reduction()
+    # _test_gen_padded_attention_mask_2d()
     _test_gqa()
     _test_overlap_v2()
     _test_neighborhood()
