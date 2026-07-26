@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 
@@ -28,16 +30,23 @@ class RoPE2d(nn.Module):
     sin_h: torch.Tensor
     cos_w: torch.Tensor
     sin_w: torch.Tensor
+    q_norm: nn.Module
+    k_norm: nn.Module
 
     def __init__(
         self,
         head_dim: int,
-        height: int,
-        width: int,
+        size: int | tuple[int, int],
         base: float = 10000.0,
+        norm_layer: Callable[[int], nn.Module] | None = None,
     ) -> None:
         super().__init__()
         assert head_dim % 4 == 0, "head_dim must be a multiple of 4"
+
+        if isinstance(size, int):
+            height = width = size
+        else:
+            height, width = size
 
         self.head_dim = head_dim
         self.height = height
@@ -49,6 +58,13 @@ class RoPE2d(nn.Module):
         self.register_buffer("sin_h", sin_h, persistent=False)
         self.register_buffer("cos_w", cos_w, persistent=False)
         self.register_buffer("sin_w", sin_w, persistent=False)
+
+        if norm_layer is not None:
+            self.q_norm = norm_layer(head_dim)
+            self.k_norm = norm_layer(head_dim)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
 
     @torch.no_grad()
     def _precompute_freqs(self, base: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -70,10 +86,7 @@ class RoPE2d(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos(), emb.sin()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, num_heads, N, head_dim] (N = h * w)
-        """
+    def apply_rope(self, x: torch.Tensor) -> torch.Tensor:
         B, num_heads, N, head_dim = x.shape
         x_h = x[..., : self.dim_chunk].reshape(B, num_heads, self.height, self.width, self.dim_chunk)
         x_w = x[..., self.dim_chunk :].reshape(B, num_heads, self.height, self.width, self.dim_chunk)
@@ -85,6 +98,14 @@ class RoPE2d(nn.Module):
         out_w = out_w.reshape(B, num_heads, N, self.dim_chunk)
         return torch.cat([out_h, out_w], dim=-1)
 
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        q: [B, num_heads, N, head_dim] (N = h * w)
+        """
+        q = self.apply_rope(self.q_norm(q).to(q.dtype))
+        k = self.apply_rope(self.k_norm(k).to(k.dtype))
+        return q, k
+
 
 def _bench(do_compile):
     import time
@@ -92,24 +113,29 @@ def _bench(do_compile):
     device = "cuda:0"
     N = 20
     LAYERS = 10
-    B = 16
+    B = 64
     S = (128, 128)
     dim = 256
     num_heads = 4
     head_dim = dim // 4
 
-    rope = RoPE2d(head_dim, S[0], S[1]).cuda()
+    rope = RoPE2d(head_dim, S, norm_layer=nn.LayerNorm).cuda()
     x = torch.rand((B, num_heads, S[0] * S[1], head_dim), dtype=torch.float16, device="cuda")
     if do_compile:
-        # over 10x faster
         rope = torch.compile(rope)
 
     with torch.inference_mode(), torch.autocast(device_type="cuda"):
-        z = rope(x)
+        z, _ = rope(x, x)
         print(z.shape, z.dtype)
 
     # check backward works
-    rope(x + nn.Parameter(torch.zeros(1)).cuda()).sum().backward()
+    with torch.autocast(device_type="cuda"):
+        sum(
+            rope(
+                x + nn.Parameter(torch.zeros(1, dtype=x.dtype)).cuda(),
+                x + nn.Parameter(torch.zeros(1, dtype=x.dtype)).cuda(),
+            )
+        ).sum().backward()
 
     # benchmark
     torch.cuda.synchronize()
@@ -117,7 +143,7 @@ def _bench(do_compile):
     with torch.inference_mode(), torch.autocast(device_type="cuda"):
         for _ in range(N):
             for _ in range(LAYERS):
-                z = rope(x)
+                rope(x, x)
     torch.cuda.synchronize()
     print(round(1 / ((time.time() - t) / (B * N)), 3), "FPS")
     max_vram_mb = int(torch.cuda.max_memory_allocated(device) / (1024 * 1024))
@@ -125,31 +151,32 @@ def _bench(do_compile):
 
 
 def _visualize():
-    from .permute import bchw_to_bnc, bnc_to_bchw
+
     import torchvision.transforms.functional as TF
     from torchvision.utils import make_grid
-    import time
+
+    from .permute import bchw_to_bnc, bnc_to_bchw
+
     C = 32
     IMG_SIZE = 32
     WINDOW = 8
     x = torch.ones((1, C, IMG_SIZE, IMG_SIZE))
     out_shape = x.shape
-    rope = RoPE2d(C, WINDOW, WINDOW, base=10000)
+    rope = RoPE2d(C, WINDOW, base=10000)
     x = bchw_to_bnc(x, WINDOW)
     x = x.unsqueeze(1)
-    x = rope(x)
+    x = rope.apply_rope(x)
     x = x.squeeze(1)
     x = bnc_to_bchw(x, out_shape, WINDOW)
 
     images = []
     for i in range(C):
-        img = x[0, i:(i + 1)]
-        img = (img + 2 ** 0.5) / (2 ** 0.5 * 2)
+        img = x[0, i : (i + 1)]
+        img = (img + 2**0.5) / (2**0.5 * 2)
         images.append(img)
 
     img = make_grid(images, nrow=C // 2, padding=2, normalize=False)
     TF.to_pil_image(img).show()
-
 
 
 if __name__ == "__main__":

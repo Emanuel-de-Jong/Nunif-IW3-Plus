@@ -88,8 +88,7 @@ def sliced_sdp(q, k, v, num_heads, attn_mask=None, rope=None, dropout_p=0.0, is_
     v = v.view(B, KN, num_kv_heads, kv_dim).permute(0, 2, 1, 3)
 
     if rope is not None:
-        q = rope(q)
-        k = rope(k)
+        q, k = rope(q, k)
 
     use_flash = B <= 65535  # avoid CUDA error: invalid configuration argument.
     with use_flash_attention(use_flash):
@@ -253,12 +252,12 @@ class WindowMHA2dV2(nn.Module):
             self.pad_w = self.window_size[1] // 2
 
         self.mha = MHA(in_channels, num_heads, qkv_bias=False, num_kv_heads=num_kv_heads)
-        self.rope = RoPE2d(in_channels // num_heads, self.window_size[0], self.window_size[1])
 
     def forward(
         self,
         x: torch.Tensor,
         layer_norm: nn.Module | None = None,
+        rope: nn.Module | None = None,
         norm_shift: torch.Tensor | None = None,
         norm_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -292,7 +291,7 @@ class WindowMHA2dV2(nn.Module):
             x = x * (1.0 + norm_scale.view(B, 1, 1, C)) + norm_shift.view(B, 1, 1, C)
             x = x.view(B_bnc, N_bnc, C)
 
-        x = self.mha(x, attn_mask=attn_mask, rope=self.rope)
+        x = self.mha(x, attn_mask=attn_mask, rope=rope)
         x = bnc_to_bchw(x, out_shape, self.window_size)
         if needs_pad:
             x = x[:, :, self.pad_h : self.pad_h + H, self.pad_w : self.pad_w + W]
@@ -325,12 +324,12 @@ class WindowMHA2dCLV2(nn.Module):
             self.pad_w = self.window_size[1] // 2
 
         self.mha = MHA(in_channels, num_heads, qkv_bias=False, num_kv_heads=num_kv_heads)
-        self.rope = RoPE2d(in_channels // num_heads, self.window_size[0], self.window_size[1])
 
     def forward(
         self,
         x: torch.Tensor,
         layer_norm: nn.Module | None = None,
+        rope: nn.Module | None = None,
         norm_shift: torch.Tensor | None = None,
         norm_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -364,7 +363,7 @@ class WindowMHA2dCLV2(nn.Module):
             x = x * (1.0 + norm_scale.view(B, 1, 1, C)) + norm_shift.view(B, 1, 1, C)
             x = x.view(B_bnc, N_bnc, C)
 
-        x = self.mha(x, attn_mask=attn_mask, rope=self.rope)
+        x = self.mha(x, attn_mask=attn_mask, rope=rope)
         x = bnc_to_bhwc(x, out_shape, self.window_size)
         if needs_pad:
             x = x[:, self.pad_h : self.pad_h + H, self.pad_w : self.pad_w + W, :]
@@ -446,7 +445,6 @@ class OverlapWindowMHA2dV2(nn.Module):
 
         self.qkv_proj = nn.Linear(in_channels, self.qkv_dim * self.num_heads * 3 * 2, bias=False)
         self.head_proj = nn.Linear(in_channels, in_channels)
-        self.rope = RoPE2d((in_channels // 2) // (num_heads // 2), self.window_size[0], self.window_size[1])
         basic_module_init(self.qkv_proj)
         basic_module_init(self.head_proj)
 
@@ -454,6 +452,7 @@ class OverlapWindowMHA2dV2(nn.Module):
         self,
         x: torch.Tensor,
         layer_norm: nn.Module | None = None,
+        rope: nn.Module | None = None,
         norm_shift: torch.Tensor | None = None,
         norm_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -497,7 +496,7 @@ class OverlapWindowMHA2dV2(nn.Module):
         attn_mask = torch.cat((x1_atten_mask, x2_atten_mask), dim=0)
 
         q, k, v = x.split(self.qkv_dim * self.num_heads, dim=-1)
-        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask, rope=self.rope)
+        x = sliced_sdp(q, k, v, self.num_heads, attn_mask=attn_mask, rope=rope)
         x1 = x[:B1]
         x2 = x[B1:]
         x1 = bnc_to_bhwc(x1, x1_out_shape, self.window_size)
@@ -865,15 +864,17 @@ def _test_bias2():
 
 
 def _test_2d_v2():
+    from .rope import RoPE2d
     dim = 64
     num_heads = 4
     window_size = (8, 8)
 
     # uses RoPE2d
+    rope = RoPE2d(dim // num_heads, window_size, norm_layer=nn.LayerNorm).cuda()
     x = torch.zeros((4, dim, 32, 32)).cuda()
     for shift in [False, True, (True, False), (False, True)]:
         mha = WindowMHA2dV2(dim, num_heads=num_heads, window_size=window_size, shift=shift).cuda()
-        assert mha(x).shape == x.shape
+        assert mha(x, rope=rope).shape == x.shape
 
 
 def _test_2d_cl_v2():
