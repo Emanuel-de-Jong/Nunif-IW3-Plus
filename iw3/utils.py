@@ -228,7 +228,6 @@ def make_video_codec_option(args, input_path=None):
     if args.video_codec == "libvpx-vp9" and "a" in args.pix_fmt.lower():
         options["auto-alt-ref"] = "0"
         options["alpha_mode"] = "1"
-        print(f"\nDEBUG [CODEC OPTIONS]: Applied VP9 alpha settings. Options mapped: {options}")
 
     return options
 
@@ -937,7 +936,6 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                 if alpha_batch is not None:
                     fill_color = torch.tensor([0.4, 0.5, 0.6], dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
                     x = x * alpha_batch + fill_color * (1.0 - alpha_batch)
-                    print(f"DEBUG [INFER]: Applied gray mask to RGB tensor background.")
 
                 depth_batch = depth_model.infer(x, tta=args.tta, low_vram=args.low_vram,
                                                 enable_amp=not args.disable_amp,
@@ -958,7 +956,6 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                         if m.any():
                             bg_depth = (depth_batch[i][m].min() + depth_batch[i].min()) * 0.5
                             depth_batch[i][torch.logical_not(m)] = bg_depth
-                            print(f"DEBUG [INFER]: Batch {i} background depth flattened to: {bg_depth.item():.4f}")
 
             return depth_batch, dequeue_ticket_id
 
@@ -1006,7 +1003,6 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
 
     def _preprocess(x, pts, flush):
         enqueue_ticket_id = enqueue_ticket_lock.new_ticket()
-        print(f"DEBUG [PROCESS: _preprocess] Incoming x shape: {getattr(x, 'shape', 'None')}")
         if not flush and x is not None and x.shape[-3] == 4:
             if x.ndim == 4:
                 alpha_batch = x[:, 3:4].contiguous()
@@ -1014,10 +1010,8 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
             else:
                 alpha_batch = x[3:4].contiguous()
                 x = x[:3].contiguous()
-            print(f"DEBUG [PROCESS: _preprocess] Alpha extracted. x: {x.shape}, alpha: {alpha_batch.shape}")
         else:
             alpha_batch = None
-            print(f"DEBUG [PROCESS: _preprocess] No alpha extracted. Condition failed.")
         return (x, pts, flush, enqueue_ticket_id, alpha_batch)
 
     return _cuda_stream_wrapper, _preprocess

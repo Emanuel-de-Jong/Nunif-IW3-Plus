@@ -606,8 +606,6 @@ class InputTransform:
         if has_alpha:
             target_format = "rgba64le" if "48" in self.rgb_format or "16" in self.rgb_format or self.use_16bit else "rgba"
 
-        print(f"DEBUG LOG [InputTransform]: has_alpha={has_alpha} | target_format={target_format}")
-
         frame = frame.reformat(
             format=target_format,
             src_colorspace=self.src_colorspace,
@@ -619,7 +617,6 @@ class InputTransform:
         )
 
         rgb_np: np.ndarray = frame.to_ndarray(format=target_format)
-        print(f"DEBUG LOG [InputTransform]: rgb_np.shape={rgb_np.shape}")
 
         rgb = torch.from_numpy(rgb_np).contiguous()
         rgb = rgb.to(self.device)
@@ -727,7 +724,6 @@ class OutputTransform:
         return self.from_video_frame(frame)
 
     def from_tensor(self, x: torch.Tensor) -> av.VideoFrame:
-        print(f"DEBUG [WRITE: from_tensor] Outgoing shape: {x.shape} | dst_pix_fmt: {self.dst_pix_fmt}")
         dtype: Any
         value_scale: float
         # NOTE: When using uint8, calling contiguous() is faster,
@@ -864,7 +860,6 @@ def to_tensor(frame: av.VideoFrame | TensorFrame, device: torch.device | str | N
         x = frame.to_chw()
         if device is not None:
             x = x.to(device)
-        print(f"DEBUG [READ: to_tensor] TensorFrame path. Shape: {x.shape}")
         return x
     elif isinstance(frame, av.VideoFrame):
         if device is not None:
@@ -872,7 +867,6 @@ def to_tensor(frame: av.VideoFrame | TensorFrame, device: torch.device | str | N
                 device = torch.device(device)
             if frame.format.name in {"nv12", "p010le"} and is_discrete_device(device):
                 out = ColorTransform.to_tensor(frame, device=device).squeeze(0)
-                print(f"DEBUG [READ: to_tensor] Hardware path. Shape: {out.shape}")
                 return out
 
         nd = to_ndarray(frame)
@@ -880,7 +874,6 @@ def to_tensor(frame: av.VideoFrame | TensorFrame, device: torch.device | str | N
         if device is not None:
             x = x.to(device)
         out = x.permute(2, 0, 1).contiguous().float() / float(torch.iinfo(x.dtype).max)
-        print(f"DEBUG [READ: to_tensor] Software path. ndarray: {nd.shape}, Final Tensor: {out.shape}")
         return out
     else:
         raise ValueError(f"{type(frame)} not supported")
