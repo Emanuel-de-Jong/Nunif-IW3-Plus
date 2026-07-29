@@ -264,7 +264,14 @@ def _process_video(
 
     video_output_stream.thread_type = "AUTO"
     video_output_stream.pix_fmt = config.pix_fmt
+
+    if config.video_codec == "libvpx-vp9" and "a" in config.pix_fmt.lower():
+        if config.options is None:
+            config.options = {}
+        config.options["alpha_mode"] = "1"
+
     video_output_stream.options = config.options
+    print(f"\nDEBUG [CONFIG]: Codec: {video_output_stream.name} | pix_fmt: {video_output_stream.pix_fmt} | Options: {video_output_stream.options}")
     video_preprocessor = VideoPreprocessor(
         stream_pix_fmt=video_input_stream.pix_fmt,
         sw_format=sw_format,
@@ -336,7 +343,9 @@ def _process_video(
                                 )
                                 uninitialized = False
                             # print(video_input_stream.format, new_frame.format, reformatted_frame.format)
+                            print(f"\nDEBUG [ENCODE]: Frame format: {reformatted_frame.format.name} | Planes: {len(reformatted_frame.planes)}")
                             enc_packets = video_output_stream.encode(reformatted_frame)
+                            print(f"DEBUG [ENCODE]: Packets generated: {len(enc_packets)}")
                             if enc_packets:
                                 output_container.mux(enc_packets)
                             pbar.update(1)
@@ -463,6 +472,12 @@ def generate_video(
     video_output_stream.pix_fmt = config.pix_fmt
     video_output_stream.width = output_size[0]
     video_output_stream.height = output_size[1]
+
+    if config.video_codec == "libvpx-vp9" and "a" in config.pix_fmt.lower():
+        if config.options is None:
+            config.options = {}
+        config.options["alpha_mode"] = "1"
+
     video_output_stream.options = config.options
 
     if audio_file is not None:
