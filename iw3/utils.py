@@ -733,6 +733,9 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
 
 
 def extract_frame_rgb_alpha(frame, device):
+    if not hasattr(frame, "format"):
+        return VU.to_tensor(frame, device=device), None
+
     fmt_name = frame.format.name
     has_alpha = (
         len(frame.format.components) == 4 or
