@@ -601,20 +601,26 @@ class InputTransform:
         )
 
     def to_tensor_av(self, frame: av.VideoFrame) -> TensorFrame:
+        has_alpha = getattr(frame.format, 'has_alpha', False) or 'a' in frame.format.name.lower() or len(frame.format.components) == 4
+        target_format = self.rgb_format
+        if has_alpha:
+            target_format = "rgba64le" if "48" in self.rgb_format or "16" in self.rgb_format or self.use_16bit else "rgba"
+
         frame = frame.reformat(
-            format=self.rgb_format,
+            format=target_format,
             src_colorspace=self.src_colorspace,
             src_color_range=self.src_color_range,
             dst_colorspace=self.dst_colorspace,
             dst_color_primaries=self.dst_color_primaries,
             dst_color_trc=self.dst_color_trc,
-            dst_color_range=ColorRange.JPEG,  # full range
+            dst_color_range=ColorRange.JPEG,
         )
-        # Type ignored because to_ndarray is Any
-        rgb_np: np.ndarray = frame.to_ndarray(format=self.rgb_format)
+
+        rgb_np: np.ndarray = frame.to_ndarray(format=target_format)
+
         rgb = torch.from_numpy(rgb_np).contiguous()
         rgb = rgb.to(self.device)
-        # Normalize based on bit depth
+        
         if rgb_np.dtype == np.uint8:
             rgb = rgb.permute(2, 0, 1).to(self.dtype) / 255.0
         elif rgb_np.dtype == np.uint16:
@@ -704,11 +710,15 @@ class OutputTransform:
     def from_ndarray(self, x: np.ndarray) -> av.VideoFrame:
         format: str
         if x.dtype == np.uint8:
-            format = "rgb24"
+            format = "rgba" if x.shape[-1] == 4 else "rgb24"
         elif x.dtype == np.uint16:
-            format = "gbrp16le"
+            format = "rgba64le" if x.shape[-1] == 4 else "gbrp16le"
         else:
             raise ValueError(f"unsupported dtype {x.dtype}")
+
+        # Force target to preserve alpha if incoming array has alpha
+        if x.shape[-1] == 4 and self.dst_pix_fmt == "yuv420p":
+            self.dst_pix_fmt = "yuva420p"
 
         frame = av.VideoFrame.from_ndarray(x, format=format)
         return self.from_video_frame(frame)
@@ -733,6 +743,11 @@ class OutputTransform:
         return self.from_ndarray(x_nd)
 
     def is_dlpack_supported(self, x) -> bool:
+        # Abort GPU acceleration path if the tensor has an alpha channel
+        has_alpha = (x.shape[0] == 4) if x.dim() == 3 else (x.shape[1] == 4)
+        if has_alpha:
+            return False
+
         return (
             is_nvidia_gpu(x.device)  # TODO: Remove this condition for xpu/mps
             and self.dst_pix_fmt in {"nv12", "p010le", "yuv420p", "yuvj420p", "yuv420p10le"}
@@ -830,7 +845,13 @@ def to_ndarray(frame: av.VideoFrame) -> np.ndarray:
     from .utils import RGB_8BIT, RGB_16BIT
 
     use_16bit = frame.format.components[0].bits > 8
-    format = RGB_16BIT if use_16bit else RGB_8BIT
+    has_alpha = getattr(frame.format, 'has_alpha', False) or 'a' in frame.format.name.lower()
+
+    if has_alpha:
+        format = "rgba64le" if use_16bit else "rgba"
+    else:
+        format = RGB_16BIT if use_16bit else RGB_8BIT
+
     return frame.to_ndarray(format=format)
 
 
@@ -845,14 +866,15 @@ def to_tensor(frame: av.VideoFrame | TensorFrame, device: torch.device | str | N
             if isinstance(device, str):
                 device = torch.device(device)
             if frame.format.name in {"nv12", "p010le"} and is_discrete_device(device):
-                # Optimized path: Upload YUV to GPU via DLPack and convert to RGB on GPU
-                return ColorTransform.to_tensor(frame, device=device).squeeze(0)
+                out = ColorTransform.to_tensor(frame, device=device).squeeze(0)
+                return out
 
-        x = torch.from_numpy(to_ndarray(frame))
+        nd = to_ndarray(frame)
+        x = torch.from_numpy(nd)
         if device is not None:
             x = x.to(device)
-        # CHW float32
-        return x.permute(2, 0, 1).contiguous().float() / float(torch.iinfo(x.dtype).max)
+        out = x.permute(2, 0, 1).contiguous().float() / float(torch.iinfo(x.dtype).max)
+        return out
     else:
         raise ValueError(f"{type(frame)} not supported")
 
