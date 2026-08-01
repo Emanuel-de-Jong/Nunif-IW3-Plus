@@ -724,7 +724,7 @@ class WindowGMLP3d(nn.Module):
         return x
 
 
-def _test_spatial_reduction():
+def _bench_spatial_reduction():
     import time
 
     kernel_size = 2
@@ -864,7 +864,6 @@ def _test_bias2():
 
 
 def _test_2d_v2():
-    from .rope import RoPE2d
     dim = 64
     num_heads = 4
     window_size = (8, 8)
@@ -926,8 +925,99 @@ def _test_gen_padded_attention_mask_2d():
     print(mask)
 
 
+def _bench_gqa(do_compile=False):
+    import time
+
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    N = 100
+    IMG_SIZE = 256
+    WINDOW_SIZE = 8
+    B = (IMG_SIZE // WINDOW_SIZE) ** 2
+    L = WINDOW_SIZE * WINDOW_SIZE
+    dim = 256
+    head_dim = 32
+    num_heads = dim // head_dim
+
+    print(f"\n**** _bench_gqa: compile={do_compile}")
+
+    for backend in (
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.CUDNN_ATTENTION,
+        SDPBackend.MATH,
+    ):
+        print(f"** backend {backend}")
+        torch.compiler.reset()
+        mha = MHA(dim, num_heads=num_heads, qkv_bias=False).cuda().half()
+        gqa = MHA(dim, num_heads=num_heads, num_kv_heads=num_heads // 2, qkv_bias=False).cuda().half()
+        if do_compile:
+            mha = torch.compile(mha)
+            gqa = torch.compile(gqa)
+        x = torch.rand((B, L, dim)).cuda().half()
+
+        try:
+            with sdpa_kernel([backend]):
+                with torch.inference_mode():
+                    mha(x)
+                torch.cuda.synchronize()
+
+                t = time.perf_counter()
+                with torch.inference_mode():
+                    for i in range(N):
+                        mha(x)
+                torch.cuda.synchronize()
+                fps = round(1.0 / ((time.perf_counter() - t) / N), 3)
+                print("MHA", fps)
+
+                with torch.inference_mode():
+                    gqa(x)
+                torch.cuda.synchronize()
+                t = time.perf_counter()
+                with torch.inference_mode():
+                    for i in range(N):
+                        gqa(x)
+                torch.cuda.synchronize()
+                fps = round(1.0 / ((time.perf_counter() - t) / N), 3)
+                print("GQA", fps)
+        except RuntimeError:
+            print("Error: skip")
+
+    """
+    **** _bench_gqa: compile=False
+    ** backend SDPBackend.FLASH_ATTENTION
+    MHA 1426.344
+    GQA 1699.622
+    ** backend SDPBackend.EFFICIENT_ATTENTION
+    MHA 1343.229
+    Error: skip
+    ** backend SDPBackend.CUDNN_ATTENTION
+    MHA 1657.916
+    GQA 2078.301
+    ** backend SDPBackend.MATH
+    MHA 250.919
+    GQA 271.549
+
+    **** _bench_gqa: compile=True
+    ** backend SDPBackend.FLASH_ATTENTION
+    MHA 1427.617
+    GQA 1731.205
+    ** backend SDPBackend.EFFICIENT_ATTENTION
+    MHA 1426.413
+    Error: skip
+    ** backend SDPBackend.CUDNN_ATTENTION
+    MHA 1418.113
+    GQA 1725.839
+    ** backend SDPBackend.MATH
+    MHA 1419.065
+    GQA 1726.6
+    """
+
+
 if __name__ == "__main__":
-    # _test_spatial_reduction()
+    _bench_gqa(do_compile=False)
+    _bench_gqa(do_compile=True)
+    # _bench_spatial_reduction()
     # _test_gen_padded_attention_mask_2d()
     _test_gqa()
     _test_overlap_v2()
