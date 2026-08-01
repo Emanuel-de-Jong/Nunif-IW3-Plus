@@ -469,7 +469,7 @@ Perhaps what is needed is fine tuning for ZoeDepth.
 
 ## About inpainting and its training
 
-See https://github.com/nagadomi/nunif/pull/484 and [Inpainting Model Training](https://github.com/nagadomi/nunif/blob/iw3_inpaint/iw3/docs/inpaint_training.md).
+See https://github.com/nagadomi/nunif/pull/484 and [Inpainting Model Training](./docs/inpaint_training.md).
 
 ## Monocular Depth Estimation Models
 

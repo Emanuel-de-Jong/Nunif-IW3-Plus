@@ -54,6 +54,8 @@ def detect_boundary(
 
     def batch_callback(x, pts):
         frame_count[0] += x.shape[0]
+        if x.shape[1] == 4:
+            x = x[:, :3, :, :]
         pts = torch.tensor(pts, dtype=torch.long)
         if x.shape[0] < padding_size:
             n = padding_size - x.shape[0]

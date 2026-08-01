@@ -264,6 +264,7 @@ def _process_video(
 
     video_output_stream.thread_type = "AUTO"
     video_output_stream.pix_fmt = config.pix_fmt
+
     video_output_stream.options = config.options
     video_preprocessor = VideoPreprocessor(
         stream_pix_fmt=video_input_stream.pix_fmt,
@@ -463,6 +464,7 @@ def generate_video(
     video_output_stream.pix_fmt = config.pix_fmt
     video_output_stream.width = output_size[0]
     video_output_stream.height = output_size[1]
+
     video_output_stream.options = config.options
 
     if audio_file is not None:

@@ -228,6 +228,10 @@ def make_video_codec_option(args, input_path=None):
     else:
         options = {}
 
+    if args.video_codec == "libvpx-vp9" and "a" in args.pix_fmt.lower():
+        options["auto-alt-ref"] = "0"
+        options["alpha_mode"] = "1"
+
     return options
 
 
@@ -730,6 +734,32 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
 
 # video callbacks
 
+
+def extract_frame_rgb_alpha(frame, device):
+    if not hasattr(frame, "format"):
+        return VU.to_tensor(frame, device=device), None
+
+    fmt_name = frame.format.name
+    has_alpha = (
+        len(frame.format.components) == 4 or
+        "alpha" in fmt_name or
+        "yuva" in fmt_name or
+        "rgba" in fmt_name
+    )
+    if has_alpha:
+        is_16bit = frame.format.components[0].bits > 8
+        nd = frame.to_ndarray(format="rgba64le" if is_16bit else "rgba")
+        t = torch.from_numpy(nd).to(device).permute(2, 0, 1).float()
+        t /= 65535.0 if is_16bit else 255.0
+        rgb = t[:3]
+        alpha = t[3:4]
+        if torch.all(alpha == 1.0):
+            alpha = None
+        return rgb, alpha
+    else:
+        return VU.to_tensor(frame, device=device), None
+
+
 def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
     src_queue = []
     device = args.state["device"]
@@ -738,13 +768,17 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
 
     def _postprocess(depths, flush):
         for depth in depths:
-            x, pts = src_queue.pop(0)
+            x, alpha, pts = src_queue.pop(0)
             reset_pts = [pts in segment_pts]
             if isinstance(x, VU.OffloadedFrame):
                 x = x.load(device=args.state["device"])
             elif isinstance(x, av.VideoFrame):
                 x = VU.to_tensor(x, device=args.state["device"])
             assert torch.is_tensor(x)
+
+            if alpha is not None:
+                assert torch.is_tensor(alpha)
+                alpha = alpha.to(args.state["device"])
 
             if args.debug_depth:
                 out = debug_depth_image(depth, args)
@@ -755,7 +789,18 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
                 left_eye, right_eye = apply_divergence(depth, x, args, side_model, reset_pts=reset_pts)
                 if left_eye is not None:
                     if left_eye.ndim == 3:
-                        out = postprocess_image(left_eye, right_eye, args)
+                        sbs_rgb = postprocess_image(left_eye, right_eye, args)
+                        if alpha is not None:
+                            left_alpha, right_alpha = apply_divergence(
+                                depth, alpha.repeat(3, 1, 1), args, side_model, reset_pts=reset_pts)
+                            if left_alpha is not None:
+                                sbs_alpha = postprocess_image(
+                                    left_alpha, right_alpha, args).mean(dim=0, keepdim=True)
+                                out = torch.cat([sbs_rgb, sbs_alpha], dim=0)
+                            else:
+                                out = sbs_rgb
+                        else:
+                            out = sbs_rgb
                     else:
                         out = [postprocess_image(left, right, args) for left, right in zip(left_eye, right_eye)]
                 else:
@@ -795,12 +840,13 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
         if offload_dtype == torch.uint16:
             offload_dtype = torch.float16
 
-        x = VU.to_tensor(frame, device=args.state["device"])
+        x, alpha = extract_frame_rgb_alpha(frame, args.state["device"])
 
         if frame_cpu_offload:
+            alpha = alpha.cpu() if alpha is not None else None
             if isinstance(frame, av.VideoFrame):
                 # av.VideoFrame
-                src_queue.append((frame, frame.pts))
+                src_queue.append((frame, alpha, frame.pts))
             else:
                 if offload_resource_manager is None:
                     offload_resource_manager = VU.OffloadResourceManager(
@@ -814,10 +860,10 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
                     dtype=offload_dtype,
                     manager=offload_resource_manager,
                 )
-                src_queue.append((offloaded_frame, frame.pts))
+                src_queue.append((offloaded_frame, alpha, frame.pts))
         else:
             # gpu buffer
-            src_queue.append((x, frame.pts))
+            src_queue.append((x, alpha, frame.pts))
 
         depth = depth_model.infer(x, tta=args.tta, low_vram=args.low_vram,
                                   enable_amp=not args.disable_amp,
@@ -860,24 +906,40 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
 
                 if frame_cpu_offload:
                     x_srcs = []
+                    alpha_srcs = []
                     pts = []
                     for _ in range(len(depths)):
-                        x_src, t = src_queue.pop(0)
+                        x_src, alpha_i, t = src_queue.pop(0)
                         x_srcs.append(x_src.load(device=device))
+                        alpha_srcs.append(alpha_i.to(device) if alpha_i is not None else None)
                         pts.append(t)
                     x_srcs = torch.stack(x_srcs)
+                    has_alpha = alpha_srcs[0] is not None
+                    alpha_srcs = torch.stack(alpha_srcs) if has_alpha else None
                 else:
-                    x_srcs, pts = src_queue.pop(0)
+                    x_srcs, alpha_srcs, pts = src_queue.pop(0)
+                    has_alpha = alpha_srcs is not None
                 reset_pts = [t in segment_pts for t in pts]
 
                 if args.rgbd or args.half_rgbd:
                     left_eyes, right_eyes = apply_rgbd(x_srcs, depths, mapper=args.mapper)
+                    left_alphas = right_alphas = None
                 else:
                     left_eyes, right_eyes = apply_divergence(depths, x_srcs, args, side_model, reset_pts=reset_pts)
+                    if has_alpha:
+                        left_alphas, right_alphas = apply_divergence(
+                            depths, alpha_srcs.repeat(1, 3, 1, 1), args, side_model, reset_pts=reset_pts)
+                    else:
+                        left_alphas = right_alphas = None
 
                 if left_eyes is not None:
                     for i in range(left_eyes.shape[0]):
-                        yield postprocess_image(left_eyes[i], right_eyes[i], args)
+                        sbs = postprocess_image(left_eyes[i], right_eyes[i], args)
+                        if left_alphas is not None and i < left_alphas.shape[0]:
+                            sbs_alpha = postprocess_image(left_alphas[i], right_alphas[i], args).mean(dim=0, keepdim=True)
+                            yield torch.cat([sbs, sbs_alpha], dim=0)
+                        else:
+                            yield sbs
 
             if flush and hasattr(side_model, "flush"):
                 left_eyes, right_eyes = side_model.flush(enable_amp=not args.disable_amp)
@@ -885,9 +947,9 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                     for i in range(left_eyes.shape[0]):
                         yield postprocess_image(left_eyes[i], right_eyes[i], args)
 
-    def _batch_infer(x, pts, flush, enqueue_ticket_id, offload_stream=None):
-        nonlocal offload_resource_manager
 
+    def _batch_infer(x, pts, flush, enqueue_ticket_id, alpha_batch=None, offload_stream=None):
+        nonlocal offload_resource_manager
         # Reorder threads
         with enqueue_ticket_lock(enqueue_ticket_id):
             dequeue_ticket_id = dequeue_ticket_lock.new_ticket()
@@ -907,22 +969,42 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                             manager=offload_resource_manager,
                             stream=offload_stream
                         )
-                        src_queue.append((offloaded_frame, pts[i]))
+                        alpha_i = alpha_batch[i] if alpha_batch is not None else None
+                        src_queue.append((offloaded_frame, alpha_i, pts[i]))
                 else:
-                    src_queue.append((x, pts))
+                    src_queue.append((x, alpha_batch, pts))
 
             if flush:
                 return None, dequeue_ticket_id
             else:
+                if alpha_batch is not None:
+                    fill_color = torch.tensor([0.4, 0.5, 0.6], dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
+                    x = x * alpha_batch + fill_color * (1.0 - alpha_batch)
                 depth_batch = depth_model.infer(x, tta=args.tta, low_vram=args.low_vram,
                                                 enable_amp=not args.disable_amp,
                                                 edge_dilation=args.edge_dilation,
                                                 depth_aa=args.depth_aa)
+
+                if alpha_batch is not None:
+                    depth_alpha = F.interpolate(
+                        alpha_batch,
+                        size=depth_batch.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                        antialias=True,
+                    )
+                    mask = depth_alpha > 0.0
+                    for i in range(depth_batch.shape[0]):
+                        m = mask[i]
+                        if m.any():
+                            bg_depth = (depth_batch[i][m].min() + depth_batch[i].min()) * 0.5
+                            depth_batch[i][torch.logical_not(m)] = bg_depth
+
             return depth_batch, dequeue_ticket_id
 
     @torch.inference_mode()
     def _cuda_stream_wrapper(preprocess_args):
-        x, pts, flush, enqueue_ticket_id = preprocess_args
+        x, pts, flush, enqueue_ticket_id, alpha_batch = preprocess_args
         if flush:
             device = args.state["device"]
             reset_ema = None
@@ -951,7 +1033,9 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                 stream.wait_stream(get_current_stream(device))
                 with device_context(device), stream:
                     depth_batch, dequeue_ticket_id = _batch_infer(
-                        x, pts, flush=flush, enqueue_ticket_id=enqueue_ticket_id, offload_stream=offload_stream)
+                        x, pts, flush=flush, enqueue_ticket_id=enqueue_ticket_id,
+                        alpha_batch=alpha_batch, offload_stream=offload_stream
+                    )
                     results = _postprocess(
                         depth_batch, reset_ema,
                         dequeue_ticket_id=dequeue_ticket_id,
@@ -962,7 +1046,7 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
                     stream.synchronize()
             else:
                 depth_batch, dequeue_ticket_id = _batch_infer(
-                    x, pts, flush=flush, enqueue_ticket_id=enqueue_ticket_id)
+                    x, pts, flush=flush, enqueue_ticket_id=enqueue_ticket_id, alpha_batch=alpha_batch)
                 results = _postprocess(
                     depth_batch, reset_ema,
                     dequeue_ticket_id=dequeue_ticket_id,
@@ -974,7 +1058,16 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
 
     def _preprocess(x, pts, flush):
         enqueue_ticket_id = enqueue_ticket_lock.new_ticket()
-        return (x, pts, flush, enqueue_ticket_id)
+        if not flush and x is not None and x.shape[-3] == 4:
+            if x.ndim == 4:
+                alpha_batch = x[:, 3:4].contiguous()
+                x = x[:, :3].contiguous()
+            else:
+                alpha_batch = x[3:4].contiguous()
+                x = x[:3].contiguous()
+        else:
+            alpha_batch = None
+        return (x, pts, flush, enqueue_ticket_id, alpha_batch)
 
     return _cuda_stream_wrapper, _preprocess
 
@@ -1639,7 +1732,7 @@ def bind_export_single_frame_callback(depth_model, segment_pts, rgb_dir, depth_d
                 if isinstance(x, VU.OffloadedFrame):
                     im_numpy = x.cpu_buffer().permute(1, 2, 0).numpy()
                 elif isinstance(x, av.VideoFrame):
-                    im_numpy = x.to_ndarray(VU.RGB_8BIT)
+                    im_numpy = x.reformat(format=VU.RGB_8BIT).to_ndarray(VU.RGB_8BIT)
                 im = Image.fromarray(im_numpy)
                 futures.append(
                     pool.submit(save_image, im, path.join(rgb_dir, f"{seq}.png"))
@@ -1740,7 +1833,7 @@ def bind_export_vda_frame_callback(depth_model, segment_pts, rgb_dir, depth_dir,
                 if isinstance(x, VU.OffloadedFrame):
                     im_numpy = x.cpu_buffer().permute(1, 2, 0).numpy()
                 elif isinstance(x, av.VideoFrame):
-                    im_numpy = x.to_ndarray(VU.RGB_8BIT)
+                    im_numpy = x.reformat(format=VU.RGB_8BIT).to_ndarray(VU.RGB_8BIT)
                 im = Image.fromarray(im_numpy)
                 futures.append(
                     pool.submit(save_image, im, path.join(rgb_dir, f"{seq}.png"))
@@ -2407,7 +2500,7 @@ def create_parser(required_true=True):
     parser.add_argument("--rgbd", action="store_true", help="output in RGBD")
     parser.add_argument("--half-rgbd", action="store_true", help="output in Half RGBD")
 
-    parser.add_argument("--pix-fmt", type=str, default="yuv420p", choices=["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp", "gbrp10le", "gbrp16le"],
+    parser.add_argument("--pix-fmt", type=str, default="yuv420p", choices=["yuv420p", "yuv444p", "yuv420p10le", "rgb24", "gbrp", "gbrp10le", "gbrp16le", "yuva420p", "rgba", "gbrap", "gbrap10le", "gbrap16le"],
                         help="pixel format (video only)")
     parser.add_argument("--tta", action="store_true",
                         help="Use flip augmentation on depth model")

@@ -34,7 +34,7 @@ from nunif.modules.fft_loss import YRGBL1FFTGradientLoss
 from nunif.modules.lpips import LPIPSWith
 from nunif.modules.weighted_loss import WeightedLoss
 from nunif.modules.dct_loss import DCTLoss
-from nunif.modules.dinov2 import DINOv2PoolWith, DINOv2CosineWith
+from nunif.modules.dinov2 import DINOv2PoolWith, DINOv2CosineWith, DINOv2AlignmentLoss
 from dino.models.l4sn import L4SNWith
 from nunif.modules.identity_loss import IdentityLoss
 from nunif.modules.transforms import DiffPairRandomTranslate, DiffPairRandomRotate, DiffPairRandomDownsample
@@ -85,6 +85,7 @@ LOSS_FUNCTIONS = {
 
     "dct": lambda: DCTLoss(clamp=True),
     "dctirm": lambda: _dctirm(),
+    "dctirm_dino_align": lambda: DINOv2AlignmentLoss(_dctirm(), weight=0.01),
     "dctir24": lambda: WeightedLoss(
         (DCTLoss(window_size=24, clamp=True, random_rotate=True, overlap=True),),
         weights=(1.0,),
@@ -197,12 +198,16 @@ def inf_loss():
 
 def fit_size(z, y):
     if isinstance(z, (tuple, list)):
+        if z[0].ndim != 4:
+            return z, y
         if z[0].shape[2] != y.shape[2] or z[0].shape[3] != y.shape[3]:
             pad_h = (y.shape[2] - z[0].shape[2]) // 2
             pad_w = (y.shape[3] - z[0].shape[3]) // 2
             assert pad_h >= 0 or pad_w >= 0
             y = torch.nn.functional.pad(y, (-pad_w, -pad_w, -pad_h, -pad_h))
     else:
+        if z.ndim != 4:
+            return z, y
         if z.shape[2] != y.shape[2] or z.shape[3] != y.shape[3]:
             pad_h = (y.shape[2] - z.shape[2]) // 2
             pad_w = (y.shape[3] - z.shape[3]) // 2
@@ -233,8 +238,9 @@ class Waifu2xEnv(LuminancePSNREnv):
                  discriminator,
                  discriminator_criterion,
                  sampler, use_diff_aug=False, use_diff_aug_downsample=False, use_diff_aug_noise=False,
-                 adaptive_weight_ema=None):
-        super().__init__(model, criterion)
+                 adaptive_weight_ema=None,
+                 eval_criterion=None):
+        super().__init__(model, criterion, eval_criterion=eval_criterion)
         self.discriminator = discriminator
         self.discriminator_criterion = discriminator_criterion
         self.adaptive_weight_ema = adaptive_weight_ema
@@ -263,10 +269,10 @@ class Waifu2xEnv(LuminancePSNREnv):
         if self.trainer.args.hard_example == "none":
             return
         if isinstance(loss, (list, tuple)):
-            if any(math.isnan(val) for val in loss):
+            if any(torch.any(torch.isnan(val.detach())) for val in loss):
                 return
         else:
-            if math.isnan(loss):
+            if torch.any(torch.isnan(loss.detach())):
                 return
 
         index = data[-1]
@@ -391,7 +397,7 @@ class Waifu2xEnv(LuminancePSNREnv):
                 else:
                     z = to_dtype(self.model(x, self.to_device(privilege)), x.dtype)
                     z, y = fit_size(z, y)
-                if isinstance(z, (list, tuple)) and self.use_diff_aug:
+                if (isinstance(z, (list, tuple)) or z.ndim != 4) and self.use_diff_aug:
                     raise ValueError(f"--diff-aug does not support {self.model.name}")
                 z, y = self.diff_aug(z, y)
                 loss = self.criterion(z, y)
@@ -636,6 +642,7 @@ class Waifu2xTrainer(Trainer):
         else:
             discriminator_criterion = None
 
+        eval_criterion = IdentityLoss() if self.args.loss == "ident" else None
         return Waifu2xEnv(
             self.model, criterion=criterion,
             discriminator=self.discriminator,
@@ -644,7 +651,8 @@ class Waifu2xTrainer(Trainer):
             use_diff_aug=self.args.diff_aug,
             use_diff_aug_downsample=self.args.diff_aug_downsample,
             use_diff_aug_noise=self.args.diff_aug_noise,
-            adaptive_weight_ema=self.adaptive_weight_ema
+            adaptive_weight_ema=self.adaptive_weight_ema,
+            eval_criterion=eval_criterion,
         )
 
     def setup(self):
