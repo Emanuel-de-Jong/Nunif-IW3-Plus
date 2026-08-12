@@ -1,4 +1,5 @@
 import os
+import shutil
 import cv2
 import imageio_ffmpeg
 import plus.global_params as g
@@ -6,67 +7,67 @@ from fire import Fire
 
 
 def main(
-    input_video_path: str = str(g.OUTPUTS_DIR / "vid.mp4"),
-    output_video_path: str = str(g.OUTPUTS_DIR / "vid_upscale.mp4"),
+    input_video_path: str,
+    output_video_path: str = None,
     video2x_path: str = str(g.VIDEO2X_PATH),
-    target_width: int = 5120,
-    target_height: int = 2560,
+    max_width: int = 10240,
+    max_height: int = 5120,
     realesrgan_model: str = "realesr-animevideov3",
     gpu: int = 0,
-    crf: int = 16,
-    preset: str = "slow",
+    crf: int = 18,
+    preset: str = "medium",
     overwrite: bool = False,
 ):
+    if output_video_path is None:
+        video_dir = os.path.dirname(os.path.abspath(input_video_path))
+        video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
+        output_video_path = os.path.join(video_dir, "plus", f"{video_stem}_upscale.mp4")
+
     if g.should_skip_output(output_video_path, overwrite):
         return
     if not os.path.isfile(input_video_path):
         raise FileNotFoundError(f"Input video not found: {input_video_path}")
-    if not os.path.isfile(video2x_path):
-        raise FileNotFoundError(f"Video2X AppImage not found: {video2x_path}")
 
     width, height = get_video_size(input_video_path)
+    output_dir = os.path.dirname(output_video_path) or "."
+    print(f"Input video size: {width}x{height}", flush=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if width * 2 > max_width or height * 2 > max_height:
+        print(
+            f"2x output would exceed {max_width}x{max_height}; copying original video",
+            flush=True,
+        )
+        shutil.copy2(input_video_path, output_video_path)
+        return
+
+    if not os.path.isfile(video2x_path):
+        raise FileNotFoundError(f"Video2X AppImage not found: {video2x_path}")
     if width % 2 != 0:
         raise ValueError(f"Stereo video width must be even, got {width}")
 
-    target_output_width, target_output_height = get_target_size(
-        width, height, target_width, target_height
-    )
-    target_eye_width = target_output_width // 2
-    output_dir = os.path.dirname(output_video_path) or "."
+    print(f"RealESRGAN 2x output size: {width * 2}x{height * 2}", flush=True)
     output_name = os.path.splitext(os.path.basename(output_video_path))[0]
     left_input_path = os.path.join(output_dir, f".{output_name}_left_input.mkv")
     right_input_path = os.path.join(output_dir, f".{output_name}_right_input.mkv")
+    left_output_path = os.path.join(output_dir, f".{output_name}_left_upscaled.mp4")
+    right_output_path = os.path.join(output_dir, f".{output_name}_right_upscaled.mp4")
 
-    print(f"Input video size: {width}x{height}", flush=True)
-    print(
-        f"Target output size: {target_output_width}x{target_output_height}", flush=True
-    )
-    print(f"Target eye size: {target_eye_width}x{target_output_height}", flush=True)
-    os.makedirs(output_dir, exist_ok=True)
-
-    left_output_path = None
-    right_output_path = None
     try:
         split_stereo_video(input_video_path, left_input_path, right_input_path)
-        left_output_path = upscale_eye(
+        run_video2x(
             video2x_path,
             left_input_path,
-            target_eye_width,
-            target_output_height,
+            left_output_path,
             realesrgan_model,
             gpu,
-            crf,
-            preset,
         )
-        right_output_path = upscale_eye(
+        run_video2x(
             video2x_path,
             right_input_path,
-            target_eye_width,
-            target_output_height,
+            right_output_path,
             realesrgan_model,
             gpu,
-            crf,
-            preset,
         )
         combine_stereo_video(
             left_output_path, right_output_path, output_video_path, crf, preset
@@ -78,79 +79,8 @@ def main(
             left_output_path,
             right_output_path,
         ]:
-            if temp_path is not None and os.path.exists(temp_path):
+            if os.path.exists(temp_path):
                 os.remove(temp_path)
-
-
-def upscale_eye(
-    video2x_path,
-    input_video_path,
-    target_width,
-    target_height,
-    realesrgan_model,
-    gpu,
-    crf,
-    preset,
-):
-    current_input_path = input_video_path
-    current_width, current_height = get_video_size(input_video_path)
-    temp_paths = []
-    pass_index = 0
-
-    while True:
-        scaling_factor = get_realesrgan_scaling_factor(
-            current_width, current_height, target_width, target_height
-        )
-        if scaling_factor is None:
-            break
-
-        pass_index += 1
-        temp_output_path = os.path.join(
-            os.path.dirname(input_video_path) or ".",
-            f".{os.path.splitext(os.path.basename(input_video_path))[0]}_realesrgan_{pass_index}.mp4",
-        )
-        temp_paths.append(temp_output_path)
-        output_width = current_width * scaling_factor
-        output_height = current_height * scaling_factor
-        print(
-            f"RealESRGAN pass {pass_index}: {current_width}x{current_height} -> {output_width}x{output_height} ({scaling_factor}x)",
-            flush=True,
-        )
-        run_video2x(
-            video2x_path,
-            current_input_path,
-            temp_output_path,
-            scaling_factor,
-            realesrgan_model,
-            gpu,
-        )
-        current_input_path = temp_output_path
-        current_width = output_width
-        current_height = output_height
-
-    output_path = get_upscaled_eye_path(input_video_path)
-    if current_width != target_width or current_height != target_height:
-        print(
-            f"Exact resize: {current_width}x{current_height} -> {target_width}x{target_height}",
-            flush=True,
-        )
-        resize_video(
-            current_input_path, output_path, target_width, target_height, crf, preset
-        )
-    else:
-        os.replace(current_input_path, output_path)
-
-    for temp_path in temp_paths:
-        if temp_path != output_path and os.path.exists(temp_path):
-            os.remove(temp_path)
-    return output_path
-
-
-def get_upscaled_eye_path(input_video_path):
-    return os.path.join(
-        os.path.dirname(input_video_path) or ".",
-        f".{os.path.splitext(os.path.basename(input_video_path))[0]}_upscaled.mp4",
-    )
 
 
 def split_stereo_video(input_video_path, left_output_path, right_output_path):
@@ -224,31 +154,10 @@ def get_video_size(input_video_path):
     return width, height
 
 
-def make_even(value):
-    value = int(round(value))
-    return value if value % 2 == 0 else value + 1
-
-
-def get_target_size(width, height, target_width, target_height):
-    scale = min(target_width / width, target_height / height)
-    return make_even(width * scale), make_even(height * scale)
-
-
-def get_realesrgan_scaling_factor(width, height, target_width, target_height):
-    for scaling_factor in [4, 3, 2]:
-        if (
-            width * scaling_factor <= target_width
-            and height * scaling_factor <= target_height
-        ):
-            return scaling_factor
-    return None
-
-
 def run_video2x(
     video2x_path,
     input_video_path,
     output_video_path,
-    scaling_factor,
     realesrgan_model,
     gpu,
 ):
@@ -261,38 +170,13 @@ def run_video2x(
         "-p",
         "realesrgan",
         "-s",
-        str(scaling_factor),
+        "2",
         "--realesrgan-model",
         realesrgan_model,
     ]
     if gpu is not None:
         command.extend(["-d", str(gpu)])
     print("Running Video2X", flush=True)
-    g.run_command(command)
-
-
-def resize_video(input_video_path, output_video_path, width, height, crf, preset):
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    command = [
-        ffmpeg_path,
-        "-y",
-        "-i",
-        input_video_path,
-        "-vf",
-        f"scale={width}:{height}:flags=lanczos",
-        "-c:v",
-        "libx264",
-        "-crf",
-        str(crf),
-        "-preset",
-        preset,
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "copy",
-        output_video_path,
-    ]
-    print("Running resize", flush=True)
     g.run_command(command)
 
 

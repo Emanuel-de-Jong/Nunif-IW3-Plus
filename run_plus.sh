@@ -12,5 +12,5 @@ fi
 eval "$(conda shell.bash hook)"
 conda activate nunifiw3
 
-# python -m plus.s1_upscale --input_video_path "$INPUT_VIDEO_PATH"
+python -m plus.s1_upscale --input_video_path "$INPUT_VIDEO_PATH"
 python -m plus.s2_greenscreen --input_video_path "$INPUT_VIDEO_PATH"
