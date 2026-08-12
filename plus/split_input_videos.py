@@ -42,11 +42,7 @@ def main(path: str):
         is_duration_in_range = duration <= MAX_DURATION_SECONDS
         is_res_in_range = max(width, height) <= MAX_RESOLUTION
         is_fps_in_range = fps <= MAX_FPS
-        should_include = (
-            is_duration_in_range
-            and is_res_in_range
-            and is_fps_in_range
-        )
+        should_include = is_duration_in_range and is_res_in_range and is_fps_in_range
 
         destination = include_dir_path if should_include else exclude_dir_path
         include_dir_path.mkdir(exist_ok=True)
@@ -59,13 +55,13 @@ def main(path: str):
             status_str = "exclude-"
             if not is_duration_in_range:
                 status_str += "duration"
-            elif  not is_res_in_range:
+            elif not is_res_in_range:
                 status_str += "resolution"
-            elif  not is_fps_in_range:
+            elif not is_fps_in_range:
                 status_str += "fps"
-        
+
         print(f"({idx+1}/{total_videos}) [{status_str}] {video_path.name}")
-    
+
     print("\nSplitting done!")
 
 

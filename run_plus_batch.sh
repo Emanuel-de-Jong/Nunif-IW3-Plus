@@ -2,8 +2,15 @@
 
 set -e
 
-INPUT_DIR="_out"
-OUTPUT_DIR="_out_plus"
+INPUT_DIR="${1}"
+
+if [ -z "$INPUT_DIR" ]; then
+	echo "Usage: $0 <input_dir>"
+	exit 1
+fi
+
+eval "$(conda shell.bash hook)"
+conda activate nunifiw3
 
 shopt -s nullglob
 
@@ -14,7 +21,7 @@ for video in "$INPUT_DIR"/*.{mp4,mov,avi,mkv,webm}; do
 
 	filename="$(basename "$video")"
 	basename="${filename%.*}"
-	result="$OUTPUT_DIR/${basename}_greenscreen.mp4"
+	result="$INPUT_DIR/plus/${basename}_greenscreen.mp4"
 
 	if [ -e "$result" ]; then
 		continue
@@ -31,7 +38,7 @@ for video in "${videos[@]}"; do
 
 	printf "=== %s (%d/%d) ===\n" "$video" "$CURRENT_COUNT" "$TOTAL_COUNT"
 
-	python -m plus.s1_upscale --input_video_path "$video"
+	# python -m plus.s1_upscale --input_video_path "$video"
 	python -m plus.s2_greenscreen --input_video_path "$video"
 
 	printf "\n\n-----------------------------------\n\n"

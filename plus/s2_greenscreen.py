@@ -9,15 +9,22 @@ GREEN = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
 def main(
-    input_video_path: str = str(g.OUTPUTS_DIR / "vid_upscale.mp4"),
-    output_video_path: str = str(g.OUTPUTS_DIR / "vid_greenscreen.mp4"),
-    depth_npz_path: str = str(g.OUTPUTS_DIR / "vid_splatting.npz"),
+    input_video_path: str,
+    output_video_path: str = None,
     rvm_model_path: str = "resnet50",
     rvm_downsample_ratio: float = 0.25,
+    foreground_bias: float = 0.05,
     crf: int = 16,
     preset: str = "slow",
     overwrite: bool = False,
 ):
+    if output_video_path is None:
+        video_dir = os.path.dirname(os.path.abspath(input_video_path))
+        video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
+        output_video_path = os.path.join(
+            video_dir, "plus", f"{video_stem}_greenscreen.mp4"
+        )
+
     if g.should_skip_output(output_video_path, overwrite):
         return
 
@@ -29,12 +36,9 @@ def main(
             f"rvm_downsample_ratio must be greater than 0 and at most 1, got: {rvm_downsample_ratio}"
         )
 
-    depth_maps, depth_fps, max_disp, max_disp_reference_width = load_depth_data(
-        depth_npz_path
-    )
     model, device = create_rvm_model(rvm_model_path)
-    recurrent_state = [None] * 4
-    stereo_projector = g.ForwardWarpStereo(return_occlusion_mask=False).to(device)
+    recurrent_state_left = [None] * 4
+    recurrent_state_right = [None] * 4
 
     video = cv2.VideoCapture(input_video_path)
     if not video.isOpened():
@@ -44,7 +48,7 @@ def main(
         raise ValueError(f"SBS video width must be even, got: {width}")
 
     eye_width = width // 2
-    os.makedirs(os.path.dirname(output_video_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
     output_writer = g.RawVideoWriter(
         output_video_path,
         width,
@@ -68,52 +72,26 @@ def main(
             )
             left_frame = frame_rgb[:, :eye_width]
             right_frame = frame_rgb[:, eye_width:]
-            left_mask, recurrent_state = get_foreground_mask(
+
+            left_mask, recurrent_state_left = get_foreground_mask(
                 model,
                 left_frame,
-                recurrent_state,
+                recurrent_state_left,
+                device,
+                rvm_downsample_ratio,
+            )
+            right_mask, recurrent_state_right = get_foreground_mask(
+                model,
+                right_frame,
+                recurrent_state_right,
                 device,
                 rvm_downsample_ratio,
             )
 
-            depth_index = min(
-                round(frame_index * depth_fps / fps),
-                len(depth_maps) - 1,
-            )
-            depth_frame = cv2.resize(
-                depth_maps[depth_index],
-                (eye_width, height),
-                interpolation=cv2.INTER_LINEAR,
-            )
-            depth_tensor = (
-                torch.from_numpy(depth_frame).unsqueeze(0).unsqueeze(0).to(device)
-            )
-            disparity = g.get_disparity(
-                depth_tensor,
-                max_disp,
-                eye_width,
-                max_disp_reference_width,
-            )
-            left_mask_tensor = (
-                torch.from_numpy(left_mask).unsqueeze(0).unsqueeze(0).to(device)
-            )
-            with torch.inference_mode():
-                right_mask_tensor = stereo_projector(
-                    left_mask_tensor,
-                    disparity,
-                )
-            right_mask = right_mask_tensor[0, 0].cpu().numpy()
-
-            left_output = composite_green(left_frame, left_mask)
-            right_output = composite_green(right_frame, right_mask)
+            left_output = composite_green(left_frame, left_mask, foreground_bias)
+            right_output = composite_green(right_frame, right_mask, foreground_bias)
             output_writer.write(np.concatenate([left_output, right_output], axis=1))
 
-            del (
-                depth_tensor,
-                disparity,
-                left_mask_tensor,
-                right_mask_tensor,
-            )
             frame_index += 1
             if frame_index % 25 == 0:
                 print(f"==> green-screened {frame_index} frames", flush=True)
@@ -122,32 +100,6 @@ def main(
         output_writer.close()
 
     print(f"==> saved green-screen video: {output_video_path}", flush=True)
-
-
-def load_depth_data(depth_npz_path):
-    if not os.path.isfile(depth_npz_path):
-        raise FileNotFoundError(f"Depth map not found: {depth_npz_path}")
-    depth_data = np.load(depth_npz_path)
-    required_keys = ["depth", "fps", "max_disp", "max_disp_reference_width"]
-    missing_keys = [key for key in required_keys if key not in depth_data]
-    if missing_keys:
-        raise ValueError(
-            f"Depth npz is missing required arrays: {', '.join(missing_keys)}"
-        )
-    if len(depth_data["depth"]) <= 0:
-        raise ValueError(f"Depth map has no frames: {depth_npz_path}")
-    if float(depth_data["fps"].item()) <= 0:
-        raise ValueError(f"Depth FPS must be positive: {depth_npz_path}")
-    if int(depth_data["max_disp_reference_width"].item()) <= 0:
-        raise ValueError(
-            f"Depth disparity reference width must be positive: {depth_npz_path}"
-        )
-    return (
-        depth_data["depth"].astype(np.float32),
-        float(depth_data["fps"].item()),
-        float(depth_data["max_disp"].item()),
-        int(depth_data["max_disp_reference_width"].item()),
-    )
 
 
 def create_rvm_model(rvm_model_path):
@@ -200,8 +152,8 @@ def get_video_properties(video):
     return fps, width, height
 
 
-def composite_green(frame_rgb, mask):
-    alpha = np.clip(mask, 0.0, 1.0).astype(np.float32)[:, :, None]
+def composite_green(frame_rgb, mask, foreground_bias):
+    alpha = np.clip(mask + foreground_bias, 0.0, 1.0).astype(np.float32)[:, :, None]
     return frame_rgb * alpha + GREEN.reshape(1, 1, 3) * (1.0 - alpha)
 
 
