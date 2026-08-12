@@ -36,3 +36,9 @@ einops
 # da3
 omegaconf
 addict
+
+# plus
+fire
+opencv-python
+imageio
+imageio-ffmpeg

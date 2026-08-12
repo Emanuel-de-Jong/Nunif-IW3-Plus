@@ -1,0 +1,138 @@
+import subprocess
+import numpy as np
+import torch
+import torch.nn as nn
+import imageio_ffmpeg
+from pathlib import Path
+from Forward_Warp import forward_warp
+
+BASE_PATH = Path(__file__).resolve().parent.parent
+
+OUTPUTS_DIR = BASE_PATH / "_out"
+
+PLUS_DIR = BASE_PATH / "plus"
+VIDEO2X_PATH = PLUS_DIR / "Video2X" / "Video2X-x86_64.AppImage"
+
+
+def should_skip_output(output_path, overwrite=False):
+    if Path(output_path).exists() and not overwrite:
+        print(f"==> output already exists, skipping: {output_path}", flush=True)
+        return True
+    return False
+
+
+def run_command(command):
+    print("Running command:", " ".join(str(part) for part in command), flush=True)
+    subprocess.run([str(part) for part in command], check=True)
+
+
+def get_disparity(depth, max_disp, width, max_disp_reference_width):
+    effective_max_disp = max_disp * width / max_disp_reference_width
+    return (depth * 2.0 - 1.0) * effective_max_disp
+
+
+class RawVideoWriter:
+    def __init__(
+        self,
+        output_path,
+        width,
+        height,
+        fps,
+        codec="libx264",
+        crf=12,
+        preset="slow",
+        pixel_format="yuv420p",
+    ):
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            codec,
+        ]
+
+        if codec == "ffv1":
+            command.extend(
+                [
+                    "-level",
+                    "3",
+                    "-coder",
+                    "1",
+                    "-context",
+                    "1",
+                    "-g",
+                    "1",
+                    "-pix_fmt",
+                    "yuv444p",
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "-crf",
+                    str(crf),
+                    "-preset",
+                    preset,
+                    "-pix_fmt",
+                    pixel_format,
+                ]
+            )
+
+        command.append(str(output_path))
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
+
+    def write(self, frame):
+        if self.process.stdin is None:
+            raise RuntimeError("Video writer is closed")
+
+        frame = np.asarray(frame)
+        if frame.dtype != np.uint8:
+            if frame.max() <= 1.0:
+                frame = frame * 255.0
+            frame = np.clip(frame, 0.0, 255.0).astype(np.uint8)
+        frame = np.ascontiguousarray(frame)
+        self.process.stdin.write(frame.tobytes())
+
+    def close(self):
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        return_code = self.process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, self.process.args)
+
+
+class ForwardWarpStereo(nn.Module):
+    def __init__(self, eps=1e-6, return_occlusion_mask=True):
+        super(ForwardWarpStereo, self).__init__()
+        self.eps = eps
+        self.return_occlusion_mask = return_occlusion_mask
+        self.forward_warp = forward_warp()
+
+    def forward(self, image, disparity):
+        image = image.contiguous()
+        disparity = disparity.contiguous()
+        weights = 1.414 ** (disparity - disparity.min())
+        horizontal_flow = -disparity.squeeze(1)
+        vertical_flow = torch.zeros_like(horizontal_flow, requires_grad=False)
+        flow = torch.stack((horizontal_flow, vertical_flow), dim=-1)
+        result_accumulated = self.forward_warp(image * weights, flow)
+        weights_accumulated = self.forward_warp(weights, flow)
+        result = result_accumulated / weights_accumulated.clamp(min=self.eps)
+        if not self.return_occlusion_mask:
+            return result
+        occlusion_mask = self.forward_warp(torch.ones_like(disparity), flow)
+        occlusion_mask = 1.0 - occlusion_mask.clamp(0.0, 1.0)
+        return result, occlusion_mask
