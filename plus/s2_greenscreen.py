@@ -1,19 +1,24 @@
 import os
 import cv2
 import torch
+import torch.nn.functional as F
 import numpy as np
 import plus.global_params as g
 from fire import Fire
+from iw3.video_depth_anything_streaming_model import VideoDepthAnythingStreamingModel
 
 GREEN = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+MASK_EDGE_SOFTNESS = 0.05
 
 
 def main(
     input_video_path: str,
     output_video_path: str = None,
-    rvm_model_path: str = "resnet50",
-    rvm_downsample_ratio: float = 0.25,
+    depth_model_type: str = "VDA_Stream_S",
+    mask_blur_radius: int = 7,
     foreground_bias: float = 0.05,
+    threshold_ema_decay: float = 0.9,
     crf: int = 16,
     preset: str = "slow",
     overwrite: bool = False,
@@ -31,14 +36,12 @@ def main(
     if not os.path.isfile(input_video_path):
         raise FileNotFoundError(f"Input video not found: {input_video_path}")
 
-    if rvm_downsample_ratio <= 0 or rvm_downsample_ratio > 1:
-        raise ValueError(
-            f"rvm_downsample_ratio must be greater than 0 and at most 1, got: {rvm_downsample_ratio}"
-        )
+    left_model = create_depth_model(depth_model_type)
+    right_model = create_depth_model(depth_model_type)
+    device = left_model.device
 
-    model, device = create_rvm_model(rvm_model_path)
-    recurrent_state_left = [None] * 4
-    recurrent_state_right = [None] * 4
+    threshold_ema_left = None
+    threshold_ema_right = None
 
     video = cv2.VideoCapture(input_video_path)
     if not video.isOpened():
@@ -73,19 +76,25 @@ def main(
             left_frame = frame_rgb[:, :eye_width]
             right_frame = frame_rgb[:, eye_width:]
 
-            left_mask, recurrent_state_left = get_foreground_mask(
-                model,
-                left_frame,
-                recurrent_state_left,
-                device,
-                rvm_downsample_ratio,
+            left_depth_np = infer_and_normalize_depth(
+                left_model, left_frame, device, height, eye_width
             )
-            right_mask, recurrent_state_right = get_foreground_mask(
-                model,
-                right_frame,
-                recurrent_state_right,
-                device,
-                rvm_downsample_ratio,
+            right_depth_np = infer_and_normalize_depth(
+                right_model, right_frame, device, height, eye_width
+            )
+
+            threshold_ema_left = update_threshold_ema(
+                left_depth_np, threshold_ema_left, threshold_ema_decay
+            )
+            threshold_ema_right = update_threshold_ema(
+                right_depth_np, threshold_ema_right, threshold_ema_decay
+            )
+
+            left_mask = compute_foreground_mask(
+                left_depth_np, threshold_ema_left, mask_blur_radius
+            )
+            right_mask = compute_foreground_mask(
+                right_depth_np, threshold_ema_right, mask_blur_radius
             )
 
             left_output = composite_green(left_frame, left_mask, foreground_bias)
@@ -102,43 +111,66 @@ def main(
     print(f"==> saved green-screen video: {output_video_path}", flush=True)
 
 
-def create_rvm_model(rvm_model_path):
-    if rvm_model_path == "resnet50":
-        model = torch.hub.load(
-            "PeterL1n/RobustVideoMatting",
-            "resnet50",
-            trust_repo=True,
-        )
-    else:
-        model = torch.hub.load(
-            "PeterL1n/RobustVideoMatting",
-            "resnet50",
-            pretrained=False,
-            trust_repo=True,
-        )
-        model.load_state_dict(torch.load(rvm_model_path, map_location="cpu"))
-
-    device = torch.device("cuda")
-    return model.to(device).eval(), device
+def create_depth_model(depth_model_type):
+    model = VideoDepthAnythingStreamingModel(depth_model_type)
+    model.load(gpu=0)
+    return model
 
 
-def get_foreground_mask(
-    model,
-    frame_rgb,
-    recurrent_state,
-    device,
-    downsample_ratio,
+def infer_and_normalize_depth(
+    model, frame_rgb_hwc, device, target_height, target_width
 ):
-    frame_tensor = (
-        torch.from_numpy(frame_rgb).permute(2, 0, 1).unsqueeze(0).float().to(device)
-    )
+    frame_tensor = torch.from_numpy(frame_rgb_hwc).permute(2, 0, 1).float().to(device)
     with torch.inference_mode():
-        _foreground, alpha, *new_state = model(
-            frame_tensor,
-            *recurrent_state,
-            downsample_ratio,
+        depth = model.infer(frame_tensor)
+
+    depth_up = (
+        F.interpolate(
+            depth.unsqueeze(0),
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
         )
-    return alpha[0, 0].cpu().numpy(), new_state
+        .squeeze(0)
+        .squeeze(0)
+    )
+    depth_np = depth_up.cpu().numpy()
+
+    depth_min = depth_np.min()
+    depth_max = depth_np.max()
+    depth_range = depth_max - depth_min
+    if depth_range > 0:
+        return (depth_np - depth_min) / depth_range
+    return np.zeros_like(depth_np)
+
+
+def update_threshold_ema(depth_np, current_ema, ema_decay):
+    depth_uint8 = (depth_np * 255).clip(0, 255).astype(np.uint8)
+    threshold_val, _ = cv2.threshold(
+        depth_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    raw_threshold = threshold_val / 255.0
+    if current_ema is None:
+        return raw_threshold
+    return ema_decay * current_ema + (1.0 - ema_decay) * raw_threshold
+
+
+def compute_foreground_mask(depth_np, threshold, mask_blur_radius):
+    depth_uint8 = (depth_np * 255).clip(0, 255).astype(np.uint8)
+    depth_smoothed = (
+        cv2.bilateralFilter(depth_uint8, d=9, sigmaColor=40, sigmaSpace=40).astype(
+            np.float32
+        )
+        / 255.0
+    )
+
+    alpha = 1.0 / (1.0 + np.exp(-(depth_smoothed - threshold) / MASK_EDGE_SOFTNESS))
+
+    if mask_blur_radius > 0:
+        blur_kernel_size = 2 * mask_blur_radius + 1
+        alpha = cv2.GaussianBlur(alpha, (blur_kernel_size, blur_kernel_size), 0)
+
+    return alpha.clip(0.0, 1.0).astype(np.float32)
 
 
 def get_video_properties(video):
