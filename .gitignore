@@ -1,10 +1,13 @@
+
+tmp/*
+!tmp/presets
+
 *~
 *.bk*.py
 .DS_Store
 TODO
 *.swp
 *.log
-tmp
 *.png
 *.webp
 *.jpg

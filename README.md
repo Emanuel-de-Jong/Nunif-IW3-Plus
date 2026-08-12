@@ -1,18 +1,8 @@
-My playground.
+## Nunif IW3 Plus
 
-For the time being, I will make incompatible changes.
+Adds upscaling and greenscreening.
 
-## waifu2x
-
-[waifu2x/README.md](./waifu2x/README.md)
-
-waifu2x: Image Super-Resolution for Anime-Style Art. Also it supports photo models (GAN based models)
-
-The repository contains waifu2x pytorch implementation and pretrained models, started with porting the original [waifu2x](https://github.com/nagadomi/waifu2x).
-
-The demo application can be found at
-- https://waifu2x.udp.jp/ (Cloud version)
-- https://unlimited.waifu2x.net/ (In-Browser version).
+Original repo can be found [here](https://github.com/nagadomi/nunif/tree/dev).
 
 ## iw3
 
@@ -36,27 +26,6 @@ You can watch any image and video/live displayed on your PC as 3D in realtime.
 
 iw3-player is a self-hosted, specialized viewing environment for stereoscopic media.  
 It allows you to stream media that has been pre-converted to 3D with iw3 from your PC and enjoy it on VR devices through a WebXR application.
-
-## stilizer
-
-[stlizer/README.md](./stlizer/README.md)
-
-stlizer is a fast conservative video stabilizer.
-
-## cliqa
-
-[cliqa/README.md](./cliqa/README.md)
-
-`cliqa` provides low-vision image quality scores that are more consistent across different images.
-
-It is useful for filtering low-quality images with a threshold value when creating image datasets.
-
-Currently, the following two models are supported.
-
-- JPEGQuality: Predicts JPEG Quality from image content
-- GrainNoiseLeve: Predicts Noise Level related to photograph and PSNR degraded by that noise
-
-CLI tools are also available to filter out low quality images using these results.
 
 ## Install
 
