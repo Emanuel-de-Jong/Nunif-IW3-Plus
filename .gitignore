@@ -1,4 +1,6 @@
 
+_in/
+_out/
 tmp/*
 !tmp/presets
 
