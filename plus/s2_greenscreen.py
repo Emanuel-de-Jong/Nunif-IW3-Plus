@@ -9,7 +9,7 @@ from iw3.video_depth_anything_streaming_model import VideoDepthAnythingStreaming
 
 GREEN = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
-MASK_EDGE_SOFTNESS = 0.05
+MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 
 def main(
@@ -164,8 +164,11 @@ def compute_foreground_mask(depth_np, threshold, mask_blur_radius):
         / 255.0
     )
 
-    alpha = 1.0 / (1.0 + np.exp(-(depth_smoothed - threshold) / MASK_EDGE_SOFTNESS))
+    alpha = (depth_smoothed > threshold).astype(np.uint8) * 255
+    alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, MORPH_KERNEL)
+    alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, MORPH_KERNEL)
 
+    alpha = alpha.astype(np.float32) / 255.0
     if mask_blur_radius > 0:
         blur_kernel_size = 2 * mask_blur_radius + 1
         alpha = cv2.GaussianBlur(alpha, (blur_kernel_size, blur_kernel_size), 0)
