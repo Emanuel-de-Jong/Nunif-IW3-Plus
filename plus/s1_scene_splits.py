@@ -24,8 +24,7 @@ def main(
     threshold: float = 0.18,
     prominence: float = 0.025,
     persistence: int = 3,
-    cooldown_seconds: float = 5.0,
-    ignore_start_seconds: float = 5.0,
+    cooldown_seconds: float = 3.0,
     refine_seconds: float = 1.0,
     refine_window_seconds: float = 0.20,
     copy_if_no_boundaries: bool = True,
@@ -34,10 +33,12 @@ def main(
     preset: str = "medium",
     overwrite: bool = False,
 ):
+    ignore_start_seconds = cooldown_seconds
+
     if output_dir is None:
         video_dir = os.path.dirname(os.path.abspath(input_video_path))
         video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
-        output_dir = os.path.join(video_dir, "plus", f"{video_stem}_scenes")
+        output_dir = os.path.join(video_dir, "plus")
 
     video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
     boundaries_json_path = os.path.join(output_dir, f"{video_stem}_boundaries.json")
