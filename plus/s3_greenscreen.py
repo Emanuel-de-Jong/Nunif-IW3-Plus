@@ -1,10 +1,10 @@
 import os
 import gc
 import re
-import sys
 import json
 import math
 import glob
+import shlex
 import shutil
 import subprocess
 import cv2
@@ -12,7 +12,6 @@ import torch
 import numpy as np
 import imageio_ffmpeg
 import plus.global_params as g
-from pathlib import Path
 from fire import Fire
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
@@ -44,17 +43,17 @@ def main(
     num_vote_runs: int = 3,
     vlm_temperature: float = 0.3,
     vlm_max_new_tokens: int = 512,
-    sam2matting_repo_dir: str = "SAM2Matting",
+    sam2matting_repo_dir: str = None,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     overwrite: bool = False,
 ):
     device = "cuda"
 
-    sam2matting_checkpoint = (
-        Path(sam2matting_repo_dir) / "checkpoints" / "SAM2Matting-SAM3.pt"
-    )
-    sam2matting_python = "conda run -n sam2matting"
+    if sam2matting_repo_dir is None:
+        sam2matting_repo_dir = str(g.PLUS_DIR / "SAM2Matting")
+    sam_matting_script = str(g.PLUS_DIR / "sam_matting.py")
+    sam2matting_launcher = "conda run --no-capture-output -n sam2matting python"
 
     video_dir = os.path.dirname(os.path.abspath(input_video_path))
     video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
@@ -68,9 +67,6 @@ def main(
         return
     if not os.path.isfile(input_video_path):
         raise FileNotFoundError(f"Input video not found: {input_video_path}")
-
-    if sam2matting_python is None:
-        sam2matting_python = sys.executable
 
     video = cv2.VideoCapture(input_video_path)
     if not video.isOpened():
@@ -94,7 +90,6 @@ def main(
         "vlm_temperature": vlm_temperature,
         "vlm_max_new_tokens": vlm_max_new_tokens,
         "sam2matting_repo_dir": sam2matting_repo_dir,
-        "sam2matting_checkpoint": sam2matting_checkpoint,
         "qc_frame_interval": qc_frame_interval,
         "qc_area_jump_threshold": qc_area_jump_threshold,
         "device": device,
@@ -153,15 +148,13 @@ def main(
             write_qc_log(qc_log_path, sidecar)
             return
 
-        matting_enabled = (
-            sam2matting_repo_dir is not None and sam2matting_checkpoint is not None
-        )
-        if not matting_enabled:
+        if not os.path.isdir(sam2matting_repo_dir):
             sidecar["failures"].append(
-                "SAM2Matting not configured; skipped matting stage"
+                f"SAM2Matting repo not found: {sam2matting_repo_dir}; skipped matting stage"
             )
             print(
-                "==> SAM2Matting repo/checkpoint not provided; skipping matting stage",
+                f"==> SAM2Matting repo not found: {sam2matting_repo_dir}; "
+                "skipping matting stage",
                 flush=True,
             )
             save_sidecar(sidecar_path, sidecar)
@@ -178,9 +171,9 @@ def main(
                     video_stem,
                     fps,
                     include_concepts,
-                    sam2matting_python,
+                    sam2matting_launcher,
                     sam2matting_repo_dir,
-                    sam2matting_checkpoint,
+                    sam_matting_script,
                     qc_frame_interval,
                     qc_area_jump_threshold,
                 )
@@ -281,7 +274,11 @@ def identify_foreground(
                 print(f"==> VLM run {run_index} failed: {error}", flush=True)
                 run_results.append(None)
     finally:
-        unload_vlm(model, processor)
+        del model
+        del processor
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return vote_concepts(run_results, num_vote_runs)
 
 
@@ -399,14 +396,6 @@ def vote_concepts(run_results, num_vote_runs):
     return include_concepts, exclude_concepts
 
 
-def unload_vlm(model, processor):
-    del model
-    del processor
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
 def process_eye(
     eye,
     input_video_path,
@@ -415,21 +404,21 @@ def process_eye(
     video_stem,
     fps,
     include_concepts,
-    sam2matting_python,
+    sam2matting_launcher,
     sam2matting_repo_dir,
-    sam2matting_checkpoint,
+    sam_matting_script,
     qc_frame_interval,
     qc_area_jump_threshold,
 ):
-    eye_video_path = os.path.join(work_dir, f".{video_stem}_{eye}.mkv")
-    split_eye_video(input_video_path, eye, eye_video_path)
+    eye_frames_dir = os.path.join(work_dir, f"frames_{eye}")
+    extract_eye_frames(input_video_path, eye, eye_frames_dir)
 
     eye_output_dir = os.path.join(work_dir, f"sam_{eye}")
-    run_sam2matting_sam3(
-        sam2matting_python,
+    run_sam_matting(
+        sam2matting_launcher,
         sam2matting_repo_dir,
-        sam2matting_checkpoint,
-        eye_video_path,
+        sam_matting_script,
+        eye_frames_dir,
         include_concepts,
         eye_output_dir,
     )
@@ -441,15 +430,16 @@ def process_eye(
     output_mov_paths = []
     instance_records = []
     for instance in instances:
-        label = slugify_concept(instance["concept"])
+        concept_label = resolve_concept_label(instance["concept"], include_concepts)
+        label = slugify_concept(concept_label)
         filename = f"{video_stem}_{eye}_inst{instance['id']:02d}_{label}.mov"
         output_mov_paths.append(os.path.join(output_dir, filename))
         instance_records.append(
-            {"id": instance["id"], "concept": instance["concept"], "output": filename}
+            {"id": instance["id"], "concept": concept_label, "output": filename}
         )
 
     qc_flags = render_and_qc_eye(
-        eye_video_path,
+        eye_frames_dir,
         instances,
         output_mov_paths,
         fps,
@@ -459,7 +449,15 @@ def process_eye(
     return instance_records, qc_flags
 
 
-def split_eye_video(input_video_path, eye, output_path):
+def resolve_concept_label(subdir_name, include_concepts):
+    prefix = subdir_name.split("_", 1)[0]
+    if prefix.isdigit() and int(prefix) < len(include_concepts):
+        return include_concepts[int(prefix)]
+    return subdir_name
+
+
+def extract_eye_frames(input_video_path, eye, frames_dir):
+    os.makedirs(frames_dir, exist_ok=True)
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     if eye == "L":
         crop = "crop=iw/2:ih:0:0"
@@ -470,55 +468,43 @@ def split_eye_video(input_video_path, eye, output_path):
         "-y",
         "-i",
         input_video_path,
-        "-filter_complex",
-        f"[0:v]{crop}[out]",
-        "-map",
-        "[out]",
-        "-c:v",
-        "ffv1",
-        "-level",
-        "3",
-        "-pix_fmt",
-        "yuv444p",
-        output_path,
+        "-vf",
+        crop,
+        os.path.join(frames_dir, "frame_%06d.png"),
     ]
     g.run_command(command)
 
 
-def run_sam2matting_sam3(
-    sam2matting_python,
+def run_sam_matting(
+    sam2matting_launcher,
     sam2matting_repo_dir,
-    sam2matting_checkpoint,
-    eye_video_path,
+    sam_matting_script,
+    eye_frames_dir,
     include_concepts,
     eye_output_dir,
 ):
-    script_path = os.path.join(sam2matting_repo_dir, "inference_video_sam3.py")
-    if not os.path.isfile(script_path):
-        raise FileNotFoundError(f"SAM2Matting SAM3 script not found: {script_path}")
+    if not os.path.isfile(sam_matting_script):
+        raise FileNotFoundError(f"SAM matting driver not found: {sam_matting_script}")
     os.makedirs(eye_output_dir, exist_ok=True)
-    text_prompt = "|".join(include_concepts)
-    command = [
-        sam2matting_python,
-        script_path,
-        "--checkpoint",
-        sam2matting_checkpoint,
-        "--input",
-        eye_video_path,
-        "--text",
-        text_prompt,
-        "--output",
-        eye_output_dir,
-        "--save_mp4",
+    command = shlex.split(sam2matting_launcher) + [
+        sam_matting_script,
+        "--sam_repo_dir",
+        os.path.abspath(sam2matting_repo_dir),
+        "--video_dir",
+        os.path.abspath(eye_frames_dir),
+        "--output_dir",
+        os.path.abspath(eye_output_dir),
+        "--languages",
+        "|".join(include_concepts),
+        "--frame_idx",
+        "0",
     ]
     print(
-        "Running SAM2Matting SAM3:",
+        "Running SAM matting:",
         " ".join(str(part) for part in command),
         flush=True,
     )
-    subprocess.run(
-        [str(part) for part in command], check=True, cwd=sam2matting_repo_dir
-    )
+    subprocess.run([str(part) for part in command], check=True)
 
 
 def collect_instance_alpha_sequences(eye_output_dir):
@@ -546,18 +532,18 @@ def collect_instance_alpha_sequences(eye_output_dir):
 
 
 def render_and_qc_eye(
-    eye_video_path,
+    eye_frames_dir,
     instances,
     output_mov_paths,
     fps,
     qc_frame_interval,
     qc_area_jump_threshold,
 ):
-    video = cv2.VideoCapture(eye_video_path)
-    if not video.isOpened():
-        raise ValueError(f"Could not open eye video: {eye_video_path}")
-    width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_paths = sorted(glob.glob(os.path.join(eye_frames_dir, "*.png")))
+    if len(frame_paths) == 0:
+        raise RuntimeError(f"no eye frames in {eye_frames_dir}")
+    sample = cv2.imread(frame_paths[0], cv2.IMREAD_COLOR)
+    height, width = sample.shape[:2]
 
     writers = [
         g.RawAlphaVideoWriter(output_mov_paths[instance_index], width, height, fps)
@@ -566,13 +552,11 @@ def render_and_qc_eye(
     previous_areas = [None] * len(instances)
     previous_present_count = None
     qc_flags = []
-    frame_index = 0
     try:
-        while True:
-            success, frame_bgr = video.read()
-            if not success:
-                break
+        for frame_index, frame_path in enumerate(frame_paths):
+            frame_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_rgb16 = frame_rgb.astype(np.uint16) * 257
             present_count = 0
             current_areas = []
             for instance_index, instance in enumerate(instances):
@@ -583,9 +567,8 @@ def render_and_qc_eye(
                 current_areas.append(area)
                 if area > 0.0:
                     present_count += 1
-                rgba = np.dstack(
-                    [frame_rgb, (alpha * 255.0).clip(0, 255).astype(np.uint8)]
-                )
+                alpha16 = np.round(alpha * 65535.0).clip(0, 65535).astype(np.uint16)
+                rgba = np.dstack([frame_rgb16, alpha16])
                 writers[instance_index].write(rgba)
 
             if frame_index % qc_frame_interval == 0:
@@ -601,9 +584,7 @@ def render_and_qc_eye(
                 )
                 previous_areas = current_areas
                 previous_present_count = present_count
-            frame_index += 1
     finally:
-        video.release()
         for writer in writers:
             writer.close()
     return qc_flags
@@ -672,7 +653,7 @@ def slugify_concept(concept):
 
 def save_sidecar(sidecar_path, sidecar):
     with open(sidecar_path, "w", encoding="utf-8") as file:
-        json.dump(sidecar, file, indent=2)
+        json.dump(sidecar, file, indent=2, default=str)
 
 
 def write_qc_log(qc_log_path, sidecar):

@@ -123,7 +123,7 @@ class RawAlphaVideoWriter:
             "-vcodec",
             "rawvideo",
             "-pix_fmt",
-            "rgba",
+            "rgba64le",
             "-s",
             f"{width}x{height}",
             "-r",
@@ -146,10 +146,10 @@ class RawAlphaVideoWriter:
             raise RuntimeError("Video writer is closed")
 
         frame = np.asarray(frame)
-        if frame.dtype != np.uint8:
+        if frame.dtype != np.uint16:
             if frame.max() <= 1.0:
-                frame = frame * 255.0
-            frame = np.clip(frame, 0.0, 255.0).astype(np.uint8)
+                frame = frame * 65535.0
+            frame = np.clip(frame, 0.0, 65535.0).astype(np.uint16)
         frame = np.ascontiguousarray(frame)
         self.process.stdin.write(frame.tobytes())
 
