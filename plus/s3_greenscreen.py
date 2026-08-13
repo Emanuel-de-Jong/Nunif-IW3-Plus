@@ -3,7 +3,6 @@ import gc
 import re
 import json
 import shutil
-import sys
 import cv2
 import torch
 import numpy as np
@@ -76,7 +75,7 @@ def main(
     vlm_temperature: float = 0.2,
     vlm_max_new_tokens: int = 768,
     vlm_max_long_side: int = 1024,
-    sam_model_id: str = "facebook/sam3.1",
+    sam_model_id: str = "facebook/sam3",
     sam_repo_dir: str = None,
     sam_checkpoint_path: str = None,
     sam_bpe_path: str = None,
@@ -97,12 +96,6 @@ def main(
     overwrite: bool = False,
 ):
     device = "cuda"
-
-    default_sam_repo_dir = str(g.PLUS_DIR / "SAM2Matting")
-    if sam_bpe_path is None and sam_repo_dir is not None:
-        sam_bpe_path = os.path.join(
-            sam_repo_dir, "sam3", "bpe_simple_vocab_16e6.txt.gz"
-        )
 
     video_dir = os.path.dirname(os.path.abspath(input_video_path))
     video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
@@ -142,7 +135,6 @@ def main(
         "vlm_max_long_side": vlm_max_long_side,
         "sam_model_id": sam_model_id,
         "sam_repo_dir": sam_repo_dir,
-        "default_sam_repo_dir": default_sam_repo_dir,
         "sam_checkpoint_path": sam_checkpoint_path,
         "sam_bpe_path": sam_bpe_path,
         "sam_prompt_frame_idx": sam_prompt_frame_idx,
@@ -236,12 +228,9 @@ def main(
             write_qc_log(qc_log_path, sidecar)
             return
 
-        if sam_repo_dir is not None and sam_repo_dir not in sys.path:
-            sys.path.insert(0, sam_repo_dir)
         predictor = create_sam_predictor(
             sam_model_id,
             sam_repo_dir,
-            default_sam_repo_dir,
             sam_checkpoint_path,
             sam_bpe_path,
             sam_compile,
@@ -299,8 +288,8 @@ def main(
                         flush=True,
                     )
         except Exception as error:
-            sidecar["failures"].append(f"SAM 3.1 processing crashed: {error}")
-            print(f"==> SAM 3.1 processing crashed: {error}", flush=True)
+            sidecar["failures"].append(f"SAM 3 processing crashed: {error}")
+            print(f"==> SAM 3 processing crashed: {error}", flush=True)
             save_sidecar(sidecar_path, sidecar)
             write_qc_log(qc_log_path, sidecar)
             return
@@ -594,73 +583,25 @@ def prompt_matches_scene(concept, include_concepts, specific_include_concepts):
 def create_sam_predictor(
     sam_model_id,
     sam_repo_dir,
-    default_sam_repo_dir,
     checkpoint_path,
     bpe_path,
     compiled,
 ):
-    print(f"Loading SAM 3.1 model: {sam_model_id}", flush=True)
-    try:
-        from sam3.model_builder import build_sam3_video_predictor
-    except ImportError:
-        if sam_repo_dir is None:
-            sam_repo_dir = default_sam_repo_dir
-        if sam_repo_dir not in sys.path:
-            sys.path.insert(0, sam_repo_dir)
-        if bpe_path is None:
-            bpe_path = os.path.join(
-                sam_repo_dir, "sam3", "bpe_simple_vocab_16e6.txt.gz"
-            )
-        try:
-            from sam3.model_builder import build_sam3_video_predictor
-        except ImportError as error:
-            raise RuntimeError(
-                "Could not import SAM 3. Make sure facebook/sam3.1 or the local sam3 package is installed."
-            ) from error
+    print(f"Loading SAM 3 model: {sam_model_id}", flush=True)
+    from transformers import Sam3VideoModel, Sam3VideoProcessor
 
-    checkpoint_path = resolve_sam_checkpoint(sam_model_id, checkpoint_path)
-    kwargs = {
-        "gpus_to_use": [0],
-        "checkpoint_path": checkpoint_path,
-        "strict_state_dict_loading": False,
-        "bpe_path": bpe_path,
-        "apply_temporal_disambiguation": True,
-    }
-    if checkpoint_path is None:
-        kwargs["load_from_HF"] = True
-    try:
-        predictor = build_sam3_video_predictor(**kwargs)
-    except TypeError:
-        kwargs.pop("load_from_HF", None)
-        predictor = build_sam3_video_predictor(**kwargs)
-
+    dtype = torch.bfloat16
+    model = Sam3VideoModel.from_pretrained(sam_model_id).to("cuda", dtype=dtype)
     if compiled:
-        trunk = predictor.model.detector.backbone.vision_backbone.trunk
-        trunk.forward = torch.compile(
-            trunk.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=False,
-        )
-    return predictor
-
-
-def resolve_sam_checkpoint(sam_model_id, checkpoint_path):
-    if checkpoint_path is not None:
-        return checkpoint_path
-    if sam_model_id in (None, "", "facebook/sam3"):
-        return None
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as error:
-        raise RuntimeError(
-            "huggingface_hub is required to download the requested SAM checkpoint"
-        ) from error
-    try:
-        hf_hub_download(repo_id=sam_model_id, filename="config.json")
-    except Exception:
-        pass
-    return hf_hub_download(repo_id=sam_model_id, filename="sam3.pt")
+        model = torch.compile(model)
+    model.eval()
+    processor = Sam3VideoProcessor.from_pretrained(sam_model_id)
+    return {
+        "model": model,
+        "processor": processor,
+        "device": "cuda",
+        "dtype": dtype,
+    }
 
 
 def crop_eye_video(
@@ -723,29 +664,25 @@ def process_eye_with_sam(
     greenscreen_crf=18,
     greenscreen_preset="veryfast",
 ):
-    video = cv2.VideoCapture(eye_video_path)
-    if not video.isOpened():
-        raise ValueError(f"Could not open cropped eye video: {eye_video_path}")
-    try:
-        _, width, height, frame_count = get_video_properties(video)
-    finally:
-        video.release()
+    video_frames, width, height, frame_count = load_video_frames(eye_video_path)
+    model = predictor["model"]
+    processor = predictor["processor"]
+    device = predictor["device"]
+    dtype = predictor["dtype"]
 
-    session_id = None
     try:
-        response = predictor.handle_request(
-            dict(type="start_session", resource_path=eye_video_path)
+        inference_session = processor.init_video_session(
+            video=video_frames,
+            inference_device=device,
+            processing_device="cpu",
+            video_storage_device="cpu",
+            dtype=dtype,
         )
-        session_id = response["session_id"]
         prompt_frame_idx = min(max(int(prompt_frame_idx), 0), frame_count - 1)
         for prompt in prompts:
-            predictor.handle_request(
-                dict(
-                    type="add_prompt",
-                    session_id=session_id,
-                    frame_index=prompt_frame_idx,
-                    text=prompt,
-                )
+            inference_session = processor.add_text_prompt(
+                inference_session=inference_session,
+                text=prompt,
             )
 
         green_writer = g.RawVideoWriter(
@@ -778,37 +715,27 @@ def process_eye_with_sam(
         max_instances = 0
         qc_flags = []
         current_frame_index = 0
-        video = cv2.VideoCapture(eye_video_path)
-        if not video.isOpened():
-            raise ValueError(f"Could not reopen cropped eye video: {eye_video_path}")
 
         try:
-            for response in predictor.handle_stream_request(
-                dict(
-                    type="propagate_in_video",
-                    session_id=session_id,
-                    propagation_direction="forward",
-                    start_frame_index=prompt_frame_idx,
-                )
+            for model_outputs in model.propagate_in_video_iterator(
+                inference_session=inference_session,
+                max_frame_num_to_track=frame_count - 1,
             ):
-                frame_index = int(response["frame_index"])
+                frame_index = int(model_outputs.frame_idx)
                 while current_frame_index < frame_index:
-                    success, frame_bgr = video.read()
-                    if not success:
-                        break
-                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    frame_rgb = video_frames[current_frame_index]
                     empty_alpha = np.zeros((height, width), dtype=np.float32)
                     green_writer.write(composite_green(frame_rgb, empty_alpha))
                     if alpha_writer is not None:
                         alpha_writer.write(np.zeros((height, width, 3), dtype=np.uint8))
                     current_frame_index += 1
 
-                success, frame_bgr = video.read()
-                if not success:
-                    break
-                outputs = response.get("outputs", {})
-                masks = outputs.get("out_binary_masks", None)
-                object_ids = outputs.get("out_obj_ids", [])
+                processed_outputs = processor.postprocess_outputs(
+                    inference_session,
+                    model_outputs,
+                )
+                masks = tensor_to_numpy(processed_outputs.get("masks", None))
+                object_ids = tensor_to_list(processed_outputs.get("object_ids", []))
                 combined_alpha, present_count = combine_masks(
                     masks,
                     height,
@@ -817,7 +744,7 @@ def process_eye_with_sam(
                     mask_dilate_kernel,
                 )
                 max_instances = max(max_instances, present_count)
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_rgb = video_frames[frame_index]
                 green_frame = composite_green(frame_rgb, combined_alpha)
                 green_writer.write(green_frame)
                 if alpha_writer is not None:
@@ -857,19 +784,13 @@ def process_eye_with_sam(
                 current_frame_index += 1
 
             while current_frame_index < frame_count:
-                success, frame_bgr = video.read()
-                if not success:
-                    break
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_rgb = video_frames[current_frame_index]
                 empty_alpha = np.zeros((height, width), dtype=np.float32)
                 green_writer.write(composite_green(frame_rgb, empty_alpha))
                 if alpha_writer is not None:
                     alpha_writer.write(np.zeros((height, width, 3), dtype=np.uint8))
                 current_frame_index += 1
         finally:
-            predictor.handle_request(dict(type="close_session", session_id=session_id))
-            session_id = None
-            video.release()
             green_writer.close()
             if alpha_writer is not None:
                 alpha_writer.close()
@@ -882,8 +803,46 @@ def process_eye_with_sam(
             "qc_flags": qc_flags,
         }
     finally:
-        if session_id is not None:
-            predictor.handle_request(dict(type="close_session", session_id=session_id))
+        del video_frames
+
+
+def load_video_frames(video_path):
+    video = cv2.VideoCapture(video_path)
+    if not video.isOpened():
+        raise ValueError(f"Could not open cropped eye video: {video_path}")
+    try:
+        _, width, height, frame_count = get_video_properties(video)
+        frames = []
+        while True:
+            success, frame_bgr = video.read()
+            if not success:
+                break
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        video.release()
+    if len(frames) == 0:
+        raise ValueError(f"Could not read cropped eye video frames: {video_path}")
+    if len(frames) != frame_count:
+        frame_count = len(frames)
+    return frames, width, height, frame_count
+
+
+def tensor_to_numpy(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def tensor_to_list(value):
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return list(value)
 
 
 def combine_masks(masks, height, width, mask_close_kernel, mask_dilate_kernel):
@@ -963,7 +922,7 @@ def write_instance_frames(
             )
             instance_records[object_id] = {
                 "id": object_id,
-                "concept": "SAM 3.1 object",
+                "concept": "SAM 3 object",
                 "output": os.path.basename(output_path),
             }
         mask = np.squeeze(masks[position])

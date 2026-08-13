@@ -3,6 +3,7 @@ prompt*.txt
 _in/
 _out/
 _out_plus/
+plus/checkpoints/*
 plus/SAM2Matting/*
 plus/Video2X/*
 !plus/Video2X/.gitkeep
