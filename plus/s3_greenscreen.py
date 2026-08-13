@@ -3,6 +3,7 @@ import gc
 import re
 import json
 import shutil
+import tempfile
 import cv2
 import torch
 import numpy as np
@@ -90,6 +91,7 @@ def main(
     mask_close_kernel: int = 9,
     mask_dilate_kernel: int = 3,
     mask_border_shift: int = 0,
+    mask_overlap_gap_fill: int = 50,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
@@ -149,6 +151,7 @@ def main(
         "mask_close_kernel": mask_close_kernel,
         "mask_dilate_kernel": mask_dilate_kernel,
         "mask_border_shift": mask_border_shift,
+        "mask_overlap_gap_fill": mask_overlap_gap_fill,
         "qc_frame_interval": qc_frame_interval,
         "qc_area_jump_threshold": qc_area_jump_threshold,
         "greenscreen_crf": greenscreen_crf,
@@ -279,6 +282,7 @@ def main(
                         mask_close_kernel,
                         mask_dilate_kernel,
                         mask_border_shift,
+                        mask_overlap_gap_fill,
                         qc_frame_interval,
                         qc_area_jump_threshold,
                         greenscreen_crf,
@@ -305,6 +309,8 @@ def main(
         hstack_videos(
             eye_green_paths["L"], eye_green_paths["R"], greenscreen_path, overwrite=True
         )
+        print("==> writing chroma-key metadata", flush=True)
+        write_mp4_metadata(greenscreen_path, np.array([0, 255, 0], dtype=np.uint8))
         sidecar["outputs"]["greenscreen"] = os.path.basename(greenscreen_path)
         print(f"==> saved greenscreen composite: {greenscreen_path}", flush=True)
 
@@ -663,6 +669,7 @@ def process_eye_with_sam(
     mask_close_kernel,
     mask_dilate_kernel,
     mask_border_shift,
+    mask_overlap_gap_fill,
     qc_frame_interval,
     qc_area_jump_threshold,
     greenscreen_crf=18,
@@ -747,6 +754,7 @@ def process_eye_with_sam(
                     mask_close_kernel,
                     mask_dilate_kernel,
                     mask_border_shift,
+                    mask_overlap_gap_fill,
                 )
                 max_instances = max(max_instances, present_count)
                 frame_rgb = video_frames[frame_index]
@@ -851,7 +859,13 @@ def tensor_to_list(value):
 
 
 def combine_masks(
-    masks, height, width, mask_close_kernel, mask_dilate_kernel, mask_border_shift
+    masks,
+    height,
+    width,
+    mask_close_kernel,
+    mask_dilate_kernel,
+    mask_border_shift,
+    mask_overlap_gap_fill,
 ):
     if masks is None:
         return np.zeros((height, width), dtype=np.float32), 0
@@ -861,6 +875,7 @@ def combine_masks(
     if masks.ndim == 2:
         masks = masks[None]
     combined = np.zeros((height, width), dtype=np.uint8)
+    instance_masks = []
     present_count = 0
     for mask in masks:
         mask_2d = np.squeeze(mask)
@@ -876,12 +891,33 @@ def combine_masks(
         if mask_u8.max() == 0:
             continue
         present_count += 1
+        instance_masks.append(mask_u8)
         combined = np.maximum(combined, mask_u8)
 
+    combined = fill_overlap_gaps(combined, instance_masks, mask_overlap_gap_fill)
     combined = postprocess_mask(
         combined, mask_close_kernel, mask_dilate_kernel, mask_border_shift
     )
     return combined.astype(np.float32) / 255.0, present_count
+
+
+def fill_overlap_gaps(combined, instance_masks, mask_overlap_gap_fill):
+    if mask_overlap_gap_fill <= 0 or len(instance_masks) < 2:
+        return combined
+
+    kernel_size = int(mask_overlap_gap_fill) * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    overlap_count = np.zeros(combined.shape, dtype=np.uint16)
+    for instance_mask in instance_masks:
+        dilated = cv2.dilate(instance_mask, kernel, iterations=1)
+        overlap_count += (dilated > 0).astype(np.uint16)
+
+    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+    gap_mask = (combined == 0) & (overlap_count >= 2) & (closed > 0)
+    if np.any(gap_mask):
+        combined = combined.copy()
+        combined[gap_mask] = 255
+    return combined
 
 
 def postprocess_mask(mask_u8, mask_close_kernel, mask_dilate_kernel, mask_border_shift):
@@ -1013,6 +1049,68 @@ def hstack_videos(left_path, right_path, output_path, overwrite=False):
         output_path,
     ]
     g.run_command(command)
+
+
+def get_hex_color(green_color):
+    return "#{:02X}{:02X}{:02X}".format(
+        int(green_color[0]), int(green_color[1]), int(green_color[2])
+    )
+
+
+def get_chroma_key_metadata(green_color):
+    hex_color = get_hex_color(green_color)
+    metadata = [
+        ("stereo_mode", "left_right"),
+        ("chroma_key", "true"),
+        ("chroma_key_color", hex_color),
+        ("greenscreen", "true"),
+        ("greenscreen_color", hex_color),
+        ("passthrough_chroma_key", hex_color),
+        ("com.oculus.vr.chroma_key", hex_color),
+        ("com.meta.vr.chroma_key", hex_color),
+        ("com.deovr.chroma_key", hex_color),
+    ]
+    return metadata
+
+
+def write_mp4_metadata(video_path, green_color):
+    metadata = get_chroma_key_metadata(green_color)
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    directory = os.path.dirname(video_path) or "."
+    file_name = os.path.basename(video_path)
+
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{os.path.splitext(file_name)[0]}_metadata_",
+        suffix=".mp4",
+        dir=directory,
+        delete=False,
+    ) as temp_file:
+        temp_output_path = temp_file.name
+
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        video_path,
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-movflags",
+        "use_metadata_tags",
+    ]
+
+    for key, value in metadata:
+        command.extend(["-metadata", f"{key}={value}"])
+
+    command.append(temp_output_path)
+
+    try:
+        g.run_command(command)
+        os.replace(temp_output_path, video_path)
+    finally:
+        if os.path.exists(temp_output_path):
+            os.remove(temp_output_path)
 
 
 def save_sidecar(sidecar_path, sidecar):
