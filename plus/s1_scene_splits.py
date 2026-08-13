@@ -8,17 +8,15 @@ import numpy as np
 import imageio_ffmpeg
 import plus.global_params as g
 from fire import Fire
+from transformers import AutoModel, AutoProcessor
 
 
 def main(
     input_video_path: str,
     output_dir: str = None,
-    model_repo: str = "facebookresearch/dinov3",
-    model_source: str = "github",
-    model_variant: str = "dinov3_vitb16",
-    weights_path: str = None,
+    model_name: str = "google/siglip2-base-patch16-384",
     sample_fps: float = 15.0,
-    input_size: int = 336,
+    input_size: int = 384,
     batch_size: int = 32,
     precision: str = "fp16",
     device: str = "cuda",
@@ -66,9 +64,7 @@ def main(
     print(f"Input video duration: {duration:.3f}s", flush=True)
 
     torch_device = create_device(device)
-    model = create_dino_model(
-        model_repo, model_source, model_variant, weights_path, torch_device
-    )
+    model, image_mean, image_std = create_siglip_model(model_name, torch_device)
     autocast_dtype = get_autocast_dtype(precision, torch_device)
 
     sample_frame_indices = get_sample_frame_indices(fps, frame_count, sample_fps)
@@ -84,6 +80,8 @@ def main(
         model,
         torch_device,
         autocast_dtype,
+        image_mean,
+        image_std,
         input_size,
         batch_size,
         "sampled",
@@ -113,6 +111,8 @@ def main(
         model,
         torch_device,
         autocast_dtype,
+        image_mean,
+        image_std,
         input_size,
         batch_size,
         refine_seconds,
@@ -152,10 +152,7 @@ def main(
         input_size,
         batch_size,
         precision,
-        model_repo,
-        model_source,
-        model_variant,
-        weights_path,
+        model_name,
         window_seconds,
         threshold,
         prominence,
@@ -183,33 +180,17 @@ def create_device(device):
     return torch_device
 
 
-def create_dino_model(model_repo, model_source, model_variant, weights_path, device):
-    print(f"Loading DINOv3 model: {model_repo}:{model_variant}", flush=True)
-    load_kwargs = {
-        "verbose": False,
-        "trust_repo": True,
-    }
-    if model_source == "local":
-        load_kwargs["source"] = "local"
-    elif model_source != "github":
-        raise ValueError(f"Unsupported model_source: {model_source}")
-
-    if weights_path is not None:
-        load_kwargs["weights"] = weights_path
-    else:
-        load_kwargs["pretrained"] = True
-
-    try:
-        model = torch.hub.load(model_repo, model_variant, **load_kwargs)
-    except TypeError:
-        if weights_path is not None:
-            raise
-        load_kwargs.pop("pretrained", None)
-        model = torch.hub.load(model_repo, model_variant, **load_kwargs)
+def create_siglip_model(model_name, device):
+    print(f"Loading SigLIP 2 model: {model_name}", flush=True)
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
     model.eval()
     model.requires_grad_(False)
     model.to(device)
-    return model
+    image_processor = getattr(processor, "image_processor", processor)
+    image_mean = getattr(image_processor, "image_mean", [0.5, 0.5, 0.5])
+    image_std = getattr(image_processor, "image_std", [0.5, 0.5, 0.5])
+    return model, image_mean, image_std
 
 
 def get_autocast_dtype(precision, device):
@@ -260,6 +241,8 @@ def infer_video_frame_indices(
     model,
     device,
     autocast_dtype,
+    image_mean,
+    image_std,
     input_size,
     batch_size,
     progress_name,
@@ -308,6 +291,8 @@ def infer_video_frame_indices(
                             batch_frames,
                             device,
                             autocast_dtype,
+                            image_mean,
+                            image_std,
                         )
                     )
                     selected_frame_indices.extend(read_frame_indices)
@@ -327,6 +312,8 @@ def infer_video_frame_indices(
                 batch_frames,
                 device,
                 autocast_dtype,
+                image_mean,
+                image_std,
             )
         )
         selected_frame_indices.extend(read_frame_indices)
@@ -344,7 +331,7 @@ def infer_video_frame_indices(
 def print_progress(progress_name, processed_count, total_count):
     if processed_count == total_count or processed_count % 512 == 0:
         print(
-            f"==> {progress_name} DINO frames {processed_count}/{total_count}",
+            f"==> {progress_name} SigLIP frames {processed_count}/{total_count}",
             flush=True,
         )
 
@@ -358,40 +345,45 @@ def preprocess_frame(frame_bgr, input_size):
     return np.transpose(frame_np, (2, 0, 1))
 
 
-def infer_frame_batch(model, batch_frames, device, autocast_dtype):
+def infer_frame_batch(
+    model, batch_frames, device, autocast_dtype, image_mean, image_std
+):
     batch_np = np.stack(batch_frames, axis=0)
     batch = torch.from_numpy(batch_np).to(device, non_blocking=True)
-    batch = normalize_dino_input(batch)
+    batch = normalize_siglip_input(batch, image_mean, image_std)
 
     autocast_context = contextlib.nullcontext()
     if autocast_dtype is not None:
         autocast_context = torch.autocast(device_type=device.type, dtype=autocast_dtype)
 
     with torch.inference_mode(), autocast_context:
-        output = run_dino_model(model, batch)
+        output = run_siglip_model(model, batch)
         embeddings = extract_embedding_from_output(output)
 
     embeddings = F.normalize(embeddings.float(), p=2, dim=1)
     return embeddings.cpu().numpy().astype(np.float32)
 
 
-def normalize_dino_input(batch):
-    mean = torch.tensor(
-        [0.485, 0.456, 0.406], dtype=batch.dtype, device=batch.device
-    ).reshape(1, 3, 1, 1)
-    stdv = torch.tensor(
-        [0.229, 0.224, 0.225], dtype=batch.dtype, device=batch.device
-    ).reshape(1, 3, 1, 1)
+def normalize_siglip_input(batch, image_mean, image_std):
+    mean = torch.tensor(image_mean, dtype=batch.dtype, device=batch.device).reshape(
+        1, 3, 1, 1
+    )
+    stdv = torch.tensor(image_std, dtype=batch.dtype, device=batch.device).reshape(
+        1, 3, 1, 1
+    )
     return (batch - mean) / stdv
 
 
-def run_dino_model(model, batch):
-    if hasattr(model, "forward_features"):
-        try:
-            return model.forward_features(batch)
-        except TypeError:
-            pass
-    return model(batch)
+def run_siglip_model(model, batch):
+    if hasattr(model, "get_image_features"):
+        return model.get_image_features(pixel_values=batch)
+    if hasattr(model, "vision_model"):
+        output = model.vision_model(pixel_values=batch)
+        if hasattr(output, "pooler_output") and output.pooler_output is not None:
+            return output.pooler_output
+        if hasattr(output, "last_hidden_state"):
+            return output.last_hidden_state[:, 0]
+    return model(pixel_values=batch)
 
 
 def extract_embedding_from_output(output):
@@ -407,12 +399,14 @@ def extract_embedding_from_output(output):
         embeddings = tensor_to_embedding(output, "")
         if embeddings is not None:
             return embeddings
-    raise RuntimeError("Could not extract DINO embeddings from model output")
+    raise RuntimeError("Could not extract SigLIP embeddings from model output")
 
 
 def extract_embedding_from_dict(output):
     embeddings = []
     for key in [
+        "image_embeds",
+        "image_features",
         "x_norm_clstoken",
         "x_norm_patchtokens",
         "x_prenorm",
@@ -581,6 +575,8 @@ def refine_boundaries(
     model,
     device,
     autocast_dtype,
+    image_mean,
+    image_std,
     input_size,
     batch_size,
     refine_seconds,
@@ -600,6 +596,8 @@ def refine_boundaries(
             model,
             device,
             autocast_dtype,
+            image_mean,
+            image_std,
             input_size,
             batch_size,
             refine_seconds,
@@ -625,6 +623,8 @@ def refine_boundary(
     model,
     device,
     autocast_dtype,
+    image_mean,
+    image_std,
     input_size,
     batch_size,
     refine_seconds,
@@ -653,6 +653,8 @@ def refine_boundary(
         model,
         device,
         autocast_dtype,
+        image_mean,
+        image_std,
         input_size,
         batch_size,
         "refine",
@@ -845,10 +847,7 @@ def save_boundaries_json(
     input_size,
     batch_size,
     precision,
-    model_repo,
-    model_source,
-    model_variant,
-    weights_path,
+    model_name,
     window_seconds,
     threshold,
     prominence,
@@ -872,10 +871,7 @@ def save_boundaries_json(
             "input_size": input_size,
             "batch_size": batch_size,
             "precision": precision,
-            "model_repo": model_repo,
-            "model_source": model_source,
-            "model_variant": model_variant,
-            "weights_path": weights_path,
+            "model_name": model_name,
             "window_seconds": window_seconds,
             "threshold": threshold,
             "prominence": prominence,
