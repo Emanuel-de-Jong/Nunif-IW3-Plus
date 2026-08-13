@@ -38,8 +38,9 @@ for video in "${videos[@]}"; do
 
 	printf "=== %s (%d/%d) ===\n" "$video" "$CURRENT_COUNT" "$TOTAL_COUNT"
 
-	python -m plus.s1_upscale --input_video_path "$video"
-	python -m plus.s2_greenscreen --input_video_path "$video"
+	python -m plus.s1_scene_splits --input_video_path "$video"
+	python -m plus.s2_upscale --input_video_path "$video"
+	python -m plus.s3_greenscreen --input_video_path "$video"
 
 	printf "\n\n-----------------------------------\n\n"
 done

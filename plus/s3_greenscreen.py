@@ -15,9 +15,9 @@ MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 def main(
     input_video_path: str,
     output_video_path: str = None,
-    depth_model_type: str = "VDA_Stream_S",
+    depth_model_type: str = "VDA_Stream_Metric_L",
     mask_blur_radius: int = 7,
-    foreground_bias: float = 0.05,
+    foreground_bias: float = 0.00,
     threshold_ema_decay: float = 0.9,
     crf: int = 16,
     preset: str = "slow",
