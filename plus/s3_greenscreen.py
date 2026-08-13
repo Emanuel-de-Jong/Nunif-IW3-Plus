@@ -2,10 +2,8 @@ import os
 import gc
 import re
 import json
-import glob
-import shlex
 import shutil
-import subprocess
+import sys
 import cv2
 import torch
 import numpy as np
@@ -15,7 +13,7 @@ from fire import Fire
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 SYSTEM_PROMPT = (
-    "You are a VFX matting assistant. Respond with strict, minified JSON only. "
+    "You are a VFX foreground segmentation assistant. Respond with strict, minified JSON only. "
     "No prose, no markdown, no code fences."
 )
 
@@ -24,16 +22,49 @@ USER_INSTRUCTION = (
     "shot with a fixed cast of foreground subjects. These objects will be cut out and "
     "placed on a different background, so decide what should and should not be "
     "included as if you were compositing this shot for VFX. "
-    "Return JSON with exactly two keys. "
-    '"include" is a list of short foreground concept phrases that must survive onto '
-    'the new background, for example "the girl in the red coat" or "the brown dog". '
+    "Return JSON with exactly four keys. "
+    '"include" is a list of broad foreground concept phrases for exhaustive segmentation, '
+    'for example "person", "animal", "vehicle", "held object", "clothing", or "sports equipment". '
+    '"specific_include" is a list of specific visible foreground subjects and attached objects, '
+    'for example "the girl in the red coat", "the brown dog", "the black backpack", '
+    '"the phone in her hand", "the bicycle", or "the sword". '
     '"exclude" is a list of things that must NOT be included, and it must always be '
-    "populated: actively reason about ambiguous cases such as cast or contact shadows, "
-    "reflections, translucent or particle effects, sky, and background scenery. "
-    "Use one concept phrase per distinct kind of subject. "
-    "Be thorough: list every distinct foreground subject that should be kept, even if it "
-    "is small or only partially visible."
+    "populated: actively reason about cast or contact shadows, reflections, translucent or "
+    "particle effects, sky, floor, walls, furniture, and background scenery. "
+    "Be very thorough. Include small objects, body parts, hair, clothing, accessories, "
+    "held items, objects touching the main subject, pets, vehicles, and tools when they "
+    "move with or belong to the foreground. Prefer concepts that keep touching foreground "
+    "objects connected instead of splitting them apart."
 )
+
+COMMON_FOREGROUND_CONCEPTS = [
+    # "person",
+    # "people",
+    # "human",
+    # "hair",
+    # "face",
+    # "hand",
+    # "clothing",
+    # "shoe",
+    # "hat",
+    # "helmet",
+    # "glasses",
+    # "bag",
+    # "backpack",
+    # "held object",
+    # "object in hand",
+    # "tool",
+    # "phone",
+    # "sports equipment",
+    # "instrument",
+    # "animal",
+    # "pet",
+    # "dog",
+    # "cat",
+    # "vehicle",
+    # "bicycle",
+    # "motorcycle",
+]
 
 
 def main(
@@ -41,11 +72,24 @@ def main(
     output_dir: str = None,
     vlm_model_id: str = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated",
     num_sampled_frames: int = 7,
-    num_vote_runs: int = 3,
-    vlm_temperature: float = 0.3,
-    vlm_max_new_tokens: int = 512,
+    num_vote_runs: int = 2,
+    vlm_temperature: float = 0.2,
+    vlm_max_new_tokens: int = 768,
     vlm_max_long_side: int = 1024,
-    sam2matting_repo_dir: str = None,
+    sam_model_id: str = "facebook/sam3.1",
+    sam_repo_dir: str = None,
+    sam_checkpoint_path: str = None,
+    sam_bpe_path: str = None,
+    sam_prompt_frame_idx: int = 0,
+    sam_prompt_groups: int = 6,
+    sam_max_long_side: int = 0,
+    sam_video_crf: int = 12,
+    sam_video_preset: str = "veryfast",
+    sam_compile: bool = False,
+    output_alpha_video: bool = True,
+    output_instance_videos: bool = False,
+    mask_close_kernel: int = 9,
+    mask_dilate_kernel: int = 3,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
@@ -54,10 +98,11 @@ def main(
 ):
     device = "cuda"
 
-    if sam2matting_repo_dir is None:
-        sam2matting_repo_dir = str(g.PLUS_DIR / "SAM2Matting")
-    sam_matting_script = str(g.PLUS_DIR / "sam_matting.py")
-    sam2matting_launcher = "conda run --no-capture-output -n sam2matting python"
+    default_sam_repo_dir = str(g.PLUS_DIR / "SAM2Matting")
+    if sam_bpe_path is None and sam_repo_dir is not None:
+        sam_bpe_path = os.path.join(
+            sam_repo_dir, "sam3", "bpe_simple_vocab_16e6.txt.gz"
+        )
 
     video_dir = os.path.dirname(os.path.abspath(input_video_path))
     video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
@@ -66,6 +111,7 @@ def main(
 
     sidecar_path = os.path.join(output_dir, f"{video_stem}_matte.json")
     qc_log_path = os.path.join(output_dir, f"{video_stem}_qc.log")
+    greenscreen_path = os.path.join(output_dir, f"{video_stem}_greenscreen.mp4")
 
     if g.should_skip_output(sidecar_path, overwrite):
         return
@@ -94,7 +140,21 @@ def main(
         "vlm_temperature": vlm_temperature,
         "vlm_max_new_tokens": vlm_max_new_tokens,
         "vlm_max_long_side": vlm_max_long_side,
-        "sam2matting_repo_dir": sam2matting_repo_dir,
+        "sam_model_id": sam_model_id,
+        "sam_repo_dir": sam_repo_dir,
+        "default_sam_repo_dir": default_sam_repo_dir,
+        "sam_checkpoint_path": sam_checkpoint_path,
+        "sam_bpe_path": sam_bpe_path,
+        "sam_prompt_frame_idx": sam_prompt_frame_idx,
+        "sam_prompt_groups": sam_prompt_groups,
+        "sam_max_long_side": sam_max_long_side,
+        "sam_video_crf": sam_video_crf,
+        "sam_video_preset": sam_video_preset,
+        "sam_compile": sam_compile,
+        "output_alpha_video": output_alpha_video,
+        "output_instance_videos": output_instance_videos,
+        "mask_close_kernel": mask_close_kernel,
+        "mask_dilate_kernel": mask_dilate_kernel,
         "qc_frame_interval": qc_frame_interval,
         "qc_area_jump_threshold": qc_area_jump_threshold,
         "greenscreen_crf": greenscreen_crf,
@@ -110,8 +170,11 @@ def main(
         "config": config,
         "sampled_frame_indices": [],
         "include": [],
+        "specific_include": [],
         "exclude": [],
+        "sam_prompts": [],
         "eyes": {},
+        "outputs": {},
         "failures": [],
     }
 
@@ -122,7 +185,7 @@ def main(
         sidecar["sampled_frame_indices"] = [
             int(index) for index in sampled_frame_indices
         ]
-        frames_dir = os.path.join(work_dir, "frames")
+        frames_dir = os.path.join(work_dir, "samples")
         image_paths = extract_sample_frames(
             input_video_path,
             sampled_frame_indices,
@@ -138,104 +201,128 @@ def main(
             return
 
         print(f"==> sampled {len(image_paths)} frames for VLM", flush=True)
-        include_concepts, exclude_concepts = identify_foreground(
-            vlm_model_id,
-            device,
-            image_paths,
-            num_vote_runs,
-            vlm_temperature,
-            vlm_max_new_tokens,
-            sidecar,
+        include_concepts, specific_include_concepts, exclude_concepts = (
+            identify_foreground(
+                vlm_model_id,
+                device,
+                image_paths,
+                num_vote_runs,
+                vlm_temperature,
+                vlm_max_new_tokens,
+                sidecar,
+            )
+        )
+        prompts = build_sam_prompts(
+            include_concepts,
+            specific_include_concepts,
+            sam_prompt_groups,
         )
         sidecar["include"] = include_concepts
+        sidecar["specific_include"] = specific_include_concepts
         sidecar["exclude"] = exclude_concepts
+        sidecar["sam_prompts"] = prompts
         print(f"==> voted include concepts: {include_concepts}", flush=True)
+        print(
+            f"==> voted specific include concepts: {specific_include_concepts}",
+            flush=True,
+        )
         print(f"==> voted exclude concepts: {exclude_concepts}", flush=True)
+        print(f"==> SAM prompts: {prompts}", flush=True)
 
-        if len(include_concepts) == 0:
+        if len(prompts) == 0:
             sidecar["failures"].append("no foreground objects detected")
             print("==> no foreground objects detected", flush=True)
             save_sidecar(sidecar_path, sidecar)
             write_qc_log(qc_log_path, sidecar)
             return
 
-        if not os.path.isdir(sam2matting_repo_dir):
-            sidecar["failures"].append(
-                f"SAM2Matting repo not found: {sam2matting_repo_dir}; skipped matting stage"
-            )
-            print(
-                f"==> SAM2Matting repo not found: {sam2matting_repo_dir}; "
-                "skipping matting stage",
-                flush=True,
-            )
-            save_sidecar(sidecar_path, sidecar)
-            write_qc_log(qc_log_path, sidecar)
-            return
-
-        eye_frames_dirs = {}
-        eye_output_dirs = {}
-        for eye in ("L", "R"):
-            eye_frames_dirs[eye] = os.path.join(work_dir, f"frames_{eye}")
-            eye_output_dirs[eye] = os.path.join(work_dir, f"sam_{eye}")
+        if sam_repo_dir is not None and sam_repo_dir not in sys.path:
+            sys.path.insert(0, sam_repo_dir)
+        predictor = create_sam_predictor(
+            sam_model_id,
+            sam_repo_dir,
+            default_sam_repo_dir,
+            sam_checkpoint_path,
+            sam_bpe_path,
+            sam_compile,
+        )
+        eye_video_paths = {
+            "L": os.path.join(work_dir, "eye_L.mp4"),
+            "R": os.path.join(work_dir, "eye_R.mp4"),
+        }
+        eye_green_paths = {
+            "L": os.path.join(work_dir, "green_L.mp4"),
+            "R": os.path.join(work_dir, "green_R.mp4"),
+        }
+        eye_alpha_paths = {
+            "L": os.path.join(work_dir, "alpha_L.mp4"),
+            "R": os.path.join(work_dir, "alpha_R.mp4"),
+        }
 
         try:
             for eye in ("L", "R"):
-                extract_eye_frames(input_video_path, eye, eye_frames_dirs[eye])
-            run_sam_matting(
-                sam2matting_launcher,
-                sam2matting_repo_dir,
-                sam_matting_script,
-                [eye_frames_dirs["L"], eye_frames_dirs["R"]],
-                include_concepts,
-                [eye_output_dirs["L"], eye_output_dirs["R"]],
-            )
+                crop_eye_video(
+                    input_video_path,
+                    eye,
+                    eye_video_paths[eye],
+                    sam_max_long_side,
+                    sam_video_crf,
+                    sam_video_preset,
+                )
+
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                for eye in ("L", "R"):
+                    eye_data = process_eye_with_sam(
+                        predictor,
+                        eye_video_paths[eye],
+                        eye_green_paths[eye],
+                        eye_alpha_paths[eye],
+                        output_dir,
+                        video_stem,
+                        eye,
+                        prompts,
+                        sam_prompt_frame_idx,
+                        fps,
+                        output_alpha_video,
+                        output_instance_videos,
+                        mask_close_kernel,
+                        mask_dilate_kernel,
+                        qc_frame_interval,
+                        qc_area_jump_threshold,
+                        greenscreen_crf,
+                        greenscreen_preset,
+                    )
+                    sidecar["eyes"][eye] = eye_data
+                    print(
+                        f"==> eye {eye}: {eye_data['max_instances']} max instances, "
+                        f"{len(eye_data['qc_flags'])} QC flags",
+                        flush=True,
+                    )
         except Exception as error:
-            sidecar["failures"].append(f"SAM2Matting crashed: {error}")
-            print(f"==> SAM2Matting crashed: {error}", flush=True)
+            sidecar["failures"].append(f"SAM 3.1 processing crashed: {error}")
+            print(f"==> SAM 3.1 processing crashed: {error}", flush=True)
             save_sidecar(sidecar_path, sidecar)
             write_qc_log(qc_log_path, sidecar)
             return
+        finally:
+            del predictor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        for eye in ("L", "R"):
-            try:
-                instance_records, qc_flags = render_eye(
-                    eye,
-                    eye_frames_dirs[eye],
-                    eye_output_dirs[eye],
-                    output_dir,
-                    video_stem,
-                    fps,
-                    qc_frame_interval,
-                    qc_area_jump_threshold,
-                )
-                sidecar["eyes"][eye] = {
-                    "instances": instance_records,
-                    "qc_flags": qc_flags,
-                }
-                print(
-                    f"==> eye {eye}: {len(instance_records)} instances, "
-                    f"{len(qc_flags)} QC flags",
-                    flush=True,
-                )
-            except Exception as error:
-                sidecar["failures"].append(f"render failed for eye {eye}: {error}")
-                sidecar["eyes"][eye] = {"instances": [], "qc_flags": []}
-                print(f"==> render failed for eye {eye}: {error}", flush=True)
+        hstack_videos(
+            eye_green_paths["L"], eye_green_paths["R"], greenscreen_path, overwrite=True
+        )
+        sidecar["outputs"]["greenscreen"] = os.path.basename(greenscreen_path)
+        print(f"==> saved greenscreen composite: {greenscreen_path}", flush=True)
 
-        try:
-            write_greenscreen_composite(
-                sidecar,
-                eye_frames_dirs,
-                eye_output_dirs,
-                output_dir,
-                video_stem,
-                fps,
-                greenscreen_crf,
-                greenscreen_preset,
+        if output_alpha_video:
+            alpha_path = os.path.join(output_dir, f"{video_stem}_alpha.mp4")
+            hstack_videos(
+                eye_alpha_paths["L"], eye_alpha_paths["R"], alpha_path, overwrite=True
             )
-        except Exception as error:
-            sidecar["failures"].append(f"greenscreen composite failed: {error}")
-            print(f"==> greenscreen composite failed: {error}", flush=True)
+            sidecar["outputs"]["alpha"] = os.path.basename(alpha_path)
+            print(f"==> saved alpha video: {alpha_path}", flush=True)
 
         save_sidecar(sidecar_path, sidecar)
         write_qc_log(qc_log_path, sidecar)
@@ -282,7 +369,7 @@ def extract_sample_frames(
                 continue
             left_frame = downscale_long_side(frame_bgr[:, :eye_width], max_long_side)
             image_path = os.path.join(frames_dir, f"sample_{order:02d}.jpg")
-            cv2.imwrite(image_path, left_frame)
+            cv2.imwrite(image_path, left_frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
             image_paths.append(image_path)
     finally:
         video.release()
@@ -422,239 +509,480 @@ def normalize_concept(phrase):
 
 def vote_concepts(run_results):
     include_representative = {}
+    specific_representative = {}
     exclude_representative = {}
     for parsed in run_results:
         if parsed is None:
             continue
-        for phrase in parsed.get("include", []):
-            if not isinstance(phrase, str):
-                continue
-            key = normalize_concept(phrase)
-            if key == "":
-                continue
-            include_representative.setdefault(key, phrase.strip())
-        for phrase in parsed.get("exclude", []):
-            if not isinstance(phrase, str):
-                continue
-            key = normalize_concept(phrase)
-            if key == "":
-                continue
-            exclude_representative.setdefault(key, phrase.strip())
+        add_concept_list(parsed.get("include", []), include_representative)
+        add_concept_list(parsed.get("specific_include", []), specific_representative)
+        scene_foreground = parsed.get("scene_foreground", None)
+        if isinstance(scene_foreground, str):
+            add_concept_list([scene_foreground], specific_representative)
+        add_concept_list(parsed.get("exclude", []), exclude_representative)
 
     include_concepts = list(include_representative.values())
+    specific_concepts = list(specific_representative.values())
     exclude_concepts = list(exclude_representative.values())
-    return include_concepts, exclude_concepts
+    return include_concepts, specific_concepts, exclude_concepts
 
 
-def render_eye(
-    eye,
-    eye_frames_dir,
-    eye_output_dir,
-    output_dir,
-    video_stem,
-    fps,
-    qc_frame_interval,
-    qc_area_jump_threshold,
+def add_concept_list(phrases, representative):
+    if not isinstance(phrases, list):
+        return
+    for phrase in phrases:
+        if not isinstance(phrase, str):
+            continue
+        key = normalize_concept(phrase)
+        if key == "":
+            continue
+        representative.setdefault(key, phrase.strip())
+
+
+def build_sam_prompts(include_concepts, specific_include_concepts, sam_prompt_groups):
+    candidates = []
+    for concept in include_concepts:
+        candidates.append(concept)
+    for concept in specific_include_concepts:
+        candidates.append(concept)
+    for concept in COMMON_FOREGROUND_CONCEPTS:
+        if prompt_matches_scene(concept, include_concepts, specific_include_concepts):
+            candidates.append(concept)
+    if len(candidates) == 0:
+        candidates.extend(COMMON_FOREGROUND_CONCEPTS[:2])
+
+    prompts = []
+    seen = set()
+    for concept in candidates:
+        key = normalize_concept(concept)
+        if key == "" or key in seen:
+            continue
+        seen.add(key)
+        prompts.append(concept.strip())
+
+    broad_prompts = [
+        "all foreground subjects and attached objects",
+        "complete foreground subject including clothing hair accessories and held objects",
+    ]
+    for prompt in reversed(broad_prompts):
+        key = normalize_concept(prompt)
+        if key not in seen:
+            prompts.insert(0, prompt)
+            seen.add(key)
+
+    if sam_prompt_groups > 0:
+        prompts = prompts[:sam_prompt_groups]
+    return prompts
+
+
+def prompt_matches_scene(concept, include_concepts, specific_include_concepts):
+    text = normalize_concept(" ".join(include_concepts + specific_include_concepts))
+    concept_key = normalize_concept(concept)
+    if concept_key in (
+        "foreground subject",
+        "all foreground object",
+        "held object",
+        "object in hand",
+    ):
+        return True
+    for word in concept_key.split(" "):
+        if len(word) >= 4 and word in text:
+            return True
+    return False
+
+
+def create_sam_predictor(
+    sam_model_id,
+    sam_repo_dir,
+    default_sam_repo_dir,
+    checkpoint_path,
+    bpe_path,
+    compiled,
 ):
-    instances = collect_instance_alpha_sequences(eye_output_dir)
-    if len(instances) == 0:
-        raise RuntimeError(f"SAM2Matting produced no instances for eye {eye}")
+    print(f"Loading SAM 3.1 model: {sam_model_id}", flush=True)
+    try:
+        from sam3.model_builder import build_sam3_video_predictor
+    except ImportError:
+        if sam_repo_dir is None:
+            sam_repo_dir = default_sam_repo_dir
+        if sam_repo_dir not in sys.path:
+            sys.path.insert(0, sam_repo_dir)
+        if bpe_path is None:
+            bpe_path = os.path.join(
+                sam_repo_dir, "sam3", "bpe_simple_vocab_16e6.txt.gz"
+            )
+        try:
+            from sam3.model_builder import build_sam3_video_predictor
+        except ImportError as error:
+            raise RuntimeError(
+                "Could not import SAM 3. Make sure facebook/sam3.1 or the local sam3 package is installed."
+            ) from error
 
-    output_mov_paths = []
-    instance_records = []
-    for instance in instances:
-        label = slugify_concept(instance["concept"])
-        filename = f"{video_stem}_{eye}_inst{instance['id']:02d}_{label}.mov"
-        output_mov_paths.append(os.path.join(output_dir, filename))
-        instance_records.append(
-            {"id": instance["id"], "concept": instance["concept"], "output": filename}
+    checkpoint_path = resolve_sam_checkpoint(sam_model_id, checkpoint_path)
+    kwargs = {
+        "gpus_to_use": [0],
+        "checkpoint_path": checkpoint_path,
+        "strict_state_dict_loading": False,
+        "bpe_path": bpe_path,
+        "apply_temporal_disambiguation": True,
+    }
+    if checkpoint_path is None:
+        kwargs["load_from_HF"] = True
+    try:
+        predictor = build_sam3_video_predictor(**kwargs)
+    except TypeError:
+        kwargs.pop("load_from_HF", None)
+        predictor = build_sam3_video_predictor(**kwargs)
+
+    if compiled:
+        trunk = predictor.model.detector.backbone.vision_backbone.trunk
+        trunk.forward = torch.compile(
+            trunk.forward,
+            mode="max-autotune",
+            fullgraph=True,
+            dynamic=False,
         )
-
-    qc_flags = render_and_qc_eye(
-        eye_frames_dir,
-        instances,
-        output_mov_paths,
-        fps,
-        qc_frame_interval,
-        qc_area_jump_threshold,
-    )
-    return instance_records, qc_flags
+    return predictor
 
 
-def extract_eye_frames(input_video_path, eye, frames_dir):
-    os.makedirs(frames_dir, exist_ok=True)
+def resolve_sam_checkpoint(sam_model_id, checkpoint_path):
+    if checkpoint_path is not None:
+        return checkpoint_path
+    if sam_model_id in (None, "", "facebook/sam3"):
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as error:
+        raise RuntimeError(
+            "huggingface_hub is required to download the requested SAM checkpoint"
+        ) from error
+    try:
+        hf_hub_download(repo_id=sam_model_id, filename="config.json")
+    except Exception:
+        pass
+    return hf_hub_download(repo_id=sam_model_id, filename="sam3.pt")
+
+
+def crop_eye_video(
+    input_video_path,
+    eye,
+    output_video_path,
+    max_long_side,
+    crf,
+    preset,
+):
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     if eye == "L":
         crop = "crop=iw/2:ih:0:0"
     else:
         crop = "crop=iw/2:ih:iw/2:0"
+    filters = [crop]
+    if max_long_side > 0:
+        filters.append(
+            f"scale='if(gt(max(iw,ih),{max_long_side}),if(gte(iw,ih),{max_long_side},-2),iw)':"
+            f"'if(gt(max(iw,ih),{max_long_side}),if(gte(iw,ih),-2,{max_long_side}),ih)'"
+        )
     command = [
         ffmpeg_path,
         "-y",
         "-i",
         input_video_path,
         "-vf",
-        crop,
-        os.path.join(frames_dir, "%06d.png"),
+        ",".join(filters),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(crf),
+        "-preset",
+        preset,
+        "-pix_fmt",
+        "yuv420p",
+        output_video_path,
     ]
     g.run_command(command)
 
 
-def run_sam_matting(
-    sam2matting_launcher,
-    sam2matting_repo_dir,
-    sam_matting_script,
-    eye_frames_dirs,
-    include_concepts,
-    eye_output_dirs,
-):
-    if not os.path.isfile(sam_matting_script):
-        raise FileNotFoundError(f"SAM matting driver not found: {sam_matting_script}")
-    for eye_output_dir in eye_output_dirs:
-        os.makedirs(eye_output_dir, exist_ok=True)
-    command = shlex.split(sam2matting_launcher) + [
-        sam_matting_script,
-        "--sam_repo_dir",
-        os.path.abspath(sam2matting_repo_dir),
-        "--video_dirs",
-        "|".join(os.path.abspath(frames_dir) for frames_dir in eye_frames_dirs),
-        "--output_dirs",
-        "|".join(os.path.abspath(output_dir) for output_dir in eye_output_dirs),
-        "--languages",
-        "|".join(include_concepts),
-        "--frame_idx",
-        "0",
-    ]
-    print(
-        "Running SAM matting:",
-        " ".join(str(part) for part in command),
-        flush=True,
-    )
-    subprocess.run([str(part) for part in command], check=True)
-
-
-def collect_instance_alpha_sequences(eye_output_dir):
-    manifest_path = os.path.join(eye_output_dir, "instances.json")
-    instances = []
-    if os.path.isfile(manifest_path):
-        with open(manifest_path, "r", encoding="utf-8") as file:
-            manifest = json.load(file)
-        for entry in manifest:
-            instance_dir = os.path.join(eye_output_dir, f"{entry['index']:03d}")
-            alpha_paths = sorted(glob.glob(os.path.join(instance_dir, "*.png")))
-            if len(alpha_paths) == 0:
-                continue
-            instances.append(
-                {
-                    "id": entry["index"],
-                    "concept": entry["concept"],
-                    "alpha_paths": alpha_paths,
-                }
-            )
-        return instances
-
-    subdirs = sorted(
-        entry
-        for entry in glob.glob(os.path.join(eye_output_dir, "*"))
-        if os.path.isdir(entry)
-    )
-    for instance_index, subdir in enumerate(subdirs):
-        alpha_paths = sorted(glob.glob(os.path.join(subdir, "*.png")))
-        if len(alpha_paths) == 0:
-            continue
-        instances.append(
-            {
-                "id": instance_index,
-                "concept": os.path.basename(subdir),
-                "alpha_paths": alpha_paths,
-            }
-        )
-    return instances
-
-
-def render_and_qc_eye(
-    eye_frames_dir,
-    instances,
-    output_mov_paths,
+def process_eye_with_sam(
+    predictor,
+    eye_video_path,
+    green_video_path,
+    alpha_video_path,
+    output_dir,
+    video_stem,
+    eye,
+    prompts,
+    prompt_frame_idx,
     fps,
+    output_alpha_video,
+    output_instance_videos,
+    mask_close_kernel,
+    mask_dilate_kernel,
     qc_frame_interval,
     qc_area_jump_threshold,
+    greenscreen_crf=18,
+    greenscreen_preset="veryfast",
 ):
-    frame_paths = sorted(glob.glob(os.path.join(eye_frames_dir, "*.png")))
-    if len(frame_paths) == 0:
-        raise RuntimeError(f"no eye frames in {eye_frames_dir}")
-    sample = cv2.imread(frame_paths[0], cv2.IMREAD_COLOR)
-    height, width = sample.shape[:2]
-
-    writers = [
-        g.RawAlphaVideoWriter(output_mov_paths[instance_index], width, height, fps)
-        for instance_index in range(len(instances))
-    ]
-    previous_areas = [None] * len(instances)
-    previous_present_count = None
-    qc_flags = []
+    video = cv2.VideoCapture(eye_video_path)
+    if not video.isOpened():
+        raise ValueError(f"Could not open cropped eye video: {eye_video_path}")
     try:
-        for frame_index, frame_path in enumerate(frame_paths):
-            frame_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frame_rgb16 = frame_rgb.astype(np.uint16) * 257
-            present_count = 0
-            current_areas = []
-            for instance_index, instance in enumerate(instances):
-                alpha = load_alpha_frame(
-                    instance["alpha_paths"], frame_index, width, height
-                )
-                area = float((alpha > 0.05).mean())
-                current_areas.append(area)
-                if area > 0.0:
-                    present_count += 1
-                alpha16 = np.round(alpha * 65535.0).clip(0, 65535).astype(np.uint16)
-                rgba = np.dstack([frame_rgb16, alpha16])
-                writers[instance_index].write(rgba)
-
-            if frame_index % qc_frame_interval == 0:
-                collect_qc_flags(
-                    frame_index,
-                    instances,
-                    current_areas,
-                    present_count,
-                    previous_areas,
-                    previous_present_count,
-                    qc_area_jump_threshold,
-                    qc_flags,
-                )
-                previous_areas = current_areas
-                previous_present_count = present_count
+        _, width, height, frame_count = get_video_properties(video)
     finally:
-        for writer in writers:
-            writer.close()
-    return qc_flags
+        video.release()
+
+    session_id = None
+    try:
+        response = predictor.handle_request(
+            dict(type="start_session", resource_path=eye_video_path)
+        )
+        session_id = response["session_id"]
+        prompt_frame_idx = min(max(int(prompt_frame_idx), 0), frame_count - 1)
+        for prompt in prompts:
+            predictor.handle_request(
+                dict(
+                    type="add_prompt",
+                    session_id=session_id,
+                    frame_index=prompt_frame_idx,
+                    text=prompt,
+                )
+            )
+
+        green_writer = g.RawVideoWriter(
+            green_video_path,
+            width,
+            height,
+            fps,
+            codec="libx264",
+            crf=greenscreen_crf,
+            preset=greenscreen_preset,
+            pixel_format="yuv420p",
+        )
+        alpha_writer = None
+        if output_alpha_video:
+            alpha_writer = g.RawVideoWriter(
+                alpha_video_path,
+                width,
+                height,
+                fps,
+                codec="libx264",
+                crf=12,
+                preset="veryfast",
+                pixel_format="yuv420p",
+            )
+
+        instance_writers = {}
+        instance_records = {}
+        previous_area = None
+        previous_present_count = None
+        max_instances = 0
+        qc_flags = []
+        current_frame_index = 0
+        video = cv2.VideoCapture(eye_video_path)
+        if not video.isOpened():
+            raise ValueError(f"Could not reopen cropped eye video: {eye_video_path}")
+
+        try:
+            for response in predictor.handle_stream_request(
+                dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    propagation_direction="forward",
+                    start_frame_index=prompt_frame_idx,
+                )
+            ):
+                frame_index = int(response["frame_index"])
+                while current_frame_index < frame_index:
+                    success, frame_bgr = video.read()
+                    if not success:
+                        break
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    empty_alpha = np.zeros((height, width), dtype=np.float32)
+                    green_writer.write(composite_green(frame_rgb, empty_alpha))
+                    if alpha_writer is not None:
+                        alpha_writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+                    current_frame_index += 1
+
+                success, frame_bgr = video.read()
+                if not success:
+                    break
+                outputs = response.get("outputs", {})
+                masks = outputs.get("out_binary_masks", None)
+                object_ids = outputs.get("out_obj_ids", [])
+                combined_alpha, present_count = combine_masks(
+                    masks,
+                    height,
+                    width,
+                    mask_close_kernel,
+                    mask_dilate_kernel,
+                )
+                max_instances = max(max_instances, present_count)
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                green_frame = composite_green(frame_rgb, combined_alpha)
+                green_writer.write(green_frame)
+                if alpha_writer is not None:
+                    alpha_u8 = (
+                        np.round(combined_alpha * 255.0).clip(0, 255).astype(np.uint8)
+                    )
+                    alpha_writer.write(cv2.cvtColor(alpha_u8, cv2.COLOR_GRAY2RGB))
+                if output_instance_videos and masks is not None:
+                    write_instance_frames(
+                        instance_writers,
+                        instance_records,
+                        output_dir,
+                        video_stem,
+                        eye,
+                        frame_rgb,
+                        masks,
+                        object_ids,
+                        width,
+                        height,
+                        fps,
+                    )
+
+                if frame_index % qc_frame_interval == 0:
+                    area = float((combined_alpha > 0.05).mean())
+                    present_count = len(object_ids) if object_ids is not None else 0
+                    collect_qc_flags(
+                        frame_index,
+                        area,
+                        present_count,
+                        previous_area,
+                        previous_present_count,
+                        qc_area_jump_threshold,
+                        qc_flags,
+                    )
+                    previous_area = area
+                    previous_present_count = present_count
+                current_frame_index += 1
+
+            while current_frame_index < frame_count:
+                success, frame_bgr = video.read()
+                if not success:
+                    break
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                empty_alpha = np.zeros((height, width), dtype=np.float32)
+                green_writer.write(composite_green(frame_rgb, empty_alpha))
+                if alpha_writer is not None:
+                    alpha_writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+                current_frame_index += 1
+        finally:
+            predictor.handle_request(dict(type="close_session", session_id=session_id))
+            session_id = None
+            video.release()
+            green_writer.close()
+            if alpha_writer is not None:
+                alpha_writer.close()
+            for writer in instance_writers.values():
+                writer.close()
+
+        return {
+            "max_instances": max_instances,
+            "instances": list(instance_records.values()),
+            "qc_flags": qc_flags,
+        }
+    finally:
+        if session_id is not None:
+            predictor.handle_request(dict(type="close_session", session_id=session_id))
 
 
-def load_alpha_frame(alpha_paths, frame_index, width, height):
-    if frame_index >= len(alpha_paths):
-        return np.zeros((height, width), dtype=np.float32)
-    alpha = cv2.imread(alpha_paths[frame_index], cv2.IMREAD_UNCHANGED)
-    if alpha is None:
-        return np.zeros((height, width), dtype=np.float32)
-    scale = 65535.0 if alpha.dtype == np.uint16 else 255.0
-    if alpha.ndim == 3:
-        if alpha.shape[2] == 4:
-            alpha = alpha[:, :, 3]
-        else:
-            alpha = cv2.cvtColor(alpha, cv2.COLOR_BGR2GRAY)
-    alpha = alpha.astype(np.float32) / scale
-    if alpha.shape[:2] != (height, width):
-        alpha = cv2.resize(alpha, (width, height), interpolation=cv2.INTER_LINEAR)
-    return np.clip(alpha, 0.0, 1.0)
+def combine_masks(masks, height, width, mask_close_kernel, mask_dilate_kernel):
+    if masks is None:
+        return np.zeros((height, width), dtype=np.float32), 0
+    masks = np.asarray(masks)
+    if masks.size == 0:
+        return np.zeros((height, width), dtype=np.float32), 0
+    if masks.ndim == 2:
+        masks = masks[None]
+    combined = np.zeros((height, width), dtype=np.uint8)
+    present_count = 0
+    for mask in masks:
+        mask_2d = np.squeeze(mask)
+        if mask_2d.ndim != 2:
+            continue
+        if mask_2d.shape[:2] != (height, width):
+            mask_2d = cv2.resize(
+                mask_2d.astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        mask_u8 = (mask_2d > 0).astype(np.uint8) * 255
+        if mask_u8.max() == 0:
+            continue
+        present_count += 1
+        combined = np.maximum(combined, mask_u8)
+
+    combined = postprocess_mask(combined, mask_close_kernel, mask_dilate_kernel)
+    return combined.astype(np.float32) / 255.0, present_count
+
+
+def postprocess_mask(mask_u8, mask_close_kernel, mask_dilate_kernel):
+    if mask_close_kernel > 1:
+        close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (mask_close_kernel, mask_close_kernel)
+        )
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, close_kernel)
+    if mask_dilate_kernel > 1:
+        dilate_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (mask_dilate_kernel, mask_dilate_kernel)
+        )
+        mask_u8 = cv2.dilate(mask_u8, dilate_kernel, iterations=1)
+    return mask_u8
+
+
+def composite_green(frame_rgb, alpha):
+    alpha = alpha[:, :, None].astype(np.float32)
+    frame = frame_rgb.astype(np.float32)
+    green = np.array([0.0, 255.0, 0.0], dtype=np.float32).reshape(1, 1, 3)
+    composite = frame * alpha + green * (1.0 - alpha)
+    return composite.clip(0, 255).astype(np.uint8)
+
+
+def write_instance_frames(
+    instance_writers,
+    instance_records,
+    output_dir,
+    video_stem,
+    eye,
+    frame_rgb,
+    masks,
+    object_ids,
+    width,
+    height,
+    fps,
+):
+    masks = np.asarray(masks)
+    for position, object_id in enumerate(object_ids):
+        object_id = int(object_id)
+        if object_id not in instance_writers:
+            output_path = os.path.join(
+                output_dir, f"{video_stem}_{eye}_obj{object_id:03d}.mov"
+            )
+            instance_writers[object_id] = g.RawAlphaVideoWriter(
+                output_path, width, height, fps
+            )
+            instance_records[object_id] = {
+                "id": object_id,
+                "concept": "SAM 3.1 object",
+                "output": os.path.basename(output_path),
+            }
+        mask = np.squeeze(masks[position])
+        if mask.shape[:2] != (height, width):
+            mask = cv2.resize(
+                mask.astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        alpha16 = (mask > 0).astype(np.uint16) * 65535
+        rgba = np.dstack([frame_rgb.astype(np.uint16) * 257, alpha16])
+        instance_writers[object_id].write(rgba)
 
 
 def collect_qc_flags(
     frame_index,
-    instances,
-    current_areas,
+    area,
     present_count,
-    previous_areas,
+    previous_area,
     previous_present_count,
     qc_area_jump_threshold,
     qc_flags,
@@ -668,94 +996,46 @@ def collect_qc_flags(
                 "to": present_count,
             }
         )
-    for instance_index, area in enumerate(current_areas):
-        previous_area = previous_areas[instance_index]
-        if previous_area is None or previous_area <= 0.0:
-            continue
-        if abs(area - previous_area) / previous_area > qc_area_jump_threshold:
-            qc_flags.append(
-                {
-                    "frame_index": frame_index,
-                    "type": "area_jump",
-                    "instance_id": instances[instance_index]["id"],
-                    "concept": instances[instance_index]["concept"],
-                    "from_area": previous_area,
-                    "to_area": area,
-                }
-            )
-
-
-def slugify_concept(concept):
-    text = re.sub(r"[^a-z0-9]+", "_", concept.strip().lower()).strip("_")
-    if text == "":
-        text = "instance"
-    return text[:40]
-
-
-def write_greenscreen_composite(
-    sidecar,
-    eye_frames_dirs,
-    eye_output_dirs,
-    output_dir,
-    video_stem,
-    fps,
-    crf,
-    preset,
-):
-    for eye in ("L", "R"):
-        if len(sidecar["eyes"].get(eye, {}).get("instances", [])) == 0:
-            print(
-                f"==> skipping greenscreen composite; eye {eye} has no instances",
-                flush=True,
-            )
-            return
-
-    left_frames = sorted(glob.glob(os.path.join(eye_frames_dirs["L"], "*.png")))
-    right_frames = sorted(glob.glob(os.path.join(eye_frames_dirs["R"], "*.png")))
-    left_instances = collect_instance_alpha_sequences(eye_output_dirs["L"])
-    right_instances = collect_instance_alpha_sequences(eye_output_dirs["R"])
-    frame_count = min(len(left_frames), len(right_frames))
-    if frame_count == 0:
+    if previous_area is None or previous_area <= 0.0:
         return
+    if abs(area - previous_area) / previous_area > qc_area_jump_threshold:
+        qc_flags.append(
+            {
+                "frame_index": frame_index,
+                "type": "combined_area_jump",
+                "from_area": previous_area,
+                "to_area": area,
+            }
+        )
 
-    sample = cv2.imread(left_frames[0], cv2.IMREAD_COLOR)
-    height, width = sample.shape[:2]
-    output_path = os.path.join(output_dir, f"{video_stem}_greenscreen.mp4")
-    writer = g.RawVideoWriter(
+
+def hstack_videos(left_path, right_path, output_path, overwrite=False):
+    if os.path.isfile(output_path) and not overwrite:
+        return
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        left_path,
+        "-i",
+        right_path,
+        "-filter_complex",
+        "[0:v][1:v]hstack=inputs=2[v]",
+        "-map",
+        "[v]",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "12",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
         output_path,
-        width * 2,
-        height,
-        fps,
-        codec="libx264",
-        crf=crf,
-        preset=preset,
-        pixel_format="yuv420p",
-    )
-    try:
-        for frame_index in range(frame_count):
-            left_green = composite_green_eye(
-                left_frames[frame_index], left_instances, frame_index, width, height
-            )
-            right_green = composite_green_eye(
-                right_frames[frame_index], right_instances, frame_index, width, height
-            )
-            writer.write(np.concatenate([left_green, right_green], axis=1))
-    finally:
-        writer.close()
-    print(f"==> saved greenscreen composite: {output_path}", flush=True)
-
-
-def composite_green_eye(frame_path, instances, frame_index, width, height):
-    frame_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-    combined_alpha = np.zeros((height, width), dtype=np.float32)
-    for instance in instances:
-        alpha = load_alpha_frame(instance["alpha_paths"], frame_index, width, height)
-        combined_alpha = np.maximum(combined_alpha, alpha)
-    combined_alpha = combined_alpha[:, :, None]
-    green = np.array([0.0, 255.0, 0.0], dtype=np.float32).reshape(1, 1, 3)
-    composite = frame_rgb * combined_alpha + green * (1.0 - combined_alpha)
-    return composite.clip(0, 255).astype(np.uint8)
+    ]
+    g.run_command(command)
 
 
 def save_sidecar(sidecar_path, sidecar):
@@ -768,7 +1048,7 @@ def write_qc_log(qc_log_path, sidecar):
     for failure in sidecar["failures"]:
         lines.append(f"FAILURE: {failure}")
     for eye, eye_data in sidecar["eyes"].items():
-        lines.append(f"eye {eye}: {len(eye_data['instances'])} instances")
+        lines.append(f"eye {eye}: {eye_data['max_instances']} max instances")
         for flag in eye_data["qc_flags"]:
             lines.append(f"  {eye} {flag}")
     with open(qc_log_path, "w", encoding="utf-8") as file:

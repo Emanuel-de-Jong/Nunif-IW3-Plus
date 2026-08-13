@@ -46,3 +46,4 @@ transformers
 qwen-vl-utils
 torchmetrics==1.9.0
 accelerate
+sam3
