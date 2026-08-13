@@ -42,3 +42,4 @@ fire
 opencv-python
 imageio
 imageio-ffmpeg
+torchmetrics==1.9.0
