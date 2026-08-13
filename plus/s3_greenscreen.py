@@ -89,6 +89,7 @@ def main(
     output_instance_videos: bool = False,
     mask_close_kernel: int = 9,
     mask_dilate_kernel: int = 3,
+    mask_border_shift: int = 0,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
@@ -147,6 +148,7 @@ def main(
         "output_instance_videos": output_instance_videos,
         "mask_close_kernel": mask_close_kernel,
         "mask_dilate_kernel": mask_dilate_kernel,
+        "mask_border_shift": mask_border_shift,
         "qc_frame_interval": qc_frame_interval,
         "qc_area_jump_threshold": qc_area_jump_threshold,
         "greenscreen_crf": greenscreen_crf,
@@ -276,6 +278,7 @@ def main(
                         output_instance_videos,
                         mask_close_kernel,
                         mask_dilate_kernel,
+                        mask_border_shift,
                         qc_frame_interval,
                         qc_area_jump_threshold,
                         greenscreen_crf,
@@ -659,6 +662,7 @@ def process_eye_with_sam(
     output_instance_videos,
     mask_close_kernel,
     mask_dilate_kernel,
+    mask_border_shift,
     qc_frame_interval,
     qc_area_jump_threshold,
     greenscreen_crf=18,
@@ -742,6 +746,7 @@ def process_eye_with_sam(
                     width,
                     mask_close_kernel,
                     mask_dilate_kernel,
+                    mask_border_shift,
                 )
                 max_instances = max(max_instances, present_count)
                 frame_rgb = video_frames[frame_index]
@@ -845,7 +850,9 @@ def tensor_to_list(value):
     return list(value)
 
 
-def combine_masks(masks, height, width, mask_close_kernel, mask_dilate_kernel):
+def combine_masks(
+    masks, height, width, mask_close_kernel, mask_dilate_kernel, mask_border_shift
+):
     if masks is None:
         return np.zeros((height, width), dtype=np.float32), 0
     masks = np.asarray(masks)
@@ -871,11 +878,13 @@ def combine_masks(masks, height, width, mask_close_kernel, mask_dilate_kernel):
         present_count += 1
         combined = np.maximum(combined, mask_u8)
 
-    combined = postprocess_mask(combined, mask_close_kernel, mask_dilate_kernel)
+    combined = postprocess_mask(
+        combined, mask_close_kernel, mask_dilate_kernel, mask_border_shift
+    )
     return combined.astype(np.float32) / 255.0, present_count
 
 
-def postprocess_mask(mask_u8, mask_close_kernel, mask_dilate_kernel):
+def postprocess_mask(mask_u8, mask_close_kernel, mask_dilate_kernel, mask_border_shift):
     if mask_close_kernel > 1:
         close_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (mask_close_kernel, mask_close_kernel)
@@ -886,6 +895,15 @@ def postprocess_mask(mask_u8, mask_close_kernel, mask_dilate_kernel):
             cv2.MORPH_ELLIPSE, (mask_dilate_kernel, mask_dilate_kernel)
         )
         mask_u8 = cv2.dilate(mask_u8, dilate_kernel, iterations=1)
+    if mask_border_shift != 0:
+        border_shift = abs(int(mask_border_shift))
+        border_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (border_shift * 2 + 1, border_shift * 2 + 1)
+        )
+        if mask_border_shift > 0:
+            mask_u8 = cv2.dilate(mask_u8, border_kernel, iterations=1)
+        else:
+            mask_u8 = cv2.erode(mask_u8, border_kernel, iterations=1)
     return mask_u8
 
 
