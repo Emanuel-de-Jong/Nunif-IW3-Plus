@@ -18,10 +18,8 @@ def main(
     sample_fps: float = 15.0,
     input_size: int = 384,
     batch_size: int = 32,
-    precision: str = "fp16",
-    device: str = "cuda",
-    window_seconds: float = 1.5,
-    threshold: float = 0.18,
+    window_seconds: float = 1.0,
+    threshold: float = 0.08,
     prominence: float = 0.025,
     persistence: int = 3,
     cooldown_seconds: float = 3.0,
@@ -64,9 +62,9 @@ def main(
     print(f"Input video FPS: {fps:.3f}", flush=True)
     print(f"Input video duration: {duration:.3f}s", flush=True)
 
-    torch_device = create_device(device)
+    torch_device = create_device("cuda")
     model, image_mean, image_std = create_siglip_model(model_name, torch_device)
-    autocast_dtype = get_autocast_dtype(precision, torch_device)
+    autocast_dtype = get_autocast_dtype("fp16", torch_device)
 
     sample_frame_indices = get_sample_frame_indices(fps, frame_count, sample_fps)
     print(
@@ -152,7 +150,6 @@ def main(
         sample_fps,
         input_size,
         batch_size,
-        precision,
         model_name,
         window_seconds,
         threshold,
@@ -847,7 +844,6 @@ def save_boundaries_json(
     sample_fps,
     input_size,
     batch_size,
-    precision,
     model_name,
     window_seconds,
     threshold,
@@ -871,7 +867,6 @@ def save_boundaries_json(
             "sample_fps": sample_fps,
             "input_size": input_size,
             "batch_size": batch_size,
-            "precision": precision,
             "model_name": model_name,
             "window_seconds": window_seconds,
             "threshold": threshold,

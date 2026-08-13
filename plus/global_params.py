@@ -104,3 +104,58 @@ class RawVideoWriter:
         return_code = self.process.wait()
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, self.process.args)
+
+
+class RawAlphaVideoWriter:
+    def __init__(
+        self,
+        output_path,
+        width,
+        height,
+        fps,
+    ):
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "4",
+            "-pix_fmt",
+            "yuva444p10le",
+            str(output_path),
+        ]
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
+
+    def write(self, frame):
+        if self.process.stdin is None:
+            raise RuntimeError("Video writer is closed")
+
+        frame = np.asarray(frame)
+        if frame.dtype != np.uint8:
+            if frame.max() <= 1.0:
+                frame = frame * 255.0
+            frame = np.clip(frame, 0.0, 255.0).astype(np.uint8)
+        frame = np.ascontiguousarray(frame)
+        self.process.stdin.write(frame.tobytes())
+
+    def close(self):
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        return_code = self.process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, self.process.args)

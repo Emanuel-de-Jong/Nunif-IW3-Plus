@@ -21,7 +21,7 @@ for video in "$INPUT_DIR"/*.{mp4,mov,avi,mkv,webm}; do
 
 	filename="$(basename "$video")"
 	basename="${filename%.*}"
-	result="$INPUT_DIR/plus/${basename}_greenscreen.mp4"
+	result="$INPUT_DIR/plus/${basename}_matte/${basename}_matte.json"
 
 	if [ -e "$result" ]; then
 		continue
