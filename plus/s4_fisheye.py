@@ -13,17 +13,13 @@ GREEN_BGR = (0, 255, 0)
 # GREEN_BGR = (64, 230, 43)
 
 
+# Always expecting a starting mapping fov of 180 degrees.
 def main(
     input_video_path: str,
     output_video_path: str = None,
     output_dir: str = None,
     fisheye_input_video_path: str = None,
     source_hfov: float = 80.0,
-    fit_mode: str = "cover",
-    fill: float = 0.75,
-    mapping_fov: float = 180.0,
-    min_mapping_fov: float = 60.0,
-    max_mapping_fov: float = 100.0,
     scale: float = 1.3,
     crf: int = 18,
     preset: str = "medium",
@@ -64,16 +60,6 @@ def main(
     if not 0 < scale <= 2:
         raise ValueError("scale must be between 0 and 2")
 
-    if not 0 < fill <= 1:
-        raise ValueError("fill must be between 0 and 1")
-
-    if fit_mode not in ("cover", "literal"):
-        raise ValueError('fit_mode must be "cover" or "literal"')
-
-    if mapping_fov is not None:
-        if not 1.0 < mapping_fov <= 180.0:
-            raise ValueError("mapping_fov must be between 1 and 180 degrees")
-
     os.makedirs(
         os.path.dirname(output_video_path) or ".",
         exist_ok=True,
@@ -91,28 +77,11 @@ def main(
     out_w = out_eye * 2
     out_h = out_eye
 
-    source_vfov = calculate_vfov(
-        source_hfov,
-        eye_w,
-        eye_h,
-    )
-
-    effective_mapping_fov = choose_mapping_fov(
-        source_hfov=source_hfov,
-        source_vfov=source_vfov,
-        fit_mode=fit_mode,
-        fill=fill,
-        explicit_mapping_fov=mapping_fov,
-        min_mapping_fov=min_mapping_fov,
-        max_mapping_fov=max_mapping_fov,
-    )
-
     map_x, map_y = make_map(
         src_w=eye_w,
         src_h=eye_h,
         out_size=out_eye,
         source_hfov=source_hfov,
-        mapping_fov=effective_mapping_fov,
         scale=scale,
     )
 
@@ -199,30 +168,7 @@ def main(
     print(f"Output:              {out_w}x{out_h}")
     print()
     print(f"Assumed source HFOV: {source_hfov:.2f}°")
-    print(f"Derived source VFOV: {source_vfov:.2f}°")
-    print(f"Fit mode:            {fit_mode}")
-    print(f"Mapping FOV:         {effective_mapping_fov:.2f}°")
     print(f"Circle scale:        {scale:.3f}")
-
-    if fit_mode == "cover" and mapping_fov is None:
-        print(f"Target fill:         {fill:.2f}")
-
-    print(f"Circle diameter:     " f"{round(out_eye * scale)} px")
-
-    horizontal_fill = min(
-        1.0,
-        source_hfov / effective_mapping_fov,
-    )
-
-    vertical_fill = min(
-        1.0,
-        source_vfov / effective_mapping_fov,
-    )
-
-    print(f"Approx H fill:       " f"{horizontal_fill * 100:.1f}% radius")
-
-    print(f"Approx V fill:       " f"{vertical_fill * 100:.1f}% radius")
-
     print()
 
     try:
@@ -368,87 +314,30 @@ def probe(path):
     return width, height, fps, frames
 
 
-def calculate_vfov(
-    hfov_degrees,
-    width,
-    height,
-):
-    hfov = math.radians(hfov_degrees)
-
-    vfov = 2.0 * math.atan((height / width) * math.tan(hfov / 2.0))
-
-    return math.degrees(vfov)
-
-
-def choose_mapping_fov(
-    source_hfov,
-    source_vfov,
-    fit_mode,
-    fill,
-    explicit_mapping_fov,
-    min_mapping_fov,
-    max_mapping_fov,
-):
-    if explicit_mapping_fov is not None:
-        return explicit_mapping_fov
-
-    if fit_mode == "literal":
-        return 180.0
-
-    narrow_fov = min(
-        source_hfov,
-        source_vfov,
-    )
-
-    calculated = narrow_fov / fill
-
-    calculated = max(
-        min_mapping_fov,
-        calculated,
-    )
-
-    calculated = min(
-        max_mapping_fov,
-        calculated,
-    )
-
-    return calculated
-
-
 def make_map(
     src_w,
     src_h,
     out_size,
     source_hfov,
-    mapping_fov,
     scale,
 ):
     source_hfov_rad = math.radians(source_hfov)
 
-    mapping_half_fov = math.radians(mapping_fov / 2.0)
-
     fx = src_w / (2.0 * math.tan(source_hfov_rad / 2.0))
-
     fy = fx
-
     src_cx = (src_w - 1) / 2.0
-
     src_cy = (src_h - 1) / 2.0
-
     center = (out_size - 1) / 2.0
-
     radius = out_size * scale / 2.0
 
     x = np.arange(
         out_size,
         dtype=np.float32,
     )
-
     y = np.arange(
         out_size,
         dtype=np.float32,
     )
-
     xx, yy = np.meshgrid(
         x,
         y,
@@ -458,10 +347,9 @@ def make_map(
     dy = yy - center
 
     r = np.sqrt(dx * dx + dy * dy)
-
     nr = r / radius
 
-    theta = nr * mapping_half_fov
+    theta = nr * (math.pi / 2.0)
 
     phi = np.arctan2(
         dy,
@@ -469,11 +357,8 @@ def make_map(
     )
 
     sin_theta = np.sin(theta)
-
     rx = sin_theta * np.cos(phi)
-
     ry = sin_theta * np.sin(phi)
-
     rz = np.cos(theta)
 
     safe_z = np.where(
@@ -483,7 +368,6 @@ def make_map(
     )
 
     map_x = src_cx + fx * rx / safe_z
-
     map_y = src_cy + fy * ry / safe_z
 
     valid = (
@@ -496,9 +380,7 @@ def make_map(
     )
 
     map_x = map_x.astype(np.float32)
-
     map_y = map_y.astype(np.float32)
-
     map_x[~valid] = -1.0
     map_y[~valid] = -1.0
 
