@@ -24,13 +24,11 @@ def main(
     video_dir = os.path.dirname(os.path.abspath(input_video_path))
     video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
     if output_dir is None:
-        output_dir = os.path.join(video_dir, "plus", f"{video_stem}_matte")
+        output_dir = os.path.join(video_dir, "plus", "tmp")
     if fisheye_input_video_path is None:
-        fisheye_input_video_path = os.path.join(
-            output_dir, f"{video_stem}_greenscreen.mp4"
-        )
+        fisheye_input_video_path = os.path.join(output_dir, f"{video_stem}_3_green.mp4")
     if output_video_path is None:
-        output_video_path = os.path.join(output_dir, f"{video_stem}_fisheye.mp4")
+        output_video_path = os.path.join(output_dir, f"{video_stem}_4_fish.mp4")
 
     if g.should_skip_output(output_video_path, overwrite):
         return

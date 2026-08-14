@@ -9,9 +9,6 @@ if [ -z "$INPUT_DIR" ]; then
 	exit 1
 fi
 
-eval "$(conda shell.bash hook)"
-conda activate nunifiw3
-
 shopt -s nullglob
 
 videos=()
@@ -21,7 +18,7 @@ for video in "$INPUT_DIR"/*.{mp4,mov,avi,mkv,webm}; do
 
 	filename="$(basename "$video")"
 	basename="${filename%.*}"
-	result="$INPUT_DIR/plus/${basename}_matte/${basename}_fisheye.mp4"
+	result="$INPUT_DIR/plus/${basename}_result.mp4"
 
 	if [ -e "$result" ]; then
 		continue
@@ -38,10 +35,7 @@ for video in "${videos[@]}"; do
 
 	printf "=== %s (%d/%d) ===\n" "$video" "$CURRENT_COUNT" "$TOTAL_COUNT"
 
-	# python -m plus.s1_scene_splits --input_video_path "$video"
-	# python -m plus.s2_upscale --input_video_path "$video"
-	python -m plus.s3_greenscreen --input_video_path "$video"
-	python -m plus.s4_fisheye --input_video_path "$video"
+	./run_plus.sh "$video"
 
 	printf "\n\n-----------------------------------\n\n"
 done

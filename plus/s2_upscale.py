@@ -21,7 +21,9 @@ def main(
     if output_video_path is None:
         video_dir = os.path.dirname(os.path.abspath(input_video_path))
         video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
-        output_video_path = os.path.join(video_dir, "plus", f"{video_stem}_upscale.mp4")
+        output_video_path = os.path.join(
+            video_dir, "plus", "tmp", f"{video_stem}_2_upscale.mp4"
+        )
 
     if g.should_skip_output(output_video_path, overwrite):
         return

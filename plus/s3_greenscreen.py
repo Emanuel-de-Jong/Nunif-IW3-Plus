@@ -16,6 +16,7 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 def main(
     input_video_path: str,
     output_dir: str = None,
+    output_video_path: str = None,
     vlm_model_id: str = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated",
     num_sampled_frames: int = 7,
     num_vote_runs: int = 2,
@@ -49,13 +50,16 @@ def main(
     video_dir = os.path.dirname(os.path.abspath(input_video_path))
     video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
     if output_dir is None:
-        output_dir = os.path.join(video_dir, "plus", f"{video_stem}_matte")
+        output_dir = os.path.join(video_dir, "plus", "tmp")
+    if output_video_path is None:
+        output_video_path = os.path.join(output_dir, f"{video_stem}_3_green.mp4")
 
-    sidecar_path = os.path.join(output_dir, f"{video_stem}_matte.json")
-    qc_log_path = os.path.join(output_dir, f"{video_stem}_qc.log")
-    greenscreen_path = os.path.join(output_dir, f"{video_stem}_greenscreen.mp4")
+    output_stem = os.path.splitext(os.path.basename(output_video_path))[0]
+    sidecar_path = os.path.join(output_dir, f"{output_stem}.json")
+    qc_log_path = os.path.join(output_dir, f"{output_stem}_qc.log")
+    greenscreen_path = output_video_path
 
-    if g.should_skip_output(sidecar_path, overwrite):
+    if g.should_skip_output(greenscreen_path, overwrite):
         return
     if not os.path.isfile(input_video_path):
         raise FileNotFoundError(f"Input video not found: {input_video_path}")
@@ -84,7 +88,7 @@ def main(
 
     eye_width = width // 2
     os.makedirs(output_dir, exist_ok=True)
-    work_dir = os.path.join(output_dir, f".{video_stem}_work")
+    work_dir = os.path.join(output_dir, f".{output_stem}_work")
     os.makedirs(work_dir, exist_ok=True)
 
     config = {
@@ -233,7 +237,7 @@ def main(
                         eye_green_paths[eye],
                         eye_alpha_paths[eye],
                         output_dir,
-                        video_stem,
+                        output_stem,
                         eye,
                         prompts,
                         sam_prompt_frame_idx,
@@ -276,7 +280,7 @@ def main(
         print(f"==> saved greenscreen composite: {greenscreen_path}", flush=True)
 
         if output_alpha_video:
-            alpha_path = os.path.join(output_dir, f"{video_stem}_alpha.mp4")
+            alpha_path = os.path.join(output_dir, f"{output_stem}_alpha.mp4")
             hstack_videos(
                 eye_alpha_paths["L"], eye_alpha_paths["R"], alpha_path, overwrite=True
             )

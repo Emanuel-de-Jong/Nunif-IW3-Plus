@@ -29,27 +29,25 @@ def main(
     copy_streams: bool = False,
     crf: int = 18,
     preset: str = "medium",
-    overwrite: bool = False,
 ):
     ignore_start_seconds = cooldown_seconds
 
     if output_dir is None:
         video_dir = os.path.dirname(os.path.abspath(input_video_path))
         video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
-        output_dir = os.path.join(video_dir, "plus")
+        output_dir = os.path.join(video_dir, "plus", "tmp")
 
     video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
-    boundaries_json_path = os.path.join(output_dir, f"{video_stem}_boundaries.json")
+    boundaries_json_path = os.path.join(
+        output_dir, f"{video_stem}_1_scene_boundaries.json"
+    )
 
-    if g.should_skip_output(boundaries_json_path, overwrite):
+    if g.should_skip_output(boundaries_json_path):
         return
     if not os.path.isfile(input_video_path):
         raise FileNotFoundError(f"Input video not found: {input_video_path}")
 
     os.makedirs(output_dir, exist_ok=True)
-    if overwrite:
-        cleanup_output_segments(output_dir, video_stem)
-
     video = cv2.VideoCapture(input_video_path)
     if not video.isOpened():
         raise ValueError(f"Could not open video: {input_video_path}")
@@ -712,7 +710,7 @@ def split_video(
     preset,
 ):
     if len(boundaries) == 0:
-        output_path = os.path.join(output_dir, f"{video_stem}_scene_000.mp4")
+        output_path = os.path.join(output_dir, f"{video_stem}_000_1_scene.mp4")
         if copy_if_no_boundaries:
             if copy_streams:
                 copy_video_streams(input_video_path, output_path)
@@ -733,7 +731,7 @@ def split_video(
 
 def split_video_copy(input_video_path, output_dir, video_stem, boundaries):
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    output_pattern = os.path.join(output_dir, f"{video_stem}_scene_%03d.mp4")
+    output_pattern = os.path.join(output_dir, f"{video_stem}_%03d_1_scene.mp4")
     segment_times = ",".join(f"{boundary['time']:.6f}" for boundary in boundaries)
     command = [
         ffmpeg_path,
@@ -782,7 +780,7 @@ def split_video_reencode(
     end_times = [float(boundary["time"]) for boundary in boundaries] + [duration]
     for segment_index, (start_time, end_time) in enumerate(zip(start_times, end_times)):
         output_path = os.path.join(
-            output_dir, f"{video_stem}_scene_{segment_index:03d}.mp4"
+            output_dir, f"{video_stem}_{segment_index:03d}_1_scene.mp4"
         )
         split_video_segment_reencode(
             input_video_path,
@@ -824,13 +822,6 @@ def split_video_segment_reencode(
         output_path,
     ]
     g.run_command(command)
-
-
-def cleanup_output_segments(output_dir, video_stem):
-    prefix = f"{video_stem}_scene_"
-    for filename in os.listdir(output_dir):
-        if filename.startswith(prefix) and filename.endswith(".mp4"):
-            os.remove(os.path.join(output_dir, filename))
 
 
 def save_boundaries_json(
