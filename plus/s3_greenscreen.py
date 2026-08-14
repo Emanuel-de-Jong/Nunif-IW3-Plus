@@ -12,60 +12,6 @@ import plus.global_params as g
 from fire import Fire
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
-SYSTEM_PROMPT = (
-    "You are a VFX foreground segmentation assistant. Respond with strict, minified JSON only. "
-    "No prose, no markdown, no code fences."
-)
-
-USER_INSTRUCTION = (
-    "The attached images are frames sampled evenly from a single continuous video "
-    "shot with a fixed cast of foreground subjects. These objects will be cut out and "
-    "placed on a different background, so decide what should and should not be "
-    "included as if you were compositing this shot for VFX. "
-    "Return JSON with exactly four keys. "
-    '"include" is a list of broad foreground concept phrases for exhaustive segmentation, '
-    'for example "person", "animal", "vehicle", "held object", "clothing", or "sports equipment". '
-    '"specific_include" is a list of specific visible foreground subjects and attached objects, '
-    'for example "the girl in the red coat", "the brown dog", "the black backpack", '
-    '"the phone in her hand", "the bicycle", or "the sword". '
-    '"exclude" is a list of things that must NOT be included, and it must always be '
-    "populated: actively reason about cast or contact shadows, reflections, translucent or "
-    "particle effects, sky, floor, walls, furniture, and background scenery. "
-    "Be very thorough. Include small objects, body parts, hair, clothing, accessories, "
-    "held items, objects touching the main subject, pets, vehicles, and tools when they "
-    "move with or belong to the foreground. Prefer concepts that keep touching foreground "
-    "objects connected instead of splitting them apart."
-)
-
-COMMON_FOREGROUND_CONCEPTS = [
-    # "person",
-    # "people",
-    # "human",
-    # "hair",
-    # "face",
-    # "hand",
-    # "clothing",
-    # "shoe",
-    # "hat",
-    # "helmet",
-    # "glasses",
-    # "bag",
-    # "backpack",
-    # "held object",
-    # "object in hand",
-    # "tool",
-    # "phone",
-    # "sports equipment",
-    # "instrument",
-    # "animal",
-    # "pet",
-    # "dog",
-    # "cat",
-    # "vehicle",
-    # "bicycle",
-    # "motorcycle",
-]
-
 
 def main(
     input_video_path: str,
@@ -123,6 +69,17 @@ def main(
         video.release()
     if width % 2 != 0:
         raise ValueError(f"SBS video width must be even, got: {width}")
+
+    qwen_prompts_file = g.PLUS_DIR / "greenscreen_prompts.json"
+    if not qwen_prompts_file.exists():
+        print("greenscreen_prompts.json couldn't be found!.")
+        print(
+            "Make a copy of plus/greenscreen_prompts_example.json and name it greenscreen_prompts.json."
+        )
+        print("Exiting...")
+        return
+
+    qwen_prompts = json.load(qwen_prompts_file)
 
     eye_width = width // 2
     os.makedirs(output_dir, exist_ok=True)
@@ -207,12 +164,14 @@ def main(
                 vlm_temperature,
                 vlm_max_new_tokens,
                 sidecar,
+                qwen_prompts,
             )
         )
         prompts = build_sam_prompts(
             include_concepts,
             specific_include_concepts,
             sam_prompt_groups,
+            qwen_prompts,
         )
         sidecar["include"] = include_concepts
         sidecar["specific_include"] = specific_include_concepts
@@ -239,6 +198,7 @@ def main(
             sam_checkpoint_path,
             sam_bpe_path,
             sam_compile,
+            qwen_prompts,
         )
         eye_video_paths = {
             "L": os.path.join(work_dir, "eye_L.mp4"),
@@ -392,9 +352,10 @@ def identify_foreground(
     vlm_temperature,
     vlm_max_new_tokens,
     sidecar,
+    qwen_prompts,
 ):
     model, processor = create_vlm(vlm_model_id, device)
-    messages = build_vlm_messages(image_paths)
+    messages = build_vlm_messages(image_paths, qwen_prompts)
     run_results = []
     try:
         for run_index in range(num_vote_runs):
@@ -434,11 +395,11 @@ def create_vlm(vlm_model_id, device):
     return model, processor
 
 
-def build_vlm_messages(image_paths):
+def build_vlm_messages(image_paths, qwen_prompts):
     content = [{"type": "image", "image": image_path} for image_path in image_paths]
-    content.append({"type": "text", "text": USER_INSTRUCTION})
+    content.append({"type": "text", "text": qwen_prompts["user_instruction"]})
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": qwen_prompts["system_prompt"]},
         {"role": "user", "content": content},
     ]
 
@@ -537,17 +498,19 @@ def add_concept_list(phrases, representative):
         representative.setdefault(key, phrase.strip())
 
 
-def build_sam_prompts(include_concepts, specific_include_concepts, sam_prompt_groups):
+def build_sam_prompts(
+    include_concepts, specific_include_concepts, sam_prompt_groups, qwen_prompts
+):
     candidates = []
     for concept in include_concepts:
         candidates.append(concept)
     for concept in specific_include_concepts:
         candidates.append(concept)
-    for concept in COMMON_FOREGROUND_CONCEPTS:
+    for concept in qwen_prompts["common_concepts"]:
         if prompt_matches_scene(concept, include_concepts, specific_include_concepts):
             candidates.append(concept)
     if len(candidates) == 0:
-        candidates.extend(COMMON_FOREGROUND_CONCEPTS[:2])
+        candidates.extend(qwen_prompts["common_concepts"][:2])
 
     prompts = []
     seen = set()
@@ -595,6 +558,7 @@ def create_sam_predictor(
     checkpoint_path,
     bpe_path,
     compiled,
+    qwen_prompts,
 ):
     print(f"Loading SAM 3 model: {sam_model_id}", flush=True)
     from transformers import Sam3VideoModel, Sam3VideoProcessor

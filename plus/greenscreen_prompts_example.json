@@ -1,0 +1,32 @@
+{
+    "system_prompt": "You are a VFX foreground segmentation assistant. Respond with strict, minified JSON only. No prose, no markdown, no code fences.",
+    "user_instruction": "The attached images are frames sampled evenly from a single continuous video shot with a fixed cast of foreground subjects. These objects will be cut out and placed on a different background, so decide what should and should not be included as if you were compositing this shot for VFX. Return JSON with exactly four keys. \"include\" is a list of broad foreground concept phrases for exhaustive segmentation, for example \"person\", \"animal\", \"vehicle\", \"held object\", \"clothing\", or \"sports equipment\". \"specific_include\" is a list of specific visible foreground subjects and attached objects, for example \"the girl in the red coat\", \"the brown dog\", \"the black backpack\", \"the phone in her hand\", \"the bicycle\", or \"the sword\". \"exclude\" is a list of things that must NOT be included, and it must always be populated: actively reason about cast or contact shadows, reflections, translucent or particle effects, sky, floor, walls, furniture, and background scenery. Be very thorough. Include small objects, body parts, hair, clothing, accessories, held items, objects touching the main subject, pets, vehicles, and tools when they move with or belong to the foreground. Prefer concepts that keep touching foreground objects connected instead of splitting them apart.",
+    "common_concepts": [
+        "person",
+        "people",
+        "human",
+        "hair",
+        "face",
+        "hand",
+        "clothing",
+        "shoe",
+        "hat",
+        "helmet",
+        "glasses",
+        "bag",
+        "backpack",
+        "held object",
+        "object in hand",
+        "tool",
+        "phone",
+        "sports equipment",
+        "instrument",
+        "animal",
+        "pet",
+        "dog",
+        "cat",
+        "vehicle",
+        "bicycle",
+        "motorcycle"
+    ]
+}
