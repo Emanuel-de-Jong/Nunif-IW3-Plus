@@ -3,10 +3,15 @@ import cv2
 from fire import Fire
 from pathlib import Path
 
+MIN_DURATION_SECONDS = 5
 MAX_DURATION_SECONDS = 120 + 5
+
+MIN_RESOLUTION = 700
 # Compare to the videos biggest side (width or height)
 MAX_RESOLUTION = 3840
-# Look at the average fps or something, not the peak
+
+MIN_FPS = 24 - 3
+# Look at the average fps, not the peak
 MAX_FPS = 60 + 5
 
 
@@ -25,6 +30,7 @@ def main(path: str):
         video_paths.append(video_path)
 
     total_videos = len(video_paths)
+
     for idx, video_path in enumerate(video_paths):
         video = cv2.VideoCapture(str(video_path))
         if not video.isOpened():
@@ -39,9 +45,13 @@ def main(path: str):
 
         video.release()
 
-        is_duration_in_range = duration <= MAX_DURATION_SECONDS
-        is_res_in_range = max(width, height) <= MAX_RESOLUTION
-        is_fps_in_range = fps <= MAX_FPS
+        is_duration_in_range = MIN_DURATION_SECONDS <= duration <= MAX_DURATION_SECONDS
+        is_res_in_range = (
+            min(width, height) >= MIN_RESOLUTION
+            and max(width, height) <= MAX_RESOLUTION
+        )
+        is_fps_in_range = MIN_FPS <= fps <= MAX_FPS
+
         should_include = is_duration_in_range and is_res_in_range and is_fps_in_range
 
         destination = include_dir_path if should_include else exclude_dir_path
@@ -60,7 +70,7 @@ def main(path: str):
             elif not is_fps_in_range:
                 status_str += "fps"
 
-        print(f"({idx+1}/{total_videos}) [{status_str}] {video_path.name}")
+        print(f"({idx + 1}/{total_videos}) [{status_str}] {video_path.name}")
 
     print("\nSplitting done!")
 
