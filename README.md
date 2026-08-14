@@ -65,6 +65,12 @@ Use `hf auth login` or set `HF_TOKEN`. The Qwen3-VL and SAM3 models are download
 
 Copy `plus/greenscreen_prompts_example.json` to `plus/greenscreen_prompts.json` before using greenscreening. You can edit that file to change the VLM prompt and common foreground concepts.
 
+`greenscreen_prompts.json` has three keys:
+
+- `system_prompt`: Sets the VLM's role and output format. Keep this short and strict so the response remains valid JSON that the greenscreen step can parse. Only change it if you need to alter the response format or the model's overall behavior.
+- `user_instruction`: Describes how the VLM should decide what belongs in the foreground. Use it to tune the compositing rules for your footage, such as whether attached objects, shadows, reflections, or certain scene elements should be included. Be explicit about what to include and exclude, and preserve the requirement to return the expected `include`, `specific_include`, and `exclude` lists.
+- `common_concepts`: A list of broad foreground concepts that are always available as segmentation prompts. Add recurring subjects in your videos, such as a particular type of prop, clothing, animal, or vehicle. Prefer simple, recognizable concepts. Remove concepts that repeatedly cause unrelated background objects to be selected.
+
 If you enable the upscaling step in `run_plus.sh`, put the [Video2X AppImage](https://github.com/k4yt3x/video2x/releases/tag/6.4.0) at `plus/Video2X/Video2X-x86_64.AppImage`. The default upscaler uses RealESRGAN 2x and skips upscaling when the result would exceed the configured maximum size.
 
 - [INSTALL-ubuntu](INSTALL-ubuntu.md)
@@ -121,7 +127,7 @@ This step detects large visual changes and splits the input video into separate 
 | Argument | Default | What it does |
 |----------|---------|--------------|
 | `--cooldown_seconds` | `3.0` | Minimum time between detected cuts. Also avoids detecting cuts right at the start. |
-| `--threshold` | `0.08` | Main sensitivity for detecting a cut. Lower values split more often; higher values split less often. |
+| `--threshold` | `0.08` | Main sensitivity for detecting a cut. Lower values split more often. Higher values split less often. |
 | `--prominence` | `0.025` | Requires a cut candidate to stand out from nearby frames. Higher values ignore weaker transitions. |
 | `--persistence` | `3` | Number of consecutive samples that must look like a boundary. Higher values reduce false positives. |
 | `--refine_seconds` / `--refine_window_seconds` | `1.0` / `0.20` | Searches around the coarse cut to place the final split closer to the real boundary. |
@@ -144,13 +150,13 @@ This step asks Qwen VL what objects are in the foreground, uses SAM3 to track th
 |----------|---------|--------------|
 | `--num_sampled_frames` | `7` | Number of frames shown to the VLM. More frames can improve prompt quality when the shot changes, but use more VRAM/time. |
 | `--num_vote_runs` | `2` | Runs the VLM multiple times and votes on concepts. Higher values can make prompts more stable, but are slower. |
-| `--vlm_temperature` | `0.2` | Randomness for VLM answers. Lower values are more deterministic; higher values can produce more varied guesses. |
+| `--vlm_temperature` | `0.2` | Randomness for VLM answers. Lower values are more deterministic. Higher values can produce more varied guesses. |
 | `--vlm_max_long_side` | `1024` | Maximum size of sampled frames sent to the VLM. Lower values use less VRAM, but may miss small objects. |
 | `--sam_prompt_groups` | `6` | Maximum number of prompt groups sent to SAM. Higher values can include more object concepts, but can also add unwanted masks. |
-| `--sam_max_long_side` | `0` | Optional size limit for SAM processing. `0` keeps the current size; lower values can reduce VRAM use. |
+| `--sam_max_long_side` | `0` | Optional size limit for SAM processing. `0` keeps the current size. Lower values can reduce VRAM use. |
 | `--sam_mask_close_kernel` | `9` | Fills small holes/gaps in the mask. Higher values make masks smoother but can merge nearby areas. |
 | `--sam_mask_dilate_kernel` | `3` | Expands the mask edge. Higher values keep more border pixels around the foreground. |
-| `--sam_mask_border_shift` | `0` | Shrinks or expands the final mask edge. Negative values shrink it; positive values expand it. |
+| `--sam_mask_border_shift` | `0` | Shrinks or expands the final mask edge. Negative values shrink it. Positive values expand it. |
 | `--sam_mask_overlap_gap_fill` | `50` | Fills gaps between overlapping/nearby SAM instance masks. Higher values connect masks more aggressively. |
 | `--depth_foreground_threshold` / `--depth_mask_border_shift` | `0.2` / `-10` | Uses the IW3 depth layout as an extra foreground hint. The border shift trims or expands that depth mask. |
 
@@ -161,7 +167,7 @@ This step remaps each SBS eye into a fisheye-style square view and copies audio 
 | Argument | Default | What it does |
 |----------|---------|--------------|
 | `--source_hfov` | `80.0` | Assumed horizontal field of view of the source video, in degrees. This changes how strongly the image is warped. |
-| `--scale` | `1.3` | Size of the fisheye circle in the output. Higher values zoom in; lower values show more of the circle. |
+| `--scale` | `1.3` | Size of the fisheye circle in the output. Higher values zoom in. Lower values show more of the circle. |
 | `--expand` | `True` | Allows the step to increase output resolution so the fisheye circle keeps more detail. |
 | `--expand_max_eye_size` | `4320` | Maximum per-eye output size when `--expand` is enabled. |
 
