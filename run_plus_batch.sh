@@ -28,10 +28,15 @@ for video in "$INPUT_DIR"/*.{mp4,mov,avi,mkv,webm}; do
 done
 
 TOTAL_COUNT=${#videos[@]}
+if (( TOTAL_COUNT == 0 )); then
+	echo "No unprocessed videos found in: $INPUT_DIR"
+	exit 0
+fi
+
 CURRENT_COUNT=0
 
 for video in "${videos[@]}"; do
-	((CURRENT_COUNT++))
+	((++CURRENT_COUNT))
 
 	printf "=== %s (%d/%d) ===\n" "$video" "$CURRENT_COUNT" "$TOTAL_COUNT"
 
