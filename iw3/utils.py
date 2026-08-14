@@ -1,6 +1,7 @@
 import sys
 import traceback
 import os
+import subprocess
 from os import path
 import warnings
 import numpy as np
@@ -1184,12 +1185,12 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
             # --skip-error and already terminated with an error
             (args.skip_error and path.exists(VU.make_error_file_path(output_filename)))
     ):
-        return  # skip
+        return None  # skip
 
     if not args.yes and path.exists(output_filename):
         y = input(f"File '{output_filename}' already exists. Overwrite? [y/N]").lower()
         if y not in {"y", "ye", "yes"}:
-            return
+            return None
 
     make_parent_dir(output_filename)
     if args.scene_detect or args.scene_detect_only:
@@ -1214,12 +1215,12 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
                 )
                 save_scene_cache(input_filename, segment_pts, args)
                 if args.state["stop_event"] is not None and args.state["stop_event"].is_set():
-                    return
+                    return None
             gc_collect()
     else:
         segment_pts = set()
     if args.scene_detect_only:
-        return
+        return None
 
     if args.autocrop is not None:
         crop = AutoCrop.from_video_file(
@@ -1348,6 +1349,11 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
         finally:
             frame_callback.shutdown()
 
+    if args.state["stop_event"] is not None and args.state["stop_event"].is_set():
+        return None
+
+    return output_filename
+
 
 def process_video_keyframes(input_filename, output_path, args, depth_model, side_model):
     assert depth_model.get_name() not in {"VideoDepthAnything", "VideoDepthAnythingStreaming"}
@@ -1410,6 +1416,7 @@ def process_video(input_filename, output_path, args, depth_model, side_model):
     # disable ema minmax for each process
     depth_model.reset()
     depth_model.disable_ema()
+    output_filename = None
 
     if args.keyframe:
         if side_model is not None and hasattr(side_model, "set_mode"):
@@ -1426,7 +1433,20 @@ def process_video(input_filename, output_path, args, depth_model, side_model):
         if args.state["convergence_model"] is not None:
             args.state["convergence_model"].reset(enable_ema=True)
 
-        process_video_full(input_filename, output_path, args, depth_model, side_model)
+        output_filename = process_video_full(input_filename, output_path, args, depth_model, side_model)
+
+    if args.plus and output_filename is not None:
+        run_plus(output_filename, args)
+
+
+def run_plus(output_filename, args):
+    plus_callback = args.state.get("plus_callback")
+    if plus_callback is not None:
+        plus_callback(output_filename)
+
+    root_dir = path.abspath(path.join(path.dirname(__file__), ".."))
+    script_path = path.join(root_dir, "run_plus.sh")
+    subprocess.run(["bash", script_path, output_filename], cwd=root_dir, check=True)
 
 
 def export_images(input_path, output_dir, args, title=None):
@@ -2457,6 +2477,7 @@ def create_parser(required_true=True):
 
     parser.add_argument("--metadata", type=str, nargs="?", default=None, const="filename", choices=["filename"],
                         help="Add metadata")
+    parser.add_argument("--plus", action="store_true", help="Run Plus after video conversion")
     parser.add_argument("--find-param", type=str, nargs="+",
                         choices=["divergence", "convergence", "foreground-scale", "ipd-offset"],
                         help="outputs results for various parameter combinations")
@@ -2486,7 +2507,7 @@ def calc_auto_warp_steps(method, divergence, synthetic_view):
     return None
 
 
-def set_state_args(args, stop_event=None, tqdm_fn=None, depth_model=None, suspend_event=None):
+def set_state_args(args, stop_event=None, tqdm_fn=None, depth_model=None, suspend_event=None, plus_callback=None):
     if depth_model is None:
         depth_model = create_depth_model(args.depth_model)
 
@@ -2539,6 +2560,7 @@ def set_state_args(args, stop_event=None, tqdm_fn=None, depth_model=None, suspen
         "stop_event": stop_event,
         "suspend_event": suspend_event,
         "tqdm_fn": tqdm_fn,
+        "plus_callback": plus_callback,
         "depth_model": depth_model,
         "convergence_model": convergence_model,
         "device": create_device(args.gpu),

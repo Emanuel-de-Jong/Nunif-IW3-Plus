@@ -35,15 +35,16 @@ def main(
     sam_compile: bool = False,
     output_alpha_video: bool = True,
     output_instance_videos: bool = False,
-    mask_close_kernel: int = 9,
-    mask_dilate_kernel: int = 3,
-    mask_border_shift: int = 0,
-    mask_overlap_gap_fill: int = 50,
+    sam_mask_close_kernel: int = 9,
+    sam_mask_dilate_kernel: int = 3,
+    sam_mask_border_shift: int = 0,
+    sam_mask_overlap_gap_fill: int = 50,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
     greenscreen_preset: str = "medium",
-    depth_foreground_threshold: float = 0.05,
+    depth_foreground_threshold: float = 0.2,
+    depth_mask_border_shift: int = -10,
     overwrite: bool = False,
 ):
     device = "cuda"
@@ -111,15 +112,16 @@ def main(
         "sam_compile": sam_compile,
         "output_alpha_video": output_alpha_video,
         "output_instance_videos": output_instance_videos,
-        "mask_close_kernel": mask_close_kernel,
-        "mask_dilate_kernel": mask_dilate_kernel,
-        "mask_border_shift": mask_border_shift,
-        "mask_overlap_gap_fill": mask_overlap_gap_fill,
+        "sam_mask_close_kernel": sam_mask_close_kernel,
+        "sam_mask_dilate_kernel": sam_mask_dilate_kernel,
+        "sam_mask_border_shift": sam_mask_border_shift,
+        "sam_mask_overlap_gap_fill": sam_mask_overlap_gap_fill,
         "qc_frame_interval": qc_frame_interval,
         "qc_area_jump_threshold": qc_area_jump_threshold,
         "greenscreen_crf": greenscreen_crf,
         "greenscreen_preset": greenscreen_preset,
         "depth_foreground_threshold": depth_foreground_threshold,
+        "depth_mask_border_shift": depth_mask_border_shift,
         "device": device,
     }
     sidecar = {
@@ -266,16 +268,17 @@ def main(
                             fps,
                             output_alpha_video,
                             output_instance_videos,
-                            mask_close_kernel,
-                            mask_dilate_kernel,
-                            mask_border_shift,
-                            mask_overlap_gap_fill,
+                            sam_mask_close_kernel,
+                            sam_mask_dilate_kernel,
+                            sam_mask_border_shift,
+                            sam_mask_overlap_gap_fill,
                             qc_frame_interval,
                             qc_area_jump_threshold,
                             greenscreen_crf,
                             greenscreen_preset,
                             eye_depth_masks.get(eye),
                             depth_foreground_threshold,
+                            depth_mask_border_shift,
                         )
                         sidecar["eyes"][eye] = eye_data
                         print(
@@ -608,7 +611,13 @@ def compute_eye_depth_masks(depth_model, eye_video_path, depth_foreground_thresh
 
 
 def apply_depth_mask(
-    alpha, depth_masks, frame_index, height, width, depth_foreground_threshold
+    alpha,
+    depth_masks,
+    frame_index,
+    height,
+    width,
+    depth_foreground_threshold,
+    depth_mask_border_shift=0,
 ):
     if (
         depth_foreground_threshold <= 0
@@ -616,7 +625,17 @@ def apply_depth_mask(
         or frame_index >= len(depth_masks)
     ):
         return alpha
-    return np.maximum(alpha, depth_masks[frame_index].astype(np.float32))
+    mask = depth_masks[frame_index]
+    if depth_mask_border_shift != 0:
+        shift = abs(int(depth_mask_border_shift))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (shift * 2 + 1, shift * 2 + 1)
+        )
+        if depth_mask_border_shift > 0:
+            mask = cv2.dilate(mask, kernel, iterations=1)
+        else:
+            mask = cv2.erode(mask, kernel, iterations=1)
+    return np.maximum(alpha, mask.astype(np.float32))
 
 
 def create_sam_predictor(
@@ -697,16 +716,17 @@ def process_eye_with_sam(
     fps,
     output_alpha_video,
     output_instance_videos,
-    mask_close_kernel,
-    mask_dilate_kernel,
-    mask_border_shift,
-    mask_overlap_gap_fill,
+    sam_mask_close_kernel,
+    sam_mask_dilate_kernel,
+    sam_mask_border_shift,
+    sam_mask_overlap_gap_fill,
     qc_frame_interval,
     qc_area_jump_threshold,
     greenscreen_crf=18,
     greenscreen_preset="veryfast",
     depth_masks=None,
     depth_foreground_threshold=0.0,
+    depth_mask_border_shift=0,
 ):
     video_frames, width, height, frame_count = load_video_frames(eye_video_path)
     model = predictor["model"]
@@ -775,6 +795,7 @@ def process_eye_with_sam(
                         height,
                         width,
                         depth_foreground_threshold,
+                        depth_mask_border_shift,
                     )
                     green_writer.write(composite_green(frame_rgb, empty_alpha))
                     if alpha_writer is not None:
@@ -794,10 +815,10 @@ def process_eye_with_sam(
                     masks,
                     height,
                     width,
-                    mask_close_kernel,
-                    mask_dilate_kernel,
-                    mask_border_shift,
-                    mask_overlap_gap_fill,
+                    sam_mask_close_kernel,
+                    sam_mask_dilate_kernel,
+                    sam_mask_border_shift,
+                    sam_mask_overlap_gap_fill,
                 )
                 combined_alpha = apply_depth_mask(
                     combined_alpha,
@@ -806,6 +827,7 @@ def process_eye_with_sam(
                     height,
                     width,
                     depth_foreground_threshold,
+                    depth_mask_border_shift,
                 )
                 max_instances = max(max_instances, present_count)
                 frame_rgb = video_frames[frame_index]
@@ -856,6 +878,7 @@ def process_eye_with_sam(
                     height,
                     width,
                     depth_foreground_threshold,
+                    depth_mask_border_shift,
                 )
                 green_writer.write(composite_green(frame_rgb, empty_alpha))
                 if alpha_writer is not None:
@@ -923,10 +946,10 @@ def combine_masks(
     masks,
     height,
     width,
-    mask_close_kernel,
-    mask_dilate_kernel,
-    mask_border_shift,
-    mask_overlap_gap_fill,
+    sam_mask_close_kernel,
+    sam_mask_dilate_kernel,
+    sam_mask_border_shift,
+    sam_mask_overlap_gap_fill,
 ):
     if masks is None:
         return np.zeros((height, width), dtype=np.float32), 0
@@ -955,18 +978,18 @@ def combine_masks(
         instance_masks.append(mask_u8)
         combined = np.maximum(combined, mask_u8)
 
-    combined = fill_overlap_gaps(combined, instance_masks, mask_overlap_gap_fill)
+    combined = fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill)
     combined = postprocess_mask(
-        combined, mask_close_kernel, mask_dilate_kernel, mask_border_shift
+        combined, sam_mask_close_kernel, sam_mask_dilate_kernel, sam_mask_border_shift
     )
     return combined.astype(np.float32) / 255.0, present_count
 
 
-def fill_overlap_gaps(combined, instance_masks, mask_overlap_gap_fill):
-    if mask_overlap_gap_fill <= 0 or len(instance_masks) < 2:
+def fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill):
+    if sam_mask_overlap_gap_fill <= 0 or len(instance_masks) < 2:
         return combined
 
-    kernel_size = int(mask_overlap_gap_fill) * 2 + 1
+    kernel_size = int(sam_mask_overlap_gap_fill) * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     overlap_count = np.zeros(combined.shape, dtype=np.uint16)
     for instance_mask in instance_masks:
@@ -981,23 +1004,25 @@ def fill_overlap_gaps(combined, instance_masks, mask_overlap_gap_fill):
     return combined
 
 
-def postprocess_mask(mask_u8, mask_close_kernel, mask_dilate_kernel, mask_border_shift):
-    if mask_close_kernel > 1:
+def postprocess_mask(
+    mask_u8, sam_mask_close_kernel, sam_mask_dilate_kernel, sam_mask_border_shift
+):
+    if sam_mask_close_kernel > 1:
         close_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (mask_close_kernel, mask_close_kernel)
+            cv2.MORPH_ELLIPSE, (sam_mask_close_kernel, sam_mask_close_kernel)
         )
         mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, close_kernel)
-    if mask_dilate_kernel > 1:
+    if sam_mask_dilate_kernel > 1:
         dilate_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (mask_dilate_kernel, mask_dilate_kernel)
+            cv2.MORPH_ELLIPSE, (sam_mask_dilate_kernel, sam_mask_dilate_kernel)
         )
         mask_u8 = cv2.dilate(mask_u8, dilate_kernel, iterations=1)
-    if mask_border_shift != 0:
-        border_shift = abs(int(mask_border_shift))
+    if sam_mask_border_shift != 0:
+        border_shift = abs(int(sam_mask_border_shift))
         border_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (border_shift * 2 + 1, border_shift * 2 + 1)
         )
-        if mask_border_shift > 0:
+        if sam_mask_border_shift > 0:
             mask_u8 = cv2.dilate(mask_u8, border_kernel, iterations=1)
         else:
             mask_u8 = cv2.erode(mask_u8, border_kernel, iterations=1)

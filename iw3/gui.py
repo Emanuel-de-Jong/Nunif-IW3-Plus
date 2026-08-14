@@ -175,6 +175,9 @@ class MainFrame(wx.Frame):
                                         name="chk_metadata")
         self.chk_metadata.SetValue(False)
 
+        self.chk_plus = wx.CheckBox(self.pnl_file_option, label=T("Enable Plus"), name="chk_plus")
+        self.chk_plus.SetValue(True)
+
         self.sep_image_format = wx.StaticLine(self.pnl_file_option, size=self.FromDIP((2, 16)), style=wx.LI_VERTICAL)
         self.lbl_image_format = wx.StaticText(self.pnl_file_option, label=" " + T("Image Format"))
         self.cbo_image_format = wx.ComboBox(self.pnl_file_option, choices=["png", "jpeg", "webp"],
@@ -191,6 +194,7 @@ class MainFrame(wx.Frame):
         layout.Add(self.sep_batch_options, flag=wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.chk_exif_transpose, flag=wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.chk_metadata, flag=wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.chk_plus, flag=wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.sep_image_format, flag=wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.lbl_image_format, flag=wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.cbo_image_format, flag=wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL)
@@ -1306,6 +1310,7 @@ class MainFrame(wx.Frame):
             ema_options = {}
 
         metadata = "filename" if self.chk_metadata.GetValue() else None
+        plus = self.chk_plus.GetValue()
         preserve_screen_border = self.chk_preserve_screen_border.IsEnabled() and self.chk_preserve_screen_border.IsChecked()
         scene_detect = self.chk_scene_detect.IsChecked()
         disable_scene_cache = not self.chk_scene_detect_cache.IsChecked()
@@ -1392,6 +1397,7 @@ class MainFrame(wx.Frame):
             recursive=recursive,
             skip_error=skip_error,
             metadata=metadata,
+            plus=plus,
             start_time=start_time,
             end_time=end_time,
         )
@@ -1402,6 +1408,7 @@ class MainFrame(wx.Frame):
                 stop_event=self.stop_event,
                 suspend_event=self.suspend_event,
                 tqdm_fn=functools.partial(TQDMGUI, self),
+                plus_callback=self.on_plus_started,
                 depth_model=self.depth_model)
         return args
 
@@ -1510,6 +1517,14 @@ class MainFrame(wx.Frame):
         elif type == 2:
             # close
             pass
+
+    def on_plus_started(self, output_filename):
+        wx.CallAfter(self.update_plus_progress, output_filename)
+
+    def update_plus_progress(self, output_filename):
+        self.prg_tqdm.SetRange(100)
+        self.prg_tqdm.SetValue(75)
+        self.SetStatusText(f"75/100 Running Plus: {path.basename(output_filename)}")
 
     def save_preset(self, name=None):
         if not name:
