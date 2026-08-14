@@ -70,8 +70,8 @@ def main(
     if width % 2 != 0:
         raise ValueError(f"SBS video width must be even, got: {width}")
 
-    qwen_prompts_file = g.PLUS_DIR / "greenscreen_prompts.json"
-    if not qwen_prompts_file.exists():
+    qwen_prompts_path = g.PLUS_DIR / "greenscreen_prompts.json"
+    if not qwen_prompts_path.exists():
         print("greenscreen_prompts.json couldn't be found!.")
         print(
             "Make a copy of plus/greenscreen_prompts_example.json and name it greenscreen_prompts.json."
@@ -79,7 +79,8 @@ def main(
         print("Exiting...")
         return
 
-    qwen_prompts = json.load(qwen_prompts_file)
+    with open(qwen_prompts_path, "r", encoding="utf-8") as qwen_prompts_file:
+        qwen_prompts = json.load(qwen_prompts_file)
 
     eye_width = width // 2
     os.makedirs(output_dir, exist_ok=True)

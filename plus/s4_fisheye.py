@@ -1,4 +1,3 @@
-import argparse
 import json
 import math
 import os
@@ -7,41 +6,53 @@ import sys
 
 import cv2
 import numpy as np
+import plus.global_params as g
+from fire import Fire
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def main(
+    input_video_path: str,
+    output_video_path: str = None,
+    output_dir: str = None,
+    fisheye_input_video_path: str = None,
+    fov: float = 80,
+    scale: float = 0.92,
+    crf: int = 18,
+    preset: str = "medium",
+    overwrite: bool = False,
+):
+    video_dir = os.path.dirname(os.path.abspath(input_video_path))
+    video_stem = os.path.splitext(os.path.basename(input_video_path))[0]
+    if output_dir is None:
+        output_dir = os.path.join(video_dir, "plus", f"{video_stem}_matte")
+    if fisheye_input_video_path is None:
+        fisheye_input_video_path = os.path.join(
+            output_dir, f"{video_stem}_greenscreen.mp4"
+        )
+    if output_video_path is None:
+        output_video_path = os.path.join(output_dir, f"{video_stem}_fisheye.mp4")
 
-    parser.add_argument("input")
-    parser.add_argument("output")
+    if g.should_skip_output(output_video_path, overwrite):
+        return
+    if not os.path.isfile(input_video_path):
+        raise FileNotFoundError(f"Input video not found: {input_video_path}")
+    if not os.path.isfile(fisheye_input_video_path):
+        raise FileNotFoundError(
+            f"Fisheye input video not found: {fisheye_input_video_path}"
+        )
 
-    parser.add_argument(
-        "--fov",
-        type=float,
-        default=80,
-    )
+    if not 0 < fov < 180:
+        raise ValueError("fov must be between 0 and 180")
 
-    parser.add_argument(
-        "--scale",
-        type=float,
-        default=0.73,
-    )
+    if not 0 < scale <= 1:
+        raise ValueError("scale must be between 0 and 1")
 
-    args = parser.parse_args()
+    os.makedirs(os.path.dirname(output_video_path) or ".", exist_ok=True)
 
-    if not os.path.isfile(args.input):
-        sys.exit(f"Input not found: {args.input}")
-
-    if not 0 < args.fov < 180:
-        sys.exit("--fov must be between 0 and 180")
-
-    if not 0 < args.scale <= 1:
-        sys.exit("--scale must be between 0 and 1")
-
-    width, height, fps, total_frames = probe(args.input)
+    width, height, fps, total_frames = probe(fisheye_input_video_path)
 
     if width % 2:
-        sys.exit("Input width must be divisible by 2")
+        raise ValueError("Input width must be divisible by 2")
 
     eye_w = width // 2
     eye_h = height
@@ -54,8 +65,8 @@ def main():
         eye_w,
         eye_h,
         out_eye,
-        args.fov,
-        args.scale,
+        fov,
+        scale,
     )
 
     decoder = subprocess.Popen(
@@ -65,7 +76,7 @@ def main():
             "-loglevel",
             "error",
             "-i",
-            args.input,
+            fisheye_input_video_path,
             "-map",
             "0:v:0",
             "-f",
@@ -97,7 +108,7 @@ def main():
             "-i",
             "pipe:0",
             "-i",
-            args.input,
+            fisheye_input_video_path,
             "-map",
             "0:v:0",
             "-map",
@@ -105,9 +116,9 @@ def main():
             "-c:v",
             "libx265",
             "-preset",
-            "medium",
+            preset,
             "-crf",
-            "18",
+            str(crf),
             "-pix_fmt",
             "yuv420p",
             "-tag:v",
@@ -125,7 +136,7 @@ def main():
             "-movflags",
             "+faststart",
             "-shortest",
-            args.output,
+            output_video_path,
         ],
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -138,9 +149,9 @@ def main():
     print(f"Input:     {width}x{height}")
     print(f"Eye:       {eye_w}x{eye_h}")
     print(f"Output:    {out_w}x{out_h}")
-    print(f"FOV:       {args.fov}°")
-    print(f"Scale:     {args.scale}")
-    print(f"Diameter:  {round(out_eye * args.scale)} px")
+    print(f"FOV:       {fov}°")
+    print(f"Scale:     {scale}")
+    print(f"Diameter:  {round(out_eye * scale)} px")
     print()
 
     try:
@@ -216,7 +227,7 @@ def main():
         print(encoder.stderr.read().decode(errors="replace"))
         sys.exit(1)
 
-    print(f"Finished: {args.output}")
+    print(f"Finished: {output_video_path}")
 
 
 def parse_fraction(value):
@@ -331,4 +342,4 @@ def convert_eye(eye, map_x, map_y):
 
 
 if __name__ == "__main__":
-    main()
+    Fire(main)
