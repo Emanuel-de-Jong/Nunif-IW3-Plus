@@ -29,6 +29,8 @@ On Windows, run `Run iw3 GUI.bat`.
 
 ![iw3-gui](https://github.com/nagadomi/nunif/assets/287255/3dba4f23-395d-48eb-afb6-819c332a93ac)
 
+In Nunif IW3 Plus, the `Enable Plus` checkbox runs `run_plus.sh` after an SBS video conversion finishes. It uses the Plus setup described in the top-level README.
+
 ### CLI
 
 Run `iw3` or `iw3.cli` module from the root directory of nunif.
@@ -43,6 +45,14 @@ python -m iw3 -h
 ```
 
 Also, when running `iw3` for the first time, it may take some time as it needs to download large model files.
+
+In Nunif IW3 Plus, add `--plus` to run `run_plus.sh` after each completed video conversion:
+
+```
+python -m iw3 -i <input file or directory> -o <output file or directory> --plus
+```
+
+Plus can also be run later with `./run_plus.sh <converted SBS video>`. See the top-level README for Plus setup notes, including conda, Hugging Face/SAM3 access, and `plus/greenscreen_prompts.json`.
 
 ### What is `--divergence`(`-d`) option?
 

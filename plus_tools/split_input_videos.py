@@ -3,11 +3,11 @@ import cv2
 from fire import Fire
 from pathlib import Path
 
-MAX_DURATION_SECONDS = 90
+MAX_DURATION_SECONDS = 120 + 5
 # Compare to the videos biggest side (width or height)
-MAX_RESOLUTION = 1920
+MAX_RESOLUTION = 3840
 # Look at the average fps or something, not the peak
-MAX_FPS = 60 + 1
+MAX_FPS = 60 + 5
 
 
 def main(path: str):
