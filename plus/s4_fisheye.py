@@ -21,6 +21,8 @@ def main(
     fisheye_input_video_path: str = None,
     source_hfov: float = 80.0,
     scale: float = 1.3,
+    expand: bool = True,
+    expand_max_eye_size: int = 4320,  # 8K
     crf: int = 18,
     preset: str = "medium",
     overwrite: bool = False,
@@ -73,7 +75,22 @@ def main(
     eye_w = width // 2
     eye_h = height
 
-    out_eye = eye_w
+    expand_note = ""
+
+    if expand and eye_w > expand_max_eye_size:
+        out_eye = eye_w
+        expand_note = f" (fallback: input exceeds {expand_max_eye_size}px)"
+    elif expand:
+        source_hfov_rad = math.radians(source_hfov)
+        fx = eye_w / (2.0 * math.tan(source_hfov_rad / 2.0))
+        ideal_eye = math.pi * fx / scale
+        out_eye = min(int(ideal_eye), expand_max_eye_size) & ~1
+        out_eye = max(out_eye, 2)
+        if int(ideal_eye) > expand_max_eye_size:
+            expand_note = f" (clamped to {expand_max_eye_size}px)"
+    else:
+        out_eye = eye_w
+
     out_w = out_eye * 2
     out_h = out_eye
 
@@ -169,6 +186,7 @@ def main(
     print()
     print(f"Assumed source HFOV: {source_hfov:.2f}°")
     print(f"Circle scale:        {scale:.3f}")
+    print(f"Expand mode:         {'on' if expand else 'off'}{expand_note}")
     print()
 
     try:

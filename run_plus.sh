@@ -122,7 +122,7 @@ run_fisheye() {
 
 pipeline_inputs=("$INPUT_VIDEO_PATH")
 
-# run_scene_splits
+run_scene_splits
 # run_upscale
 run_greenscreen
 run_fisheye
