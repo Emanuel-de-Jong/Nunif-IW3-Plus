@@ -43,6 +43,7 @@ def main(
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
     greenscreen_preset: str = "medium",
+    depth_foreground_threshold: float = 0.05,
     overwrite: bool = False,
 ):
     device = "cuda"
@@ -118,6 +119,7 @@ def main(
         "qc_area_jump_threshold": qc_area_jump_threshold,
         "greenscreen_crf": greenscreen_crf,
         "greenscreen_preset": greenscreen_preset,
+        "depth_foreground_threshold": depth_foreground_threshold,
         "device": device,
     }
     sidecar = {
@@ -197,14 +199,6 @@ def main(
             write_qc_log(qc_log_path, sidecar)
             return
 
-        predictor = create_sam_predictor(
-            sam_model_id,
-            sam_repo_dir,
-            sam_checkpoint_path,
-            sam_bpe_path,
-            sam_compile,
-            qwen_prompts,
-        )
         eye_video_paths = {
             "L": os.path.join(work_dir, "eye_L.mp4"),
             "R": os.path.join(work_dir, "eye_R.mp4"),
@@ -229,47 +223,77 @@ def main(
                     sam_video_preset,
                 )
 
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                for eye in ("L", "R"):
-                    eye_data = process_eye_with_sam(
-                        predictor,
-                        eye_video_paths[eye],
-                        eye_green_paths[eye],
-                        eye_alpha_paths[eye],
-                        output_dir,
-                        output_stem,
-                        eye,
-                        prompts,
-                        sam_prompt_frame_idx,
-                        fps,
-                        output_alpha_video,
-                        output_instance_videos,
-                        mask_close_kernel,
-                        mask_dilate_kernel,
-                        mask_border_shift,
-                        mask_overlap_gap_fill,
-                        qc_frame_interval,
-                        qc_area_jump_threshold,
-                        greenscreen_crf,
-                        greenscreen_preset,
-                    )
-                    sidecar["eyes"][eye] = eye_data
-                    print(
-                        f"==> eye {eye}: {eye_data['max_instances']} max instances, "
-                        f"{len(eye_data['qc_flags'])} QC flags",
-                        flush=True,
-                    )
+            eye_depth_masks = {}
+            if depth_foreground_threshold > 0:
+                depth_model = create_depth_model(device)
+                try:
+                    for eye in ("L", "R"):
+                        print(f"==> computing depth masks for eye {eye}", flush=True)
+                        eye_depth_masks[eye] = compute_eye_depth_masks(
+                            depth_model,
+                            eye_video_paths[eye],
+                            depth_foreground_threshold,
+                        )
+                finally:
+                    del depth_model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+            predictor = create_sam_predictor(
+                sam_model_id,
+                sam_repo_dir,
+                sam_checkpoint_path,
+                sam_bpe_path,
+                sam_compile,
+                qwen_prompts,
+            )
+            try:
+                with torch.inference_mode(), torch.autocast(
+                    "cuda", dtype=torch.bfloat16
+                ):
+                    for eye in ("L", "R"):
+                        eye_data = process_eye_with_sam(
+                            predictor,
+                            eye_video_paths[eye],
+                            eye_green_paths[eye],
+                            eye_alpha_paths[eye],
+                            output_dir,
+                            output_stem,
+                            eye,
+                            prompts,
+                            sam_prompt_frame_idx,
+                            fps,
+                            output_alpha_video,
+                            output_instance_videos,
+                            mask_close_kernel,
+                            mask_dilate_kernel,
+                            mask_border_shift,
+                            mask_overlap_gap_fill,
+                            qc_frame_interval,
+                            qc_area_jump_threshold,
+                            greenscreen_crf,
+                            greenscreen_preset,
+                            eye_depth_masks.get(eye),
+                            depth_foreground_threshold,
+                        )
+                        sidecar["eyes"][eye] = eye_data
+                        print(
+                            f"==> eye {eye}: {eye_data['max_instances']} max instances, "
+                            f"{len(eye_data['qc_flags'])} QC flags",
+                            flush=True,
+                        )
+            finally:
+                del predictor
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         except Exception as error:
             sidecar["failures"].append(f"SAM 3 processing crashed: {error}")
             print(f"==> SAM 3 processing crashed: {error}", flush=True)
             save_sidecar(sidecar_path, sidecar)
             write_qc_log(qc_log_path, sidecar)
             return
-        finally:
-            del predictor
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         hstack_videos(
             eye_green_paths["L"], eye_green_paths["R"], greenscreen_path, overwrite=True
@@ -557,6 +581,44 @@ def prompt_matches_scene(concept, include_concepts, specific_include_concepts):
     return False
 
 
+def create_depth_model(device):
+    from iw3.zoedepth_model import ZoeDepthModel
+
+    print("Loading ZoeD_Any_N depth model", flush=True)
+    depth_model = ZoeDepthModel("ZoeD_Any_N")
+    depth_model.load(gpu=0)
+    return depth_model
+
+
+def compute_eye_depth_masks(depth_model, eye_video_path, depth_foreground_threshold):
+    video_frames, width, height, _ = load_video_frames(eye_video_path)
+    depth_masks = []
+    for frame_rgb in video_frames:
+        frame_tensor = torch.from_numpy(frame_rgb.astype(np.float32) / 255.0).permute(
+            2, 0, 1
+        )
+        depth = depth_model.infer(frame_tensor.to(depth_model.device))
+        depth = depth_model.minmax_normalize_chw(depth)
+        depth_np = depth.squeeze(0).cpu().numpy()
+        mask = (depth_np >= 1.0 - depth_foreground_threshold).astype(np.uint8)
+        if mask.shape != (height, width):
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        depth_masks.append(mask)
+    return depth_masks
+
+
+def apply_depth_mask(
+    alpha, depth_masks, frame_index, height, width, depth_foreground_threshold
+):
+    if (
+        depth_foreground_threshold <= 0
+        or depth_masks is None
+        or frame_index >= len(depth_masks)
+    ):
+        return alpha
+    return np.maximum(alpha, depth_masks[frame_index].astype(np.float32))
+
+
 def create_sam_predictor(
     sam_model_id,
     sam_repo_dir,
@@ -643,6 +705,8 @@ def process_eye_with_sam(
     qc_area_jump_threshold,
     greenscreen_crf=18,
     greenscreen_preset="veryfast",
+    depth_masks=None,
+    depth_foreground_threshold=0.0,
 ):
     video_frames, width, height, frame_count = load_video_frames(eye_video_path)
     model = predictor["model"]
@@ -704,10 +768,20 @@ def process_eye_with_sam(
                 frame_index = int(model_outputs.frame_idx)
                 while current_frame_index < frame_index:
                     frame_rgb = video_frames[current_frame_index]
-                    empty_alpha = np.zeros((height, width), dtype=np.float32)
+                    empty_alpha = apply_depth_mask(
+                        np.zeros((height, width), dtype=np.float32),
+                        depth_masks,
+                        current_frame_index,
+                        height,
+                        width,
+                        depth_foreground_threshold,
+                    )
                     green_writer.write(composite_green(frame_rgb, empty_alpha))
                     if alpha_writer is not None:
-                        alpha_writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+                        alpha_u8 = (
+                            np.round(empty_alpha * 255.0).clip(0, 255).astype(np.uint8)
+                        )
+                        alpha_writer.write(cv2.cvtColor(alpha_u8, cv2.COLOR_GRAY2RGB))
                     current_frame_index += 1
 
                 processed_outputs = processor.postprocess_outputs(
@@ -724,6 +798,14 @@ def process_eye_with_sam(
                     mask_dilate_kernel,
                     mask_border_shift,
                     mask_overlap_gap_fill,
+                )
+                combined_alpha = apply_depth_mask(
+                    combined_alpha,
+                    depth_masks,
+                    frame_index,
+                    height,
+                    width,
+                    depth_foreground_threshold,
                 )
                 max_instances = max(max_instances, present_count)
                 frame_rgb = video_frames[frame_index]
@@ -767,10 +849,20 @@ def process_eye_with_sam(
 
             while current_frame_index < frame_count:
                 frame_rgb = video_frames[current_frame_index]
-                empty_alpha = np.zeros((height, width), dtype=np.float32)
+                empty_alpha = apply_depth_mask(
+                    np.zeros((height, width), dtype=np.float32),
+                    depth_masks,
+                    current_frame_index,
+                    height,
+                    width,
+                    depth_foreground_threshold,
+                )
                 green_writer.write(composite_green(frame_rgb, empty_alpha))
                 if alpha_writer is not None:
-                    alpha_writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+                    alpha_u8 = (
+                        np.round(empty_alpha * 255.0).clip(0, 255).astype(np.uint8)
+                    )
+                    alpha_writer.write(cv2.cvtColor(alpha_u8, cv2.COLOR_GRAY2RGB))
                 current_frame_index += 1
         finally:
             green_writer.close()
