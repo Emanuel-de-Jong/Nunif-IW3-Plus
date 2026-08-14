@@ -41,6 +41,7 @@ for video in "${videos[@]}"; do
 	python -m plus.s1_scene_splits --input_video_path "$video"
 	python -m plus.s2_upscale --input_video_path "$video"
 	python -m plus.s3_greenscreen --input_video_path "$video"
+	python -m plus.s4_fisheye --input_video_path "$video"
 
 	printf "\n\n-----------------------------------\n\n"
 done
