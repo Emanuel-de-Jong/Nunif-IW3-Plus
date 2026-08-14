@@ -374,9 +374,9 @@ def make_map(
         (nr <= 1.0)
         & (rz > 0.0)
         & (map_x >= 0.0)
-        & (map_x <= src_w - 1)
+        & (map_x < src_w)
         & (map_y >= 0.0)
-        & (map_y <= src_h - 1)
+        & (map_y < src_h)
     )
 
     map_x = map_x.astype(np.float32)
