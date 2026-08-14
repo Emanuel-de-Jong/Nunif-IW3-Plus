@@ -52,7 +52,7 @@ In Nunif IW3 Plus, add `--plus` to run `run_plus.sh` after each completed video 
 python -m iw3 -i <input file or directory> -o <output file or directory> --plus
 ```
 
-Plus can also be run later with `./run_plus.sh <converted SBS video>`. See the top-level README for Plus setup notes, including conda, Hugging Face/SAM3 access, and `plus/greenscreen_prompts.json`.
+Plus can also be run later with `./run_plus.sh <converted SBS video>`. See the top-level README for Plus setup instructions and details.
 
 ### What is `--divergence`(`-d`) option?
 

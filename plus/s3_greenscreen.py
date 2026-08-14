@@ -27,7 +27,7 @@ def main(
     sam_repo_dir: str = None,
     sam_checkpoint_path: str = None,
     sam_bpe_path: str = None,
-    sam_prompt_frame_idx: int = 0,
+    sam_prompt_frame_idx: int = 5,
     sam_prompt_groups: int = 6,
     sam_max_long_side: int = 0,
     sam_video_crf: int = 12,
