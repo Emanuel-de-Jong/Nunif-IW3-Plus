@@ -277,7 +277,6 @@ def main(
                             output_stem,
                             eye,
                             prompts,
-                            sam_prompt_frame_idx,
                             fps,
                             sam_chunk_seconds,
                             sam_chunk_overlap_seconds,
@@ -648,8 +647,6 @@ def compute_eye_depth_mask_video(
 def apply_depth_mask(
     alpha,
     depth_mask,
-    height,
-    width,
     depth_foreground_threshold,
     depth_mask_border_shift=0,
 ):
@@ -742,7 +739,6 @@ def process_eye_with_sam(
     video_stem,
     eye,
     prompts,
-    prompt_frame_idx,
     fps,
     sam_chunk_seconds,
     sam_chunk_overlap_seconds,
@@ -819,7 +815,7 @@ def process_eye_with_sam(
             inference_session = processor.init_video_session(
                 video=video_frames,
                 inference_device=device,
-                processing_device="cpu",
+                processing_device=device,
                 video_storage_device="cpu",
                 dtype=dtype,
             )
@@ -855,8 +851,6 @@ def process_eye_with_sam(
                         empty_alpha = apply_depth_mask(
                             np.zeros((height, width), dtype=np.float32),
                             depth_mask,
-                            height,
-                            width,
                             depth_foreground_threshold,
                             depth_mask_border_shift,
                         )
@@ -888,8 +882,6 @@ def process_eye_with_sam(
                     combined_alpha = apply_depth_mask(
                         combined_alpha,
                         depth_mask,
-                        height,
-                        width,
                         depth_foreground_threshold,
                         depth_mask_border_shift,
                     )
@@ -933,8 +925,6 @@ def process_eye_with_sam(
                     empty_alpha = apply_depth_mask(
                         np.zeros((height, width), dtype=np.float32),
                         depth_mask,
-                        height,
-                        width,
                         depth_foreground_threshold,
                         depth_mask_border_shift,
                     )
