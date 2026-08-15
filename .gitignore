@@ -5,9 +5,11 @@ _out/
 _out_plus/
 plus/greenscreen_prompts.json
 plus/checkpoints/*
+!plus/checkpoints/.gitkeep
 plus/SAM2Matting/*
 plus/Video2X/*
 !plus/Video2X/.gitkeep
+plus/sam3
 tmp/*
 !tmp/presets
 
