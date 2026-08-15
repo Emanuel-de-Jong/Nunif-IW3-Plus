@@ -6,4 +6,5 @@ SAM 3.1 is pretty much required for `s3_greenscreen.py` because it's 7x faster t
 1. In `plus/`, run `git clone https://github.com/facebookresearch/sam3.git`, then `cd sam3` and `git checkout -d 8f0b7f4d4e7eda2ed606ebde6702c93359ad01da`.
 1. Copy everything except for this `README.md` from `sam3.1_fixes/` to `sam3/`. Overwrite when prompted.
 1. Follow the `## Installation` steps in `README.md`, including step 5. Before step 5, run `pip install "setuptools<81" psutil`.
+1. Install the other step 3 dependencies: `pip install imageio imageio-ffmpeg fire transformers qwen-vl-utils accelerate kernels`
 1. Optional: To test if it has been installed correctly, change the value of `video_path` in `sam3/test.py` to your own video and run `python test.py`. If a `test.png` got created and it's not completely white or black, it's working!
