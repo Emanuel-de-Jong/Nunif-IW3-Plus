@@ -1,23 +1,13 @@
 import os
-import torch
-import glob
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 from sam3.model_builder import build_sam3_multiplex_video_predictor
-from sam3.visualization_utils import (
-    load_frame,
-    prepare_masks_for_visualization,
-    visualize_formatted_frame_output,
-)
 
 predictor = build_sam3_multiplex_video_predictor(
-    checkpoint_path="/home/graviton/base/code/repos/Nunif-IW3-Plus/plus/checkpoints/sam3.1_multiplex.pt"
+    checkpoint_path="/home/graviton/base/code/repos/Nunif-IW3-Plus/plus/checkpoints/sam3.1_multiplex.pt",
+    use_fa3=False,
 )
-
-plt.rcParams["axes.titlesize"] = 12
-plt.rcParams["figure.titlesize"] = 12
 
 
 def propagate_in_video(predictor, session_id):
@@ -54,28 +44,19 @@ def abs_to_rel_coords(coords, IMG_WIDTH, IMG_HEIGHT, coord_type="point"):
 # "video_path" needs to be either a JPEG folder or a MP4 video file
 video_path = "/home/graviton/Downloads/test.mp4"
 
-# load "video_frames_for_vis" for visualization purposes (they are not used by the model)
 if isinstance(video_path, str) and video_path.endswith(".mp4"):
     cap = cv2.VideoCapture(video_path)
-    video_frames_for_vis = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        video_frames_for_vis.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    IMG_WIDTH = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    IMG_HEIGHT = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
 else:
-    video_frames_for_vis = glob.glob(os.path.join(video_path, "*.jpg"))
-    try:
-        video_frames_for_vis.sort(
-            key=lambda p: int(os.path.splitext(os.path.basename(p))[0])
-        )
-    except ValueError:
-        print(
-            f'frame names are not in "<frame_index>.jpg" format: {video_frames_for_vis[:5]=}, '
-            f"falling back to lexicographic sort."
-        )
-        video_frames_for_vis.sort()
+    frame_files = [
+        os.path.join(video_path, name)
+        for name in os.listdir(video_path)
+        if name.lower().endswith((".jpg", ".jpeg"))
+    ]
+    with Image.open(frame_files[0]) as image:
+        IMG_WIDTH, IMG_HEIGHT = image.size
 
 response = predictor.handle_request(
     request=dict(
@@ -108,32 +89,9 @@ response = predictor.handle_request(
 )
 out = response["outputs"]
 
-plt.close("all")
-visualize_formatted_frame_output(
-    frame_idx,
-    video_frames_for_vis,
-    outputs_list=[prepare_masks_for_visualization({frame_idx: out})],
-    titles=["SAM 3.1 Dense Tracking outputs"],
-    figsize=(6, 4),
-)
-
 
 # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
 outputs_per_frame = propagate_in_video(predictor, session_id)
-
-# finally, we reformat the outputs for visualization and plot the outputs every 60 frames
-outputs_per_frame = prepare_masks_for_visualization(outputs_per_frame)
-
-vis_frame_stride = 60
-plt.close("all")
-for frame_idx in range(0, len(outputs_per_frame), vis_frame_stride):
-    visualize_formatted_frame_output(
-        frame_idx,
-        video_frames_for_vis,
-        outputs_list=[outputs_per_frame],
-        titles=["SAM 3.1 Dense Tracking outputs"],
-        figsize=(6, 4),
-    )
 
 
 # we pick id 2, which is the dancer in the front
@@ -148,25 +106,6 @@ response = predictor.handle_request(
 
 # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
 outputs_per_frame = propagate_in_video(predictor, session_id)
-
-# finally, we reformat the outputs for visualization and plot the outputs every 60 frames
-outputs_per_frame = prepare_masks_for_visualization(outputs_per_frame)
-
-vis_frame_stride = 60
-plt.close("all")
-for frame_idx in range(0, len(outputs_per_frame), vis_frame_stride):
-    visualize_formatted_frame_output(
-        frame_idx,
-        video_frames_for_vis,
-        outputs_list=[outputs_per_frame],
-        titles=["SAM 3.1 Dense Tracking outputs"],
-        figsize=(6, 4),
-    )
-
-
-sample_img = Image.fromarray(load_frame(video_frames_for_vis[0]))
-
-IMG_WIDTH, IMG_HEIGHT = sample_img.size
 
 
 # let's add back the dancer via point prompts.
@@ -183,51 +122,37 @@ points_abs = np.array(
 labels = np.array([1])
 
 # convert points and labels to tensors; also convert to relative coordinates
-points_tensor = torch.tensor(
-    abs_to_rel_coords(points_abs, IMG_WIDTH, IMG_HEIGHT, coord_type="point"),
-    dtype=torch.float32,
+points = abs_to_rel_coords(
+    points_abs,
+    IMG_WIDTH,
+    IMG_HEIGHT,
+    coord_type="point",
 )
-points_labels_tensor = torch.tensor(labels, dtype=torch.int32)
 
 response = predictor.handle_request(
     request=dict(
         type="add_prompt",
         session_id=session_id,
         frame_index=frame_idx,
-        points=points_tensor,
-        point_labels=points_labels_tensor,
+        points=points,
+        point_labels=labels,
         obj_id=obj_id,
     )
 )
 out = response["outputs"]
 
-plt.close("all")
-visualize_formatted_frame_output(
-    frame_idx,
-    video_frames_for_vis,
-    outputs_list=[prepare_masks_for_visualization({frame_idx: out})],
-    titles=["SAM 3.1 Dense Tracking outputs"],
-    figsize=(6, 4),
-    points_list=[points_abs],
-    points_labels_list=[labels],
-)
-
 # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
 outputs_per_frame = propagate_in_video(predictor, session_id)
 
-# finally, we reformat the outputs for visualization and plot the outputs every 60 frames
-outputs_per_frame = prepare_masks_for_visualization(outputs_per_frame)
+frame_idx = 0
+out = outputs_per_frame[frame_idx]
 
-vis_frame_stride = 60
-plt.close("all")
-for frame_idx in range(0, len(outputs_per_frame), vis_frame_stride):
-    visualize_formatted_frame_output(
-        frame_idx,
-        video_frames_for_vis,
-        outputs_list=[outputs_per_frame],
-        titles=["SAM 3.1 Dense Tracking outputs"],
-        figsize=(6, 4),
-    )
+obj_ids = np.asarray(out["out_obj_ids"])
+masks = np.asarray(out["out_binary_masks"])
+
+mask = masks[np.where(obj_ids == obj_id)[0][0]]
+mask = np.squeeze(mask)
+Image.fromarray(mask.astype(np.uint8) * 255).save("test.png")
 
 _ = predictor.handle_request(
     request=dict(
