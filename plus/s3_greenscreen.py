@@ -29,8 +29,8 @@ def main(
     sam_prompt_frame_idx: int = 5,
     sam_prompt_groups: int = 6,
     sam_max_long_side: int = 0,
-    sam_chunk_seconds: float = 20.0,
-    sam_chunk_overlap_seconds: float = 2.0,
+    sam_chunk_seconds: float = 10.0,
+    sam_chunk_overlap_seconds: float = 1.0,
     sam_video_crf: int = 12,
     sam_video_preset: str = "veryfast",
     sam_compile: bool = False,
@@ -960,12 +960,14 @@ def process_eye_with_sam(
                     request=dict(
                         type="close_session",
                         session_id=session_id,
+                        clear_cache_threshold=0,
                     )
                 )
                 shutil.rmtree(chunk_dir, ignore_errors=True)
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
     finally:
         green_writer.close()
         if alpha_writer is not None:
