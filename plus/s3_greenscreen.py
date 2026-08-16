@@ -33,6 +33,7 @@ def main(
     sam_checkpoint_path: str = "plus/checkpoints/sam3.1_multiplex.pt",
     sam_bpe_path: str = None,
     sam_prompt_groups: int = 4,
+    sam_max_num_objects: int = 0,
     sam_max_long_side: int = 720,
     sam_chunk_frames: int = 30,
     sam_chunk_overlap_frames: int = 10,
@@ -84,6 +85,9 @@ def main(
 
     if sam_chunk_overlap_frames >= sam_chunk_frames:
         raise ValueError("sam_chunk_overlap_frames must be less than sam_chunk_frames")
+
+    if sam_max_num_objects == 0:
+        sam_max_num_objects = int(round(sam_prompt_groups * 1.4))
 
     qwen_prompts_path = g.PLUS_DIR / "greenscreen_prompts.json"
     if not qwen_prompts_path.exists():
@@ -263,7 +267,7 @@ def main(
                 sam_checkpoint_path,
                 sam_bpe_path,
                 sam_compile,
-                sam_prompt_groups,
+                sam_max_num_objects,
             )
             try:
                 for eye in ("L", "R"):
@@ -658,7 +662,7 @@ def create_sam_predictor(
     checkpoint_path,
     bpe_path,
     compiled,
-    sam_prompt_groups,
+    sam_max_num_objects,
 ):
     print("Loading SAM 3.1 model", flush=True)
 
@@ -669,7 +673,7 @@ def create_sam_predictor(
     return build_sam3_multiplex_video_predictor(
         checkpoint_path=checkpoint_path,
         bpe_path=bpe_path or None,
-        max_num_objects=sam_prompt_groups,
+        max_num_objects=sam_max_num_objects,
         use_fa3=False,
         compile=compiled,
         session_expiration_sec=3600,
@@ -732,6 +736,23 @@ def write_chunk_jpeg_folder(eye_video_path, chunk_start, chunk_end, chunk_dir):
         video.release()
 
 
+def extract_seed_points(masks_np, height, width):
+    seed_points = []
+    if masks_np is None or masks_np.size == 0:
+        return seed_points
+    if masks_np.ndim == 2:
+        masks_np = masks_np[None]
+    for mask in masks_np:
+        mask_2d = np.squeeze(mask)
+        if mask_2d.ndim != 2 or mask_2d.max() == 0:
+            continue
+        y_coords, x_coords = np.where(mask_2d > 0)
+        centroid_x = float(x_coords.mean()) / width
+        centroid_y = float(y_coords.mean()) / height
+        seed_points.append([centroid_x, centroid_y])
+    return seed_points
+
+
 def process_eye_with_sam(
     predictor,
     sam_eye_video_path,
@@ -763,7 +784,7 @@ def process_eye_with_sam(
     if not video.isOpened():
         raise ValueError(f"Could not open cropped eye video: {sam_eye_video_path}")
     try:
-        _, _, _, frame_count = get_video_properties(video)
+        _, sam_width, sam_height, frame_count = get_video_properties(video)
     finally:
         video.release()
 
@@ -814,6 +835,7 @@ def process_eye_with_sam(
         frame_count, sam_chunk_frames, sam_chunk_overlap_frames
     )
     chunks_base_dir = os.path.dirname(green_video_path)
+    carried_seed_points = None
     try:
         for idx, (chunk_start, chunk_end, output_start) in enumerate(ranges):
             print(
@@ -829,6 +851,7 @@ def process_eye_with_sam(
                 request=dict(
                     type="start_session",
                     resource_path=chunk_dir,
+                    offload_video_to_cpu=True,
                 )
             )
             session_id = response["session_id"]
@@ -841,6 +864,23 @@ def process_eye_with_sam(
                         text=prompts[0],
                     )
                 )
+
+                # if carried_seed_points:
+                #     predictor.handle_request(
+                #         request=dict(
+                #             type="add_prompt",
+                #             session_id=session_id,
+                #             frame_index=0,
+                #             points=[carried_seed_points[0]],
+                #             point_labels=[1],
+                #             rel_coordinates=True,
+                #         )
+                #     )
+
+                next_chunk_seed_local = (
+                    ranges[idx + 1][0] - chunk_start if idx + 1 < len(ranges) else None
+                )
+                pending_seed_points = None
                 video_reader = cv2.VideoCapture(input_video_path)
                 video_reader.set(cv2.CAP_PROP_POS_FRAMES, chunk_start)
                 depth_video = open_depth_mask_video(depth_mask_path, output_start)
@@ -867,6 +907,16 @@ def process_eye_with_sam(
                         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                         depth_mask = read_depth_mask(depth_video, height, width)
                         frame_global_idx = chunk_start + local_frame_idx
+                        if (
+                            next_chunk_seed_local is not None
+                            and local_frame_idx == next_chunk_seed_local
+                        ):
+                            masks_raw = outputs.get("out_binary_masks", None)
+                            if masks_raw is not None:
+                                pending_seed_points = extract_seed_points(
+                                    np.asarray(masks_raw), sam_height, sam_width
+                                )
+
                         masks = (
                             np.asarray(outputs["out_binary_masks"])
                             if outputs.get("out_binary_masks") is not None
@@ -926,6 +976,8 @@ def process_eye_with_sam(
                     video_reader.release()
                     if depth_video is not None:
                         depth_video.release()
+
+                carried_seed_points = pending_seed_points
             finally:
                 predictor.handle_request(
                     request=dict(
