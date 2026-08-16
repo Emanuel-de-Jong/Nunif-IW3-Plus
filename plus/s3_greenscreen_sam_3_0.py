@@ -4,7 +4,6 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import gc
 import re
-import sys
 import json
 import shutil
 import tempfile
@@ -15,8 +14,14 @@ import imageio_ffmpeg
 import plus.global_params as g
 from fire import Fire
 from iw3.zoedepth_model import ZoeDepthModel
-from sam3.model_builder import build_sam3_multiplex_video_predictor
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import (
+    Qwen3VLForConditionalGeneration,
+    AutoProcessor,
+    Sam3VideoModel,
+    Sam3VideoProcessor,
+)
+
+SAM_HOTSTART_FRAMES = 15
 
 
 def main(
@@ -29,13 +34,14 @@ def main(
     vlm_temperature: float = 0.2,
     vlm_max_new_tokens: int = 768,
     vlm_max_long_side: int = 1024,
+    sam_model_id: str = "facebook/sam3",
     sam_repo_dir: str = None,
-    sam_checkpoint_path: str = "plus/checkpoints/sam3.1_multiplex.pt",
+    sam_checkpoint_path: str = None,
     sam_bpe_path: str = None,
     sam_prompt_groups: int = 4,
     sam_max_long_side: int = 1080,
-    sam_chunk_frames: int = 150,
-    sam_chunk_overlap_frames: int = 20,
+    sam_chunk_seconds: float = 5.0,
+    sam_chunk_overlap_seconds: float = 0.65,
     sam_video_crf: int = 12,
     sam_video_preset: str = "veryfast",
     sam_compile: bool = False,
@@ -82,9 +88,6 @@ def main(
     if width % 2 != 0:
         raise ValueError(f"SBS video width must be even, got: {width}")
 
-    if sam_chunk_overlap_frames >= sam_chunk_frames:
-        raise ValueError("sam_chunk_overlap_frames must be less than sam_chunk_frames")
-
     qwen_prompts_path = g.PLUS_DIR / "greenscreen_prompts.json"
     if not qwen_prompts_path.exists():
         print("greenscreen_prompts.json couldn't be found!.")
@@ -109,13 +112,14 @@ def main(
         "vlm_temperature": vlm_temperature,
         "vlm_max_new_tokens": vlm_max_new_tokens,
         "vlm_max_long_side": vlm_max_long_side,
+        "sam_model_id": sam_model_id,
         "sam_repo_dir": sam_repo_dir,
         "sam_checkpoint_path": sam_checkpoint_path,
         "sam_bpe_path": sam_bpe_path,
         "sam_prompt_groups": sam_prompt_groups,
         "sam_max_long_side": sam_max_long_side,
-        "sam_chunk_frames": sam_chunk_frames,
-        "sam_chunk_overlap_frames": sam_chunk_overlap_frames,
+        "sam_chunk_seconds": sam_chunk_seconds,
+        "sam_chunk_overlap_seconds": sam_chunk_overlap_seconds,
         "sam_video_crf": sam_video_crf,
         "sam_video_preset": sam_video_preset,
         "sam_compile": sam_compile,
@@ -259,54 +263,54 @@ def main(
                         torch.cuda.empty_cache()
 
             predictor = create_sam_predictor(
-                sam_repo_dir,
-                sam_checkpoint_path,
-                sam_bpe_path,
+                sam_model_id,
                 sam_compile,
-                sam_prompt_groups,
             )
             try:
-                for eye in ("L", "R"):
-                    eye_data = process_eye_with_sam(
-                        predictor,
-                        eye_video_paths[eye],
-                        eye_green_paths[eye],
-                        eye_alpha_paths[eye],
-                        output_dir,
-                        output_stem,
-                        eye,
-                        prompts,
-                        fps,
-                        sam_chunk_frames,
-                        sam_chunk_overlap_frames,
-                        output_alpha_video,
-                        output_instance_videos,
-                        sam_mask_close_kernel,
-                        sam_mask_dilate_kernel,
-                        sam_mask_border_shift,
-                        sam_mask_overlap_gap_fill,
-                        qc_frame_interval,
-                        qc_area_jump_threshold,
-                        greenscreen_crf,
-                        greenscreen_preset,
-                        depth_mask_paths.get(eye),
-                        depth_foreground_threshold,
-                        depth_mask_border_shift,
-                    )
-                    sidecar["eyes"][eye] = eye_data
-                    print(
-                        f"==> eye {eye}: {eye_data['max_instances']} max instances, "
-                        f"{len(eye_data['qc_flags'])} QC flags",
-                        flush=True,
-                    )
+                with torch.inference_mode(), torch.autocast(
+                    "cuda", dtype=torch.bfloat16
+                ):
+                    for eye in ("L", "R"):
+                        eye_data = process_eye_with_sam(
+                            predictor,
+                            eye_video_paths[eye],
+                            eye_green_paths[eye],
+                            eye_alpha_paths[eye],
+                            output_dir,
+                            output_stem,
+                            eye,
+                            prompts,
+                            fps,
+                            sam_chunk_seconds,
+                            sam_chunk_overlap_seconds,
+                            output_alpha_video,
+                            output_instance_videos,
+                            sam_mask_close_kernel,
+                            sam_mask_dilate_kernel,
+                            sam_mask_border_shift,
+                            sam_mask_overlap_gap_fill,
+                            qc_frame_interval,
+                            qc_area_jump_threshold,
+                            greenscreen_crf,
+                            greenscreen_preset,
+                            depth_mask_paths.get(eye),
+                            depth_foreground_threshold,
+                            depth_mask_border_shift,
+                        )
+                        sidecar["eyes"][eye] = eye_data
+                        print(
+                            f"==> eye {eye}: {eye_data['max_instances']} max instances, "
+                            f"{len(eye_data['qc_flags'])} QC flags",
+                            flush=True,
+                        )
             finally:
                 del predictor
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         except Exception as error:
-            sidecar["failures"].append(f"SAM 3.1 processing crashed: {error}")
-            print(f"==> SAM 3.1 processing crashed: {error}", flush=True)
+            sidecar["failures"].append(f"SAM 3 processing crashed: {error}")
+            print(f"==> SAM 3 processing crashed: {error}", flush=True)
             save_sidecar(sidecar_path, sidecar)
             write_qc_log(qc_log_path, sidecar)
             return
@@ -663,27 +667,23 @@ def apply_depth_mask(
 
 
 def create_sam_predictor(
-    sam_repo_dir,
-    checkpoint_path,
-    bpe_path,
+    sam_model_id,
     compiled,
-    sam_prompt_groups,
 ):
-    print("Loading SAM 3.1 model", flush=True)
+    print(f"Loading SAM 3 model: {sam_model_id}", flush=True)
 
-    resolved_sam_dir = sam_repo_dir or str(g.PLUS_DIR / "sam3")
-    if resolved_sam_dir not in sys.path:
-        sys.path.insert(0, resolved_sam_dir)
-
-    return build_sam3_multiplex_video_predictor(
-        checkpoint_path=checkpoint_path,
-        bpe_path=bpe_path or None,
-        max_num_objects=sam_prompt_groups,
-        use_fa3=False,
-        compile=compiled,
-        session_expiration_sec=3600,
-        async_loading_frames=False,
-    )
+    dtype = torch.bfloat16
+    model = Sam3VideoModel.from_pretrained(sam_model_id).to("cuda", dtype=dtype)
+    if compiled:
+        model = torch.compile(model)
+    model.eval()
+    processor = Sam3VideoProcessor.from_pretrained(sam_model_id)
+    return {
+        "model": model,
+        "processor": processor,
+        "device": "cuda",
+        "dtype": dtype,
+    }
 
 
 def crop_eye_video(
@@ -726,38 +726,6 @@ def crop_eye_video(
     g.run_command(command)
 
 
-def write_chunk_jpeg_folder(eye_video_path, chunk_start, chunk_end, chunk_dir):
-    os.makedirs(chunk_dir, exist_ok=True)
-    video = cv2.VideoCapture(eye_video_path)
-    video.set(cv2.CAP_PROP_POS_FRAMES, chunk_start)
-    try:
-        for frame_pos in range(chunk_end - chunk_start):
-            success, frame_bgr = video.read()
-            if not success:
-                break
-            path = os.path.join(chunk_dir, f"{frame_pos:06d}.jpg")
-            cv2.imwrite(path, frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    finally:
-        video.release()
-
-
-def extract_seed_points(masks_np, height, width):
-    seed_points = []
-    if masks_np is None or masks_np.size == 0:
-        return seed_points
-    if masks_np.ndim == 2:
-        masks_np = masks_np[None]
-    for mask in masks_np:
-        mask_2d = np.squeeze(mask)
-        if mask_2d.ndim != 2 or mask_2d.max() == 0:
-            continue
-        y_coords, x_coords = np.where(mask_2d > 0)
-        centroid_x = float(x_coords.mean()) / width
-        centroid_y = float(y_coords.mean()) / height
-        seed_points.append([centroid_x, centroid_y])
-    return seed_points
-
-
 def process_eye_with_sam(
     predictor,
     eye_video_path,
@@ -768,8 +736,8 @@ def process_eye_with_sam(
     eye,
     prompts,
     fps,
-    sam_chunk_frames,
-    sam_chunk_overlap_frames,
+    sam_chunk_seconds,
+    sam_chunk_overlap_seconds,
     output_alpha_video,
     output_instance_videos,
     sam_mask_close_kernel,
@@ -791,6 +759,10 @@ def process_eye_with_sam(
         _, width, height, frame_count = get_video_properties(video)
     finally:
         video.release()
+    model = predictor["model"]
+    processor = predictor["processor"]
+    device = predictor["device"]
+    dtype = predictor["dtype"]
 
     green_writer = g.RawVideoWriter(
         green_video_path,
@@ -823,10 +795,9 @@ def process_eye_with_sam(
     qc_flags = []
 
     ranges = get_sam_chunk_ranges(
-        frame_count, sam_chunk_frames, sam_chunk_overlap_frames
+        frame_count, fps, sam_chunk_seconds, sam_chunk_overlap_seconds
     )
-    chunks_base_dir = os.path.dirname(green_video_path)
-    carried_seed_points = None
+    carried_seed_masks = None
     try:
         for idx, (chunk_start, chunk_end, output_start) in enumerate(ranges):
             print(
@@ -834,146 +805,138 @@ def process_eye_with_sam(
                 f"writing from {output_start}",
                 flush=True,
             )
-            chunk_dir = os.path.join(chunks_base_dir, f"chunk_{eye}_{idx}")
-            write_chunk_jpeg_folder(eye_video_path, chunk_start, chunk_end, chunk_dir)
-            response = predictor.handle_request(
-                request=dict(
-                    type="start_session",
-                    resource_path=chunk_dir,
-                    offload_video_to_cpu=True,
-                )
+            video_frames = load_video_frame_range(
+                eye_video_path, chunk_start, chunk_end
             )
-            session_id = response["session_id"]
-            try:
-                for prompt in prompts:
-                    predictor.handle_request(
-                        request=dict(
-                            type="add_prompt",
-                            session_id=session_id,
-                            frame_index=0,
-                            text=prompt,
-                        )
-                    )
-                if carried_seed_points:
-                    for point in carried_seed_points:
-                        predictor.handle_request(
-                            request=dict(
-                                type="add_prompt",
-                                session_id=session_id,
-                                frame_index=0,
-                                points=[point],
-                                point_labels=[1],
-                                rel_coordinates=True,
-                            )
-                        )
-                next_chunk_seed_local = (
-                    ranges[idx + 1][0] - chunk_start if idx + 1 < len(ranges) else None
+            inference_session = processor.init_video_session(
+                video=video_frames,
+                inference_device=device,
+                processing_device=device,
+                video_storage_device="cpu",
+                dtype=dtype,
+            )
+            for prompt in prompts:
+                inference_session = processor.add_text_prompt(
+                    inference_session=inference_session,
+                    text=prompt,
                 )
-                pending_seed_points = None
-                video_reader = cv2.VideoCapture(eye_video_path)
-                video_reader.set(cv2.CAP_PROP_POS_FRAMES, chunk_start)
-                depth_video = open_depth_mask_video(depth_mask_path, output_start)
-                local_output_start = output_start - chunk_start
-                try:
-                    for response in predictor.handle_stream_request(
-                        request=dict(
-                            type="propagate_in_video",
-                            session_id=session_id,
-                            propagation_direction="forward",
-                        )
-                    ):
-                        local_frame_idx = response["frame_index"]
-                        outputs = response["outputs"]
-                        success, frame_bgr = video_reader.read()
-                        if not success:
-                            break
-                        if local_frame_idx < local_output_start:
-                            continue
-                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if carried_seed_masks is not None:
+                for seed_index, seed_mask in enumerate(carried_seed_masks):
+                    obj_idx = inference_session.obj_id_to_idx(seed_index)
+                    inference_session.add_mask_inputs(
+                        obj_idx, 0, seed_mask_to_tensor(seed_mask, device)
+                    )
+            next_seed_frame = ranges[idx + 1][0] if idx + 1 < len(ranges) else None
+            pending_seed_masks = None
+            depth_video = open_depth_mask_video(depth_mask_path, output_start)
+            actual_chunk_end = chunk_start + len(video_frames)
+            next_output_frame = output_start
+            try:
+                for model_outputs in model.propagate_in_video_iterator(
+                    inference_session=inference_session,
+                    max_frame_num_to_track=len(video_frames) - 1,
+                ):
+                    local_frame_index = int(model_outputs.frame_idx)
+                    frame_index = chunk_start + local_frame_index
+                    if frame_index < output_start:
+                        continue
+                    while next_output_frame < frame_index:
+                        skipped_local_frame_index = next_output_frame - chunk_start
+                        skipped_frame_rgb = video_frames[skipped_local_frame_index]
                         depth_mask = read_depth_mask(depth_video, height, width)
-                        frame_global_idx = chunk_start + local_frame_idx
-                        if (
-                            next_chunk_seed_local is not None
-                            and local_frame_idx == next_chunk_seed_local
-                        ):
-                            masks_raw = outputs.get("out_binary_masks", None)
-                            if masks_raw is not None:
-                                pending_seed_points = extract_seed_points(
-                                    np.asarray(masks_raw), height, width
-                                )
-                        masks = (
-                            np.asarray(outputs["out_binary_masks"])
-                            if outputs.get("out_binary_masks") is not None
-                            else None
-                        )
-                        object_ids = tensor_to_list(outputs.get("out_obj_ids", []))
-                        combined_alpha, present_count = combine_masks(
-                            masks,
-                            height,
-                            width,
-                            sam_mask_close_kernel,
-                            sam_mask_dilate_kernel,
-                            sam_mask_border_shift,
-                            sam_mask_overlap_gap_fill,
-                        )
-                        combined_alpha = apply_depth_mask(
-                            combined_alpha,
+                        empty_alpha = apply_depth_mask(
+                            np.zeros((height, width), dtype=np.float32),
                             depth_mask,
                             depth_foreground_threshold,
                             depth_mask_border_shift,
                         )
-                        max_instances = max(max_instances, present_count)
                         write_green_and_alpha(
-                            green_writer, alpha_writer, frame_rgb, combined_alpha
+                            green_writer, alpha_writer, skipped_frame_rgb, empty_alpha
                         )
-                        if output_instance_videos and masks is not None:
-                            write_instance_frames(
-                                instance_writers,
-                                instance_records,
-                                output_dir,
-                                video_stem,
-                                eye,
-                                frame_rgb,
-                                masks,
-                                object_ids,
-                                width,
-                                height,
-                                fps,
-                            )
-                        if frame_global_idx % qc_frame_interval == 0:
-                            area = float((combined_alpha > 0.05).mean())
-                            present_count = (
-                                len(object_ids) if object_ids is not None else 0
-                            )
-                            collect_qc_flags(
-                                frame_global_idx,
-                                area,
-                                present_count,
-                                previous_area,
-                                previous_present_count,
-                                qc_area_jump_threshold,
-                                qc_flags,
-                            )
-                            previous_area = area
-                            previous_present_count = present_count
-                finally:
-                    video_reader.release()
-                    if depth_video is not None:
-                        depth_video.release()
-                carried_seed_points = pending_seed_points
-            finally:
-                predictor.handle_request(
-                    request=dict(
-                        type="close_session",
-                        session_id=session_id,
-                        clear_cache_threshold=0,
+                        next_output_frame += 1
+                    frame_rgb = video_frames[local_frame_index]
+                    depth_mask = read_depth_mask(depth_video, height, width)
+                    processed_outputs = processor.postprocess_outputs(
+                        inference_session, model_outputs
                     )
-                )
-                shutil.rmtree(chunk_dir, ignore_errors=True)
+                    masks = tensor_to_numpy(processed_outputs.get("masks", None))
+                    object_ids = tensor_to_list(processed_outputs.get("object_ids", []))
+                    if next_seed_frame is not None and frame_index >= next_seed_frame:
+                        seed_masks = build_seed_masks(masks, height, width)
+                        if seed_masks is not None:
+                            pending_seed_masks = seed_masks
+                            next_seed_frame = None
+                    combined_alpha, present_count = combine_masks(
+                        masks,
+                        height,
+                        width,
+                        sam_mask_close_kernel,
+                        sam_mask_dilate_kernel,
+                        sam_mask_border_shift,
+                        sam_mask_overlap_gap_fill,
+                    )
+                    combined_alpha = apply_depth_mask(
+                        combined_alpha,
+                        depth_mask,
+                        depth_foreground_threshold,
+                        depth_mask_border_shift,
+                    )
+                    max_instances = max(max_instances, present_count)
+                    write_green_and_alpha(
+                        green_writer, alpha_writer, frame_rgb, combined_alpha
+                    )
+                    if output_instance_videos and masks is not None:
+                        write_instance_frames(
+                            instance_writers,
+                            instance_records,
+                            output_dir,
+                            video_stem,
+                            eye,
+                            frame_rgb,
+                            masks,
+                            object_ids,
+                            width,
+                            height,
+                            fps,
+                        )
+                    if frame_index % qc_frame_interval == 0:
+                        area = float((combined_alpha > 0.05).mean())
+                        present_count = len(object_ids) if object_ids is not None else 0
+                        collect_qc_flags(
+                            frame_index,
+                            area,
+                            present_count,
+                            previous_area,
+                            previous_present_count,
+                            qc_area_jump_threshold,
+                            qc_flags,
+                        )
+                        previous_area = area
+                        previous_present_count = present_count
+                    next_output_frame = frame_index + 1
+                while next_output_frame < actual_chunk_end:
+                    skipped_local_frame_index = next_output_frame - chunk_start
+                    skipped_frame_rgb = video_frames[skipped_local_frame_index]
+                    depth_mask = read_depth_mask(depth_video, height, width)
+                    empty_alpha = apply_depth_mask(
+                        np.zeros((height, width), dtype=np.float32),
+                        depth_mask,
+                        depth_foreground_threshold,
+                        depth_mask_border_shift,
+                    )
+                    write_green_and_alpha(
+                        green_writer, alpha_writer, skipped_frame_rgb, empty_alpha
+                    )
+                    next_output_frame += 1
+            finally:
+                carried_seed_masks = pending_seed_masks
+                if depth_video is not None:
+                    depth_video.release()
+                del inference_session
+                del video_frames
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
     finally:
         green_writer.close()
         if alpha_writer is not None:
@@ -989,18 +952,46 @@ def process_eye_with_sam(
     }
 
 
-def get_sam_chunk_ranges(frame_count, sam_chunk_frames, sam_chunk_overlap_frames):
-    if sam_chunk_frames <= 0:
+def get_sam_chunk_ranges(
+    frame_count, fps, sam_chunk_seconds, sam_chunk_overlap_seconds
+):
+    if sam_chunk_seconds <= 0:
         return [(0, frame_count, 0)]
+    chunk_frames = max(1, int(round(sam_chunk_seconds * fps)))
+    overlap_frames = max(0, int(round(sam_chunk_overlap_seconds * fps)))
+    overlap_frames = max(overlap_frames, SAM_HOTSTART_FRAMES + 5)
+    if overlap_frames >= chunk_frames:
+        raise ValueError(
+            "sam_chunk_overlap_seconds must be less than sam_chunk_seconds"
+        )
 
     ranges = []
     output_start = 0
     while output_start < frame_count:
-        chunk_start = max(0, output_start - sam_chunk_overlap_frames)
-        chunk_end = min(frame_count, output_start + sam_chunk_frames)
+        chunk_start = max(0, output_start - overlap_frames)
+        chunk_end = min(frame_count, output_start + chunk_frames)
         ranges.append((chunk_start, chunk_end, output_start))
         output_start = chunk_end
     return ranges
+
+
+def load_video_frame_range(video_path, start_frame_index, end_frame_index):
+    video = cv2.VideoCapture(video_path)
+    if not video.isOpened():
+        raise ValueError(f"Could not open cropped eye video: {video_path}")
+    try:
+        frames = []
+        video.set(cv2.CAP_PROP_POS_FRAMES, start_frame_index)
+        for _ in range(start_frame_index, end_frame_index):
+            success, frame_bgr = video.read()
+            if not success:
+                break
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        video.release()
+    if len(frames) == 0:
+        raise ValueError(f"Could not read cropped eye video frames: {video_path}")
+    return frames
 
 
 def open_depth_mask_video(depth_mask_path, start_frame_index):
@@ -1094,6 +1085,38 @@ def combine_masks(
     return combined.astype(np.float32) / 255.0, present_count
 
 
+def build_seed_masks(masks, height, width):
+    if masks is None:
+        return None
+    masks = np.asarray(masks)
+    if masks.size == 0:
+        return None
+    if masks.ndim == 2:
+        masks = masks[None]
+    seed_masks = []
+    for mask in masks:
+        mask_2d = np.squeeze(mask)
+        if mask_2d.ndim != 2:
+            continue
+        if mask_2d.shape[:2] != (height, width):
+            mask_2d = cv2.resize(
+                mask_2d.astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        mask_u8 = (mask_2d > 0).astype(np.uint8)
+        if mask_u8.max() == 0:
+            continue
+        seed_masks.append(mask_u8)
+    if len(seed_masks) == 0:
+        return None
+    return seed_masks
+
+
+def seed_mask_to_tensor(seed_mask, device):
+    return torch.from_numpy(seed_mask.astype(np.float32)).to(device)
+
+
 def fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill):
     if sam_mask_overlap_gap_fill <= 0 or len(instance_masks) < 2:
         return combined
@@ -1171,7 +1194,7 @@ def write_instance_frames(
             )
             instance_records[object_id] = {
                 "id": object_id,
-                "concept": "SAM 3.1 object",
+                "concept": "SAM 3 object",
                 "output": os.path.basename(output_path),
             }
         mask = np.squeeze(masks[position])
