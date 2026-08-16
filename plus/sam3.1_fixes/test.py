@@ -1,12 +1,20 @@
 import os
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import cv2
+import subprocess
+import imageio_ffmpeg
 import numpy as np
 from PIL import Image
 from sam3.model_builder import build_sam3_multiplex_video_predictor
 
 predictor = build_sam3_multiplex_video_predictor(
     checkpoint_path="/home/graviton/base/code/repos/Nunif-IW3-Plus/plus/checkpoints/sam3.1_multiplex.pt",
+    max_num_objects=4,
     use_fa3=False,
+    session_expiration_sec=3600,
+    async_loading_frames=False,
 )
 
 
@@ -45,6 +53,25 @@ def abs_to_rel_coords(coords, IMG_WIDTH, IMG_HEIGHT, coord_type="point"):
 video_path = "/home/graviton/Downloads/test.mp4"
 
 if isinstance(video_path, str) and video_path.endswith(".mp4"):
+    processed_video_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test.mp4")
+    subprocess.run(
+        [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-y",
+            "-i",
+            video_path,
+            "-t",
+            "6",
+            "-vf",
+            "crop=iw/2:ih:0:0,scale=1080:-2",
+            "-an",
+            processed_video_path,
+        ],
+        check=True,
+    )
+
+    video_path = processed_video_path
+
     cap = cv2.VideoCapture(video_path)
     IMG_WIDTH = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     IMG_HEIGHT = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -62,6 +89,7 @@ response = predictor.handle_request(
     request=dict(
         type="start_session",
         resource_path=video_path,
+        offload_video_to_cpu=True,
     )
 )
 session_id = response["session_id"]
@@ -144,7 +172,7 @@ out = response["outputs"]
 # now we propagate the outputs from frame 0 to the end of the video and collect all outputs
 outputs_per_frame = propagate_in_video(predictor, session_id)
 
-frame_idx = 0
+frame_idx = 5
 out = outputs_per_frame[frame_idx]
 
 obj_ids = np.asarray(out["out_obj_ids"])

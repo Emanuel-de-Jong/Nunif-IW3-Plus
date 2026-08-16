@@ -1,6 +1,10 @@
 import os
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import gc
 import re
+import sys
 import json
 import shutil
 import tempfile
@@ -10,6 +14,8 @@ import numpy as np
 import imageio_ffmpeg
 import plus.global_params as g
 from fire import Fire
+from iw3.zoedepth_model import ZoeDepthModel
+from sam3.model_builder import build_sam3_multiplex_video_predictor
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 
@@ -26,11 +32,10 @@ def main(
     sam_repo_dir: str = None,
     sam_checkpoint_path: str = "plus/checkpoints/sam3.1_multiplex.pt",
     sam_bpe_path: str = None,
-    sam_prompt_frame_idx: int = 5,
-    sam_prompt_groups: int = 6,
-    sam_max_long_side: int = 0,
-    sam_chunk_seconds: float = 10.0,
-    sam_chunk_overlap_seconds: float = 1.0,
+    sam_prompt_groups: int = 4,
+    sam_max_long_side: int = 1080,
+    sam_chunk_seconds: float = 5.0,
+    sam_chunk_overlap_seconds: float = 0.5,
     sam_video_crf: int = 12,
     sam_video_preset: str = "veryfast",
     sam_compile: bool = False,
@@ -44,7 +49,7 @@ def main(
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
     greenscreen_preset: str = "medium",
-    depth_foreground_threshold: float = 0.2,
+    depth_foreground_threshold: float = 0.0,
     depth_mask_border_shift: int = -10,
     overwrite: bool = False,
 ):
@@ -104,7 +109,6 @@ def main(
         "sam_repo_dir": sam_repo_dir,
         "sam_checkpoint_path": sam_checkpoint_path,
         "sam_bpe_path": sam_bpe_path,
-        "sam_prompt_frame_idx": sam_prompt_frame_idx,
         "sam_prompt_groups": sam_prompt_groups,
         "sam_max_long_side": sam_max_long_side,
         "sam_chunk_seconds": sam_chunk_seconds,
@@ -233,7 +237,7 @@ def main(
 
             depth_mask_paths = {}
             if depth_foreground_threshold > 0:
-                depth_model = create_depth_model(device)
+                depth_model = create_depth_model()
                 try:
                     for eye in ("L", "R"):
                         print(f"==> computing depth masks for eye {eye}", flush=True)
@@ -256,7 +260,7 @@ def main(
                 sam_checkpoint_path,
                 sam_bpe_path,
                 sam_compile,
-                qwen_prompts,
+                sam_prompt_groups,
             )
             try:
                 for eye in ("L", "R"):
@@ -590,9 +594,7 @@ def prompt_matches_scene(concept, include_concepts, specific_include_concepts):
     return False
 
 
-def create_depth_model(device):
-    from iw3.zoedepth_model import ZoeDepthModel
-
+def create_depth_model():
     print("Loading ZoeD_Any_N depth model", flush=True)
     depth_model = ZoeDepthModel("ZoeD_Any_N")
     depth_model.load(gpu=0)
@@ -662,21 +664,22 @@ def create_sam_predictor(
     checkpoint_path,
     bpe_path,
     compiled,
-    qwen_prompts,
+    sam_prompt_groups,
 ):
     print("Loading SAM 3.1 model", flush=True)
-    import sys
 
     resolved_sam_dir = sam_repo_dir or str(g.PLUS_DIR / "sam3")
     if resolved_sam_dir not in sys.path:
         sys.path.insert(0, resolved_sam_dir)
-    from sam3.model_builder import build_sam3_multiplex_video_predictor
 
     return build_sam3_multiplex_video_predictor(
         checkpoint_path=checkpoint_path,
         bpe_path=bpe_path or None,
+        max_num_objects=sam_prompt_groups,
         use_fa3=False,
         compile=compiled,
+        session_expiration_sec=3600,
+        async_loading_frames=False,
     )
 
 
