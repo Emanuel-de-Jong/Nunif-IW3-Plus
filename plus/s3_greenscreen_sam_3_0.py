@@ -274,6 +274,7 @@ def main(
                         eye_data = process_eye_with_sam(
                             predictor,
                             eye_video_paths[eye],
+                            input_video_path,
                             eye_green_paths[eye],
                             eye_alpha_paths[eye],
                             output_dir,
@@ -728,7 +729,8 @@ def crop_eye_video(
 
 def process_eye_with_sam(
     predictor,
-    eye_video_path,
+    sam_eye_video_path,
+    input_video_path,
     green_video_path,
     alpha_video_path,
     output_dir,
@@ -752,13 +754,26 @@ def process_eye_with_sam(
     depth_foreground_threshold=0.0,
     depth_mask_border_shift=0,
 ):
-    video = cv2.VideoCapture(eye_video_path)
+    video = cv2.VideoCapture(sam_eye_video_path)
     if not video.isOpened():
-        raise ValueError(f"Could not open cropped eye video: {eye_video_path}")
+        raise ValueError(f"Could not open cropped eye video: {sam_eye_video_path}")
     try:
-        _, width, height, frame_count = get_video_properties(video)
+        _, sam_width, sam_height, frame_count = get_video_properties(video)
     finally:
         video.release()
+
+    input_video = cv2.VideoCapture(input_video_path)
+    if not input_video.isOpened():
+        raise ValueError(f"Could not open input video: {input_video_path}")
+    try:
+        _, input_width, height, input_frame_count = get_video_properties(input_video)
+    finally:
+        input_video.release()
+    if input_width % 2 != 0:
+        raise ValueError(f"SBS video width must be even, got: {input_width}")
+    if input_frame_count != frame_count:
+        raise ValueError("SAM eye video frame count does not match input video")
+    width = input_width // 2
     model = predictor["model"]
     processor = predictor["processor"]
     device = predictor["device"]
@@ -806,8 +821,13 @@ def process_eye_with_sam(
                 flush=True,
             )
             video_frames = load_video_frame_range(
-                eye_video_path, chunk_start, chunk_end
+                sam_eye_video_path, chunk_start, chunk_end
             )
+            output_frames = load_eye_frame_range(
+                input_video_path, eye, chunk_start, chunk_end, width
+            )
+            if len(output_frames) != len(video_frames):
+                raise ValueError("SAM eye video frames do not match input video frames")
             inference_session = processor.init_video_session(
                 video=video_frames,
                 inference_device=device,
@@ -842,7 +862,7 @@ def process_eye_with_sam(
                         continue
                     while next_output_frame < frame_index:
                         skipped_local_frame_index = next_output_frame - chunk_start
-                        skipped_frame_rgb = video_frames[skipped_local_frame_index]
+                        skipped_frame_rgb = output_frames[skipped_local_frame_index]
                         depth_mask = read_depth_mask(depth_video, height, width)
                         empty_alpha = apply_depth_mask(
                             np.zeros((height, width), dtype=np.float32),
@@ -854,7 +874,7 @@ def process_eye_with_sam(
                             green_writer, alpha_writer, skipped_frame_rgb, empty_alpha
                         )
                         next_output_frame += 1
-                    frame_rgb = video_frames[local_frame_index]
+                    frame_rgb = output_frames[local_frame_index]
                     depth_mask = read_depth_mask(depth_video, height, width)
                     processed_outputs = processor.postprocess_outputs(
                         inference_session, model_outputs
@@ -862,7 +882,7 @@ def process_eye_with_sam(
                     masks = tensor_to_numpy(processed_outputs.get("masks", None))
                     object_ids = tensor_to_list(processed_outputs.get("object_ids", []))
                     if next_seed_frame is not None and frame_index >= next_seed_frame:
-                        seed_masks = build_seed_masks(masks, height, width)
+                        seed_masks = build_seed_masks(masks, sam_height, sam_width)
                         if seed_masks is not None:
                             pending_seed_masks = seed_masks
                             next_seed_frame = None
@@ -916,7 +936,7 @@ def process_eye_with_sam(
                     next_output_frame = frame_index + 1
                 while next_output_frame < actual_chunk_end:
                     skipped_local_frame_index = next_output_frame - chunk_start
-                    skipped_frame_rgb = video_frames[skipped_local_frame_index]
+                    skipped_frame_rgb = output_frames[skipped_local_frame_index]
                     depth_mask = read_depth_mask(depth_video, height, width)
                     empty_alpha = apply_depth_mask(
                         np.zeros((height, width), dtype=np.float32),
@@ -934,6 +954,7 @@ def process_eye_with_sam(
                     depth_video.release()
                 del inference_session
                 del video_frames
+                del output_frames
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -991,6 +1012,31 @@ def load_video_frame_range(video_path, start_frame_index, end_frame_index):
         video.release()
     if len(frames) == 0:
         raise ValueError(f"Could not read cropped eye video frames: {video_path}")
+    return frames
+
+
+def load_eye_frame_range(
+    input_video_path, eye, start_frame_index, end_frame_index, eye_width
+):
+    video = cv2.VideoCapture(input_video_path)
+    if not video.isOpened():
+        raise ValueError(f"Could not open input video: {input_video_path}")
+    try:
+        frames = []
+        video.set(cv2.CAP_PROP_POS_FRAMES, start_frame_index)
+        for _ in range(start_frame_index, end_frame_index):
+            success, frame_bgr = video.read()
+            if not success:
+                break
+            if eye == "L":
+                eye_frame_bgr = frame_bgr[:, :eye_width]
+            else:
+                eye_frame_bgr = frame_bgr[:, eye_width:]
+            frames.append(cv2.cvtColor(eye_frame_bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        video.release()
+    if len(frames) == 0:
+        raise ValueError(f"Could not read input video frames: {input_video_path}")
     return frames
 
 

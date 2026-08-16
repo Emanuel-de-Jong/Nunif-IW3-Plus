@@ -270,6 +270,7 @@ def main(
                     eye_data = process_eye_with_sam(
                         predictor,
                         eye_video_paths[eye],
+                        input_video_path,
                         eye_green_paths[eye],
                         eye_alpha_paths[eye],
                         output_dir,
@@ -760,7 +761,8 @@ def extract_seed_points(masks_np, height, width):
 
 def process_eye_with_sam(
     predictor,
-    eye_video_path,
+    sam_eye_video_path,
+    input_video_path,
     green_video_path,
     alpha_video_path,
     output_dir,
@@ -784,13 +786,26 @@ def process_eye_with_sam(
     depth_foreground_threshold=0.0,
     depth_mask_border_shift=0,
 ):
-    video = cv2.VideoCapture(eye_video_path)
+    video = cv2.VideoCapture(sam_eye_video_path)
     if not video.isOpened():
-        raise ValueError(f"Could not open cropped eye video: {eye_video_path}")
+        raise ValueError(f"Could not open cropped eye video: {sam_eye_video_path}")
     try:
-        _, width, height, frame_count = get_video_properties(video)
+        _, sam_width, sam_height, frame_count = get_video_properties(video)
     finally:
         video.release()
+
+    input_video = cv2.VideoCapture(input_video_path)
+    if not input_video.isOpened():
+        raise ValueError(f"Could not open input video: {input_video_path}")
+    try:
+        _, input_width, height, input_frame_count = get_video_properties(input_video)
+    finally:
+        input_video.release()
+    if input_width % 2 != 0:
+        raise ValueError(f"SBS video width must be even, got: {input_width}")
+    if input_frame_count != frame_count:
+        raise ValueError("SAM eye video frame count does not match input video")
+    width = input_width // 2
 
     green_writer = g.RawVideoWriter(
         green_video_path,
@@ -835,7 +850,9 @@ def process_eye_with_sam(
                 flush=True,
             )
             chunk_dir = os.path.join(chunks_base_dir, f"chunk_{eye}_{idx}")
-            write_chunk_jpeg_folder(eye_video_path, chunk_start, chunk_end, chunk_dir)
+            write_chunk_jpeg_folder(
+                sam_eye_video_path, chunk_start, chunk_end, chunk_dir
+            )
             response = predictor.handle_request(
                 request=dict(
                     type="start_session",
@@ -870,7 +887,7 @@ def process_eye_with_sam(
                     ranges[idx + 1][0] - chunk_start if idx + 1 < len(ranges) else None
                 )
                 pending_seed_points = None
-                video_reader = cv2.VideoCapture(eye_video_path)
+                video_reader = cv2.VideoCapture(input_video_path)
                 video_reader.set(cv2.CAP_PROP_POS_FRAMES, chunk_start)
                 depth_video = open_depth_mask_video(depth_mask_path, output_start)
                 local_output_start = output_start - chunk_start
@@ -889,6 +906,10 @@ def process_eye_with_sam(
                             break
                         if local_frame_idx < local_output_start:
                             continue
+                        if eye == "L":
+                            frame_bgr = frame_bgr[:, :width]
+                        else:
+                            frame_bgr = frame_bgr[:, width:]
                         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                         depth_mask = read_depth_mask(depth_video, height, width)
                         frame_global_idx = chunk_start + local_frame_idx
@@ -899,7 +920,7 @@ def process_eye_with_sam(
                             masks_raw = outputs.get("out_binary_masks", None)
                             if masks_raw is not None:
                                 pending_seed_points = extract_seed_points(
-                                    np.asarray(masks_raw), height, width
+                                    np.asarray(masks_raw), sam_height, sam_width
                                 )
                         masks = (
                             np.asarray(outputs["out_binary_masks"])
