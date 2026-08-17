@@ -91,8 +91,6 @@ run_upscale() {
 run_greenscreen() {
 	printf "\n\n=== STEP 3: GREENSCREEN ===\n"
 	local input_path output_path
-	conda deactivate
-	conda activate sam3
 	for input_path in "${pipeline_inputs[@]}"; do
 		output_path="$(get_step_output_path "$input_path" 3_green)"
 		if [ -f "$output_path" ]; then
@@ -101,8 +99,6 @@ run_greenscreen() {
 		fi
 		python -m plus.s3_greenscreen --input_video_path "$input_path" --output_dir "$TMP_DIR" --output_video_path "$output_path"
 	done
-	conda deactivate
-	conda activate nunifiw3
 	advance_inputs 3_green
 }
 

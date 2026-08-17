@@ -829,6 +829,10 @@ def process_eye_with_sam(
                     inference_session.add_mask_inputs(
                         obj_idx, 0, seed_mask_to_tensor(seed_mask, device)
                     )
+                inference_session.obj_with_new_inputs = list(
+                    range(len(carried_seed_masks))
+                )
+                inference_session.max_obj_id = len(carried_seed_masks) - 1
             next_seed_frame = ranges[idx + 1][0] if idx + 1 < len(ranges) else None
             pending_seed_masks = None
             depth_video = open_depth_mask_video(depth_mask_path, output_start)
@@ -1143,7 +1147,7 @@ def build_seed_masks(masks, height, width):
 
 
 def seed_mask_to_tensor(seed_mask, device):
-    return torch.from_numpy(seed_mask.astype(np.float32)).to(device)
+    return torch.from_numpy(seed_mask.astype(np.float32))[None, None].to(device)
 
 
 def fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill):

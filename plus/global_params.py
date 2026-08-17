@@ -74,6 +74,8 @@ class RawVideoWriter:
         else:
             command.extend(
                 [
+                    "-vf",
+                    "crop=trunc(iw/2)*2:trunc(ih/2)*2:0:0",
                     "-crf",
                     str(crf),
                     "-preset",
