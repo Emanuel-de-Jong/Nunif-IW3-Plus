@@ -741,7 +741,7 @@ def process_eye_with_sam(
     if not video.isOpened():
         raise ValueError(f"Could not open cropped eye video: {sam_eye_video_path}")
     try:
-        _, sam_width, sam_height, frame_count = get_video_properties(video)
+        _, _, _, frame_count = get_video_properties(video)
     finally:
         video.release()
 
@@ -795,9 +795,8 @@ def process_eye_with_sam(
     ranges = get_sam_chunk_ranges(
         frame_count, fps, sam_chunk_seconds, sam_chunk_overlap_seconds
     )
-    carried_seed_masks = None
     try:
-        for idx, (chunk_start, chunk_end, output_start) in enumerate(ranges):
+        for chunk_start, chunk_end, output_start in ranges:
             print(
                 f"==> eye {eye}: SAM frames {chunk_start}-{chunk_end - 1}, "
                 f"writing from {output_start}",
@@ -823,18 +822,6 @@ def process_eye_with_sam(
                     inference_session=inference_session,
                     text=prompt,
                 )
-            if carried_seed_masks is not None:
-                for seed_index, seed_mask in enumerate(carried_seed_masks):
-                    obj_idx = inference_session.obj_id_to_idx(seed_index)
-                    inference_session.add_mask_inputs(
-                        obj_idx, 0, seed_mask_to_tensor(seed_mask, device)
-                    )
-                inference_session.obj_with_new_inputs = list(
-                    range(len(carried_seed_masks))
-                )
-                inference_session.max_obj_id = len(carried_seed_masks) - 1
-            next_seed_frame = ranges[idx + 1][0] if idx + 1 < len(ranges) else None
-            pending_seed_masks = None
             depth_video = open_depth_mask_video(depth_mask_path, output_start)
             actual_chunk_end = chunk_start + len(video_frames)
             next_output_frame = output_start
@@ -868,11 +855,6 @@ def process_eye_with_sam(
                     )
                     masks = tensor_to_numpy(processed_outputs.get("masks", None))
                     object_ids = tensor_to_list(processed_outputs.get("object_ids", []))
-                    if next_seed_frame is not None and frame_index >= next_seed_frame:
-                        seed_masks = build_seed_masks(masks, sam_height, sam_width)
-                        if seed_masks is not None:
-                            pending_seed_masks = seed_masks
-                            next_seed_frame = None
                     combined_alpha, present_count = combine_masks(
                         masks,
                         height,
@@ -936,7 +918,6 @@ def process_eye_with_sam(
                     )
                     next_output_frame += 1
             finally:
-                carried_seed_masks = pending_seed_masks
                 if depth_video is not None:
                     depth_video.release()
                 del inference_session
@@ -1116,38 +1097,6 @@ def combine_masks(
         combined, sam_mask_close_kernel, sam_mask_dilate_kernel, sam_mask_border_shift
     )
     return combined.astype(np.float32) / 255.0, present_count
-
-
-def build_seed_masks(masks, height, width):
-    if masks is None:
-        return None
-    masks = np.asarray(masks)
-    if masks.size == 0:
-        return None
-    if masks.ndim == 2:
-        masks = masks[None]
-    seed_masks = []
-    for mask in masks:
-        mask_2d = np.squeeze(mask)
-        if mask_2d.ndim != 2:
-            continue
-        if mask_2d.shape[:2] != (height, width):
-            mask_2d = cv2.resize(
-                mask_2d.astype(np.uint8),
-                (width, height),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        mask_u8 = (mask_2d > 0).astype(np.uint8)
-        if mask_u8.max() == 0:
-            continue
-        seed_masks.append(mask_u8)
-    if len(seed_masks) == 0:
-        return None
-    return seed_masks
-
-
-def seed_mask_to_tensor(seed_mask, device):
-    return torch.from_numpy(seed_mask.astype(np.float32))[None, None].to(device)
 
 
 def fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill):
