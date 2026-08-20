@@ -30,7 +30,7 @@ def main(
     output_dir: str = None,
     output_video_path: str = None,
     vlm_model_id: str = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated",
-    num_sampled_frames: int = 7,
+    num_sampled_frames: int = 5,
     num_vote_runs: int = 2,
     vlm_temperature: float = 0.2,
     vlm_max_new_tokens: int = 768,
@@ -47,12 +47,12 @@ def main(
     output_instance_videos: bool = False,
     sam_mask_close_kernel: int = 9,
     sam_mask_border_shift: int = 1,
-    sam_mask_overlap_gap_fill: int = 40,
+    sam_mask_overlap_gap_fill: int = 30,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
     greenscreen_preset: str = "medium",
-    depth_foreground_threshold: float = 0.2,
+    depth_foreground_threshold: float = 0.15,
     depth_mask_border_shift: int = -10,
     prompt_override: str = None,
     overwrite: bool = False,
@@ -94,13 +94,23 @@ def main(
         return
     os.makedirs(work_dir, exist_ok=True)
 
-    retained_eye_path = os.path.join(output_dir, f"{output_stem}_L.mp4")
-    retained_green_path = os.path.join(output_dir, f"{output_stem}_green_L.mp4")
+    retained_eye_path = os.path.join(output_dir, f"{output_stem}_downscale_L.mp4")
+    retained_green_path = os.path.join(output_dir, f"{output_stem}_L.mp4")
     retained_state_path = os.path.join(output_dir, f"{output_stem}_state.json")
+    retained_depth_mask_path = os.path.join(
+        output_dir, f"{output_stem}_depth_mask_L.mp4"
+    )
     retained_depth_path = os.path.join(output_dir, f"{output_stem}_depth_L.mp4")
-    retained_depth_raw_path = os.path.join(output_dir, f"{output_stem}_depth_L_raw.mp4")
+    retained_depth_mask_raw_border_shift_path = os.path.join(
+        output_dir, f"{output_stem}_depth_mask_L_raw_border_shift.mp4"
+    )
     retained_sam_path = os.path.join(output_dir, f"{output_stem}_sam_L.mp4")
-    retained_sam_raw_path = os.path.join(output_dir, f"{output_stem}_sam_L_raw.mp4")
+    retained_sam_raw_border_shift_path = os.path.join(
+        output_dir, f"{output_stem}_sam_L_raw_border_shift.mp4"
+    )
+    retained_sam_raw_fill_overlap_path = os.path.join(
+        output_dir, f"{output_stem}_sam_L_raw_fill_overlap.mp4"
+    )
 
     config = {
         "vlm_model_id": vlm_model_id,
@@ -264,27 +274,34 @@ def main(
             "L": os.path.join(work_dir, "alpha_L.mp4"),
             "R": os.path.join(work_dir, "alpha_R.mp4"),
         }
+        eye_depth_binary_paths = {
+            "L": os.path.join(work_dir, "depth_mask_binary_L.mp4"),
+            "R": os.path.join(work_dir, "depth_mask_binary_R.mp4"),
+        }
         eye_depth_mask_paths = {
-            "L": os.path.join(work_dir, "depth_mask_L.mkv"),
-            "R": os.path.join(work_dir, "depth_mask_R.mkv"),
+            "L": os.path.join(work_dir, "depth_mask_L.mp4"),
+            "R": os.path.join(work_dir, "depth_mask_R.mp4"),
         }
-        eye_depth_green_paths = {
+        eye_depth_paths = {
             "L": os.path.join(work_dir, "depth_L.mp4"),
-            "R": None,
+            "R": os.path.join(work_dir, "depth_R.mp4"),
         }
-        eye_depth_raw_green_paths = {
-            "L": os.path.join(work_dir, "depth_L_raw.mp4"),
-            "R": None,
+        eye_depth_mask_raw_border_shift_paths = {
+            "L": os.path.join(work_dir, "depth_mask_L_raw_border_shift.mp4"),
+            "R": os.path.join(work_dir, "depth_mask_R_raw_border_shift.mp4"),
         }
-        eye_sam_green_paths = {
+        eye_sam_raw_border_shift_paths = {
+            "L": os.path.join(work_dir, "sam_L_raw_border_shift.mp4"),
+            "R": os.path.join(work_dir, "sam_R_raw_border_shift.mp4"),
+        }
+        eye_sam_paths = {
             "L": os.path.join(work_dir, "sam_L.mp4"),
-            "R": None,
+            "R": os.path.join(work_dir, "sam_R.mp4"),
         }
-        eye_sam_raw_green_paths = {
-            "L": os.path.join(work_dir, "sam_L_raw.mp4"),
-            "R": None,
+        eye_sam_raw_fill_overlap_paths = {
+            "L": os.path.join(work_dir, "sam_L_raw_fill_overlap.mp4"),
+            "R": os.path.join(work_dir, "sam_R_raw_fill_overlap.mp4"),
         }
-
         try:
             for eye in ("L", "R"):
                 crop_step = f"crop_{eye}"
@@ -306,44 +323,49 @@ def main(
                     )
 
             depth_mask_paths = {}
-            if depth_foreground_threshold > 0:
-                pending_depth_eyes = []
-                for eye in ("L", "R"):
-                    depth_step = f"depth_{eye}"
-                    if not is_completed_file(
-                        state, depth_step, eye_depth_mask_paths[eye]
-                    ):
-                        pending_depth_eyes.append(eye)
-                    depth_mask_paths[eye] = eye_depth_mask_paths[eye]
-                if len(pending_depth_eyes) > 0:
-                    depth_model = create_depth_model()
-                    try:
-                        for eye in pending_depth_eyes:
-                            print(
-                                f"==> computing depth masks for eye {eye}", flush=True
-                            )
-                            depth_step = f"depth_{eye}"
-                            temp_depth_mask_path = get_temp_path(
-                                eye_depth_mask_paths[eye]
-                            )
-                            remove_if_exists(temp_depth_mask_path)
-                            compute_eye_depth_mask_video(
-                                depth_model,
-                                eye_video_paths[eye],
-                                temp_depth_mask_path,
-                                depth_foreground_threshold,
-                                fps,
-                            )
-                            os.replace(temp_depth_mask_path, eye_depth_mask_paths[eye])
-                            mark_completed(state, depth_step)
-                            save_resume_state(
-                                state_path, state, input_video_path, output_stem, config
-                            )
-                    finally:
-                        del depth_model
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+            pending_depth_eyes = []
+            for eye in ("L", "R"):
+                depth_step = f"depth_{eye}"
+                if depth_foreground_threshold > 0 and (
+                    not is_completed_file(
+                        state, depth_step, eye_depth_binary_paths[eye]
+                    )
+                    or not os.path.isfile(eye_depth_paths[eye])
+                ):
+                    pending_depth_eyes.append(eye)
+                if depth_foreground_threshold > 0:
+                    depth_mask_paths[eye] = eye_depth_binary_paths[eye]
+            if len(pending_depth_eyes) > 0:
+                depth_model = create_depth_model()
+                try:
+                    for eye in pending_depth_eyes:
+                        print(f"==> computing depth for eye {eye}", flush=True)
+                        depth_step = f"depth_{eye}"
+                        temp_depth_mask_path = get_temp_path(
+                            eye_depth_binary_paths[eye]
+                        )
+                        remove_if_exists(temp_depth_mask_path)
+                        compute_eye_depth_mask_video(
+                            depth_model,
+                            eye_video_paths[eye],
+                            temp_depth_mask_path,
+                            get_temp_path(eye_depth_paths[eye]),
+                            depth_foreground_threshold,
+                            fps,
+                        )
+                        os.replace(temp_depth_mask_path, eye_depth_binary_paths[eye])
+                        os.replace(
+                            get_temp_path(eye_depth_paths[eye]), eye_depth_paths[eye]
+                        )
+                        mark_completed(state, depth_step)
+                        save_resume_state(
+                            state_path, state, input_video_path, output_stem, config
+                        )
+                finally:
+                    del depth_model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             pending_sam_eyes = []
             for eye in ("L", "R"):
@@ -354,11 +376,14 @@ def main(
                     eye,
                     eye_green_paths[eye],
                     eye_alpha_paths[eye],
-                    (
-                        eye_depth_green_paths[eye],
-                        eye_depth_raw_green_paths[eye],
-                        eye_sam_green_paths[eye],
-                        eye_sam_raw_green_paths[eye],
+                    get_retained_debug_paths(
+                        eye,
+                        eye_depth_mask_paths,
+                        eye_depth_mask_raw_border_shift_paths,
+                        eye_sam_paths,
+                        eye_sam_raw_border_shift_paths,
+                        eye_sam_raw_fill_overlap_paths,
+                        depth_foreground_threshold,
                     ),
                     output_alpha_video,
                     output_instance_videos,
@@ -380,24 +405,58 @@ def main(
                             sam_step = f"sam_{eye}"
                             remove_if_exists(get_temp_path(eye_green_paths[eye]))
                             remove_if_exists(get_temp_path(eye_alpha_paths[eye]))
-                            for debug_video_path in (
-                                eye_depth_green_paths[eye],
-                                eye_depth_raw_green_paths[eye],
-                                eye_sam_green_paths[eye],
-                                eye_sam_raw_green_paths[eye],
-                            ):
-                                if debug_video_path is not None:
-                                    remove_if_exists(get_temp_path(debug_video_path))
+                            debug_video_paths = get_retained_debug_paths(
+                                eye,
+                                eye_depth_mask_paths,
+                                eye_depth_mask_raw_border_shift_paths,
+                                eye_sam_paths,
+                                eye_sam_raw_border_shift_paths,
+                                eye_sam_raw_fill_overlap_paths,
+                                depth_foreground_threshold,
+                            )
+                            for debug_video_path in debug_video_paths:
+                                remove_if_exists(get_temp_path(debug_video_path))
                             eye_data = process_eye_with_sam(
                                 predictor,
                                 eye_video_paths[eye],
                                 input_video_path,
                                 get_temp_path(eye_green_paths[eye]),
                                 get_temp_path(eye_alpha_paths[eye]),
-                                get_optional_temp_path(eye_depth_green_paths[eye]),
-                                get_optional_temp_path(eye_depth_raw_green_paths[eye]),
-                                get_optional_temp_path(eye_sam_green_paths[eye]),
-                                get_optional_temp_path(eye_sam_raw_green_paths[eye]),
+                                (
+                                    get_optional_temp_path(
+                                        get_retained_debug_path(
+                                            eye,
+                                            eye_depth_mask_paths,
+                                        )
+                                    )
+                                    if depth_foreground_threshold > 0
+                                    else None
+                                ),
+                                (
+                                    get_optional_temp_path(
+                                        get_retained_debug_path(
+                                            eye,
+                                            eye_depth_mask_raw_border_shift_paths,
+                                        )
+                                    )
+                                    if depth_foreground_threshold > 0
+                                    else None
+                                ),
+                                get_optional_temp_path(
+                                    get_retained_debug_path(eye, eye_sam_paths)
+                                ),
+                                get_optional_temp_path(
+                                    get_retained_debug_path(
+                                        eye,
+                                        eye_sam_raw_border_shift_paths,
+                                    )
+                                ),
+                                get_optional_temp_path(
+                                    get_retained_debug_path(
+                                        eye,
+                                        eye_sam_raw_fill_overlap_paths,
+                                    )
+                                ),
                                 state,
                                 state_path,
                                 input_video_path,
@@ -431,31 +490,11 @@ def main(
                                     get_temp_path(eye_alpha_paths[eye]),
                                     eye_alpha_paths[eye],
                                 )
-                            for debug_video_path in (
-                                eye_depth_green_paths[eye],
-                                eye_depth_raw_green_paths[eye],
-                                eye_sam_green_paths[eye],
-                                eye_sam_raw_green_paths[eye],
-                            ):
-                                if debug_video_path is not None:
-                                    os.replace(
-                                        get_temp_path(debug_video_path),
-                                        debug_video_path,
-                                    )
+                            for debug_video_path in debug_video_paths:
+                                os.replace(
+                                    get_temp_path(debug_video_path), debug_video_path
+                                )
                             sidecar["eyes"][eye] = eye_data
-                            if eye == "L":
-                                sidecar["eyes"][eye]["depth"] = os.path.basename(
-                                    retained_depth_path
-                                )
-                                sidecar["eyes"][eye]["depth_raw"] = os.path.basename(
-                                    retained_depth_raw_path
-                                )
-                                sidecar["eyes"][eye]["sam"] = os.path.basename(
-                                    retained_sam_path
-                                )
-                                sidecar["eyes"][eye]["sam_raw"] = os.path.basename(
-                                    retained_sam_raw_path
-                                )
                             state.setdefault("eyes", {})[eye] = eye_data
                             mark_completed(state, sam_step)
                             save_resume_state(
@@ -494,12 +533,23 @@ def main(
             sidecar["outputs"]["alpha"] = os.path.basename(alpha_path)
             print(f"==> saved alpha video: {alpha_path}", flush=True)
 
-        sidecar["outputs"]["left_eye"] = os.path.basename(retained_eye_path)
-        sidecar["outputs"]["left_greenscreen"] = os.path.basename(retained_green_path)
-        sidecar["outputs"]["left_depth"] = os.path.basename(retained_depth_path)
-        sidecar["outputs"]["left_depth_raw"] = os.path.basename(retained_depth_raw_path)
-        sidecar["outputs"]["left_sam"] = os.path.basename(retained_sam_path)
-        sidecar["outputs"]["left_sam_raw"] = os.path.basename(retained_sam_raw_path)
+        sidecar["outputs"]["l_downscale"] = os.path.basename(retained_eye_path)
+        sidecar["outputs"]["l_greenscreen"] = os.path.basename(retained_green_path)
+        if depth_foreground_threshold > 0:
+            sidecar["outputs"]["l_depth_mask"] = os.path.basename(
+                retained_depth_mask_path
+            )
+            sidecar["outputs"]["l_depth"] = os.path.basename(retained_depth_path)
+            sidecar["outputs"]["l_depth_mask_raw_border_shift"] = os.path.basename(
+                retained_depth_mask_raw_border_shift_path
+            )
+        sidecar["outputs"]["l_sam"] = os.path.basename(retained_sam_path)
+        sidecar["outputs"]["l_sam_raw_border_shift"] = os.path.basename(
+            retained_sam_raw_border_shift_path
+        )
+        sidecar["outputs"]["l_sam_raw_fill_overlap"] = os.path.basename(
+            retained_sam_raw_fill_overlap_path
+        )
         sidecar["outputs"]["state"] = os.path.basename(retained_state_path)
         save_sidecar(sidecar_path, sidecar)
         write_qc_log(qc_log_path, sidecar)
@@ -511,20 +561,43 @@ def main(
     finally:
         if pipeline_complete and os.path.isdir(work_dir):
             retained_artifacts = (
+                (state_path, retained_state_path),
                 (eye_video_paths["L"], retained_eye_path),
                 (eye_green_paths["L"], retained_green_path),
-                (eye_depth_green_paths["L"], retained_depth_path),
-                (eye_depth_raw_green_paths["L"], retained_depth_raw_path),
-                (eye_sam_green_paths["L"], retained_sam_path),
-                (eye_sam_raw_green_paths["L"], retained_sam_raw_path),
-                (state_path, retained_state_path),
+                *(
+                    (
+                        (eye_depth_mask_paths["L"], retained_depth_mask_path),
+                        (eye_depth_paths["L"], retained_depth_path),
+                    )
+                    if depth_foreground_threshold > 0
+                    else ()
+                ),
+                *(
+                    (
+                        (
+                            eye_depth_mask_raw_border_shift_paths["L"],
+                            retained_depth_mask_raw_border_shift_path,
+                        ),
+                    )
+                    if depth_foreground_threshold > 0
+                    else ()
+                ),
+                (eye_sam_paths["L"], retained_sam_path),
+                (
+                    eye_sam_raw_border_shift_paths["L"],
+                    retained_sam_raw_border_shift_path,
+                ),
+                (
+                    eye_sam_raw_fill_overlap_paths["L"],
+                    retained_sam_raw_fill_overlap_path,
+                ),
             )
             for source_path, destination_path in retained_artifacts:
                 temp_destination_path = get_temp_path(destination_path)
                 remove_if_exists(temp_destination_path)
                 shutil.copy2(source_path, temp_destination_path)
                 os.replace(temp_destination_path, destination_path)
-            shutil.rmtree(work_dir, ignore_errors=True)
+            # shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def get_video_properties(video):
@@ -665,20 +738,29 @@ def set_sam_chunk_record(state, eye, chunk_key, chunk_record):
     state.setdefault("sam_chunks", {}).setdefault(eye, {})[chunk_key] = chunk_record
 
 
-def get_sam_chunk_paths(
-    chunk_dir, range_index, output_alpha_video, output_debug_videos
-):
+def get_sam_chunk_paths(chunk_dir, range_index, output_alpha_video, debug_names):
     chunk_base = f"chunk_{range_index:06d}"
     paths = {
         "green": os.path.join(chunk_dir, f"{chunk_base}_green.mp4"),
     }
     if output_alpha_video:
         paths["alpha"] = os.path.join(chunk_dir, f"{chunk_base}_alpha.mp4")
-    if output_debug_videos:
-        paths["depth"] = os.path.join(chunk_dir, f"{chunk_base}_depth.mp4")
-        paths["depth_raw"] = os.path.join(chunk_dir, f"{chunk_base}_depth_raw.mp4")
+    if "depth_mask" in debug_names:
+        paths["depth_mask"] = os.path.join(chunk_dir, f"{chunk_base}_depth_mask.mp4")
+    if "depth_mask_raw_border_shift" in debug_names:
+        paths["depth_mask_raw_border_shift"] = os.path.join(
+            chunk_dir, f"{chunk_base}_depth_mask_raw_border_shift.mp4"
+        )
+    if "sam" in debug_names:
         paths["sam"] = os.path.join(chunk_dir, f"{chunk_base}_sam.mp4")
-        paths["sam_raw"] = os.path.join(chunk_dir, f"{chunk_base}_sam_raw.mp4")
+    if "sam_raw_border_shift" in debug_names:
+        paths["sam_raw_border_shift"] = os.path.join(
+            chunk_dir, f"{chunk_base}_sam_raw_border_shift.mp4"
+        )
+    if "sam_raw_fill_overlap" in debug_names:
+        paths["sam_raw_fill_overlap"] = os.path.join(
+            chunk_dir, f"{chunk_base}_sam_raw_fill_overlap.mp4"
+        )
     return paths
 
 
@@ -718,6 +800,36 @@ def get_optional_temp_path(path):
     if path is None:
         return None
     return get_temp_path(path)
+
+
+def get_retained_debug_path(eye, debug_video_paths):
+    if eye != "L":
+        return None
+    return debug_video_paths[eye]
+
+
+def get_retained_debug_paths(
+    eye,
+    depth_mask_paths,
+    depth_mask_raw_border_shift_paths,
+    sam_paths,
+    sam_raw_border_shift_paths,
+    sam_raw_fill_overlap_paths,
+    depth_foreground_threshold,
+):
+    if eye != "L":
+        return ()
+    paths = (
+        sam_paths[eye],
+        sam_raw_border_shift_paths[eye],
+        sam_raw_fill_overlap_paths[eye],
+    )
+    if depth_foreground_threshold > 0:
+        paths = (
+            depth_mask_paths[eye],
+            depth_mask_raw_border_shift_paths[eye],
+        ) + paths
+    return paths
 
 
 def remove_if_exists(path):
@@ -960,6 +1072,7 @@ def compute_eye_depth_mask_video(
     depth_model,
     eye_video_path,
     depth_mask_path,
+    depth_path,
     depth_foreground_threshold,
     fps,
 ):
@@ -968,7 +1081,26 @@ def compute_eye_depth_mask_video(
         raise ValueError(f"Could not open cropped eye video: {eye_video_path}")
     try:
         _, width, height, _ = get_video_properties(video)
-        writer = g.RawVideoWriter(depth_mask_path, width, height, fps, codec="ffv1")
+        mask_writer = g.RawVideoWriter(
+            depth_mask_path,
+            width,
+            height,
+            fps,
+            codec="libx264",
+            crf=0,
+            preset="veryfast",
+            pixel_format="yuv444p",
+        )
+        depth_writer = g.RawVideoWriter(
+            depth_path,
+            width,
+            height,
+            fps,
+            codec="libx264",
+            crf=18,
+            preset="medium",
+            pixel_format="yuv420p",
+        )
         try:
             while True:
                 success, frame_bgr = video.read()
@@ -981,14 +1113,22 @@ def compute_eye_depth_mask_video(
                 depth = depth_model.infer(frame_tensor.to(depth_model.device))
                 depth = depth_model.minmax_normalize_chw(depth)
                 depth_np = depth.squeeze(0).cpu().numpy()
-                mask = (depth_np >= 1.0 - depth_foreground_threshold).astype(np.uint8)
-                if mask.shape != (height, width):
-                    mask = cv2.resize(
-                        mask, (width, height), interpolation=cv2.INTER_NEAREST
+                if depth_np.shape != (height, width):
+                    depth_np = cv2.resize(
+                        depth_np, (width, height), interpolation=cv2.INTER_LINEAR
                     )
-                writer.write(np.repeat(mask[:, :, None] * 255, 3, axis=2))
+                mask = (depth_np >= 1.0 - depth_foreground_threshold).astype(np.uint8)
+                depth_u8 = np.round(depth_np * 255.0).clip(0, 255).astype(np.uint8)
+                depth_writer.write(
+                    cv2.cvtColor(
+                        cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET),
+                        cv2.COLOR_BGR2RGB,
+                    )
+                )
+                mask_writer.write(np.repeat(mask[:, :, None] * 255, 3, axis=2))
         finally:
-            writer.close()
+            mask_writer.close()
+            depth_writer.close()
     finally:
         video.release()
 
@@ -1080,10 +1220,11 @@ def process_eye_with_sam(
     input_video_path,
     green_video_path,
     alpha_video_path,
-    depth_green_video_path,
-    depth_raw_green_video_path,
-    sam_green_video_path,
-    sam_raw_green_video_path,
+    depth_mask_video_path,
+    depth_mask_raw_border_shift_video_path,
+    sam_video_path,
+    sam_raw_border_shift_video_path,
+    sam_raw_fill_overlap_video_path,
     state,
     state_path,
     resume_input_video_path,
@@ -1145,36 +1286,31 @@ def process_eye_with_sam(
     )
     chunk_dir = os.path.join(os.path.dirname(green_video_path), f"sam_{eye}_chunks")
     os.makedirs(chunk_dir, exist_ok=True)
-    output_debug_videos = all(
-        video_path is not None
-        for video_path in (
-            depth_green_video_path,
-            depth_raw_green_video_path,
-            sam_green_video_path,
-            sam_raw_green_video_path,
-        )
+    debug_video_paths = {
+        "depth_mask": depth_mask_video_path,
+        "depth_mask_raw_border_shift": depth_mask_raw_border_shift_video_path,
+        "sam": sam_video_path,
+        "sam_raw_border_shift": sam_raw_border_shift_video_path,
+        "sam_raw_fill_overlap": sam_raw_fill_overlap_video_path,
+    }
+    debug_names = tuple(
+        name for name, path in debug_video_paths.items() if path is not None
     )
     chunk_green_paths = []
     chunk_alpha_paths = []
-    chunk_debug_paths = {
-        "depth": [],
-        "depth_raw": [],
-        "sam": [],
-        "sam_raw": [],
-    }
+    chunk_debug_paths = {name: [] for name in debug_names}
 
     for range_index, (chunk_start, chunk_end, output_start) in enumerate(ranges):
         chunk_key = str(range_index)
         chunk_record = get_sam_chunk_record(state, eye, chunk_key)
         chunk_paths = get_sam_chunk_paths(
-            chunk_dir, range_index, output_alpha_video, output_debug_videos
+            chunk_dir, range_index, output_alpha_video, debug_names
         )
         chunk_green_paths.append(chunk_paths["green"])
         if output_alpha_video:
             chunk_alpha_paths.append(chunk_paths["alpha"])
-        if output_debug_videos:
-            for debug_name in chunk_debug_paths:
-                chunk_debug_paths[debug_name].append(chunk_paths[debug_name])
+        for debug_name in chunk_debug_paths:
+            chunk_debug_paths[debug_name].append(chunk_paths[debug_name])
         if not output_instance_videos and sam_chunk_is_complete(
             chunk_record, chunk_paths, output_alpha_video
         ):
@@ -1212,18 +1348,17 @@ def process_eye_with_sam(
                 pixel_format="yuv420p",
             )
         debug_writers = {}
-        if output_debug_videos:
-            for debug_name in chunk_debug_paths:
-                debug_writers[debug_name] = g.RawVideoWriter(
-                    get_temp_path(chunk_paths[debug_name]),
-                    width,
-                    height,
-                    fps,
-                    codec="libx264",
-                    crf=greenscreen_crf,
-                    preset=greenscreen_preset,
-                    pixel_format="yuv420p",
-                )
+        for debug_name in chunk_debug_paths:
+            debug_writers[debug_name] = g.RawVideoWriter(
+                get_temp_path(chunk_paths[debug_name]),
+                width,
+                height,
+                fps,
+                codec="libx264",
+                crf=greenscreen_crf,
+                preset=greenscreen_preset,
+                pixel_format="yuv420p",
+            )
         chunk_qc_flags = []
         chunk_max_instances = 0
         try:
@@ -1295,7 +1430,12 @@ def process_eye_with_sam(
                     )
                     masks = tensor_to_numpy(processed_outputs.get("masks", None))
                     object_ids = tensor_to_list(processed_outputs.get("object_ids", []))
-                    sam_alpha, sam_raw_alpha, present_count = combine_masks(
+                    (
+                        sam_alpha,
+                        sam_raw_alpha,
+                        sam_fill_overlap_alpha,
+                        present_count,
+                    ) = combine_masks(
                         masks,
                         height,
                         width,
@@ -1311,6 +1451,7 @@ def process_eye_with_sam(
                         depth_mask_border_shift,
                         sam_alpha,
                         sam_raw_alpha,
+                        sam_fill_overlap_alpha,
                     )
                     combined_alpha = sam_alpha
                     combined_alpha = apply_depth_mask(
@@ -1396,11 +1537,8 @@ def process_eye_with_sam(
         os.replace(get_temp_path(chunk_paths["green"]), chunk_paths["green"])
         if output_alpha_video:
             os.replace(get_temp_path(chunk_paths["alpha"]), chunk_paths["alpha"])
-        if output_debug_videos:
-            for debug_name in chunk_debug_paths:
-                os.replace(
-                    get_temp_path(chunk_paths[debug_name]), chunk_paths[debug_name]
-                )
+        for debug_name in chunk_debug_paths:
+            os.replace(get_temp_path(chunk_paths[debug_name]), chunk_paths[debug_name])
         qc_flags.extend(chunk_qc_flags)
         chunk_record = {
             "chunk_start": chunk_start,
@@ -1425,14 +1563,8 @@ def process_eye_with_sam(
     concat_videos(chunk_green_paths, green_video_path)
     if output_alpha_video:
         concat_videos(chunk_alpha_paths, alpha_video_path)
-    if output_debug_videos:
-        debug_video_paths = {
-            "depth": depth_green_video_path,
-            "depth_raw": depth_raw_green_video_path,
-            "sam": sam_green_video_path,
-            "sam_raw": sam_raw_green_video_path,
-        }
-        for debug_name, debug_video_path in debug_video_paths.items():
+    for debug_name, debug_video_path in debug_video_paths.items():
+        if debug_video_path is not None:
             concat_videos(chunk_debug_paths[debug_name], debug_video_path)
 
     for writer in instance_writers.values():
@@ -1551,6 +1683,7 @@ def write_debug_green_frames(
     depth_mask_border_shift,
     sam_alpha,
     sam_raw_alpha,
+    sam_fill_overlap_alpha=None,
 ):
     if len(debug_writers) == 0:
         return
@@ -1558,16 +1691,30 @@ def write_debug_green_frames(
     depth_raw_alpha = apply_depth_mask(
         empty_alpha, depth_mask, depth_foreground_threshold
     )
+    if sam_fill_overlap_alpha is None:
+        sam_fill_overlap_alpha = sam_raw_alpha
     depth_alpha = apply_depth_mask(
         empty_alpha,
         depth_mask,
         depth_foreground_threshold,
         depth_mask_border_shift,
     )
-    debug_writers["depth"].write(composite_green(frame_rgb, depth_alpha))
-    debug_writers["depth_raw"].write(composite_green(frame_rgb, depth_raw_alpha))
-    debug_writers["sam"].write(composite_green(frame_rgb, sam_alpha))
-    debug_writers["sam_raw"].write(composite_green(frame_rgb, sam_raw_alpha))
+    if "depth_mask" in debug_writers:
+        debug_writers["depth_mask"].write(composite_green(frame_rgb, depth_alpha))
+    if "depth_mask_raw_border_shift" in debug_writers:
+        debug_writers["depth_mask_raw_border_shift"].write(
+            composite_green(frame_rgb, depth_raw_alpha)
+        )
+    if "sam" in debug_writers:
+        debug_writers["sam"].write(composite_green(frame_rgb, sam_alpha))
+    if "sam_raw_border_shift" in debug_writers:
+        debug_writers["sam_raw_border_shift"].write(
+            composite_green(frame_rgb, sam_raw_alpha)
+        )
+    if "sam_raw_fill_overlap" in debug_writers:
+        debug_writers["sam_raw_fill_overlap"].write(
+            composite_green(frame_rgb, sam_fill_overlap_alpha)
+        )
 
 
 def tensor_to_numpy(value):
@@ -1598,11 +1745,11 @@ def combine_masks(
 ):
     if masks is None:
         empty_alpha = np.zeros((height, width), dtype=np.float32)
-        return empty_alpha, empty_alpha, 0
+        return empty_alpha, empty_alpha, empty_alpha, 0
     masks = np.asarray(masks)
     if masks.size == 0:
         empty_alpha = np.zeros((height, width), dtype=np.float32)
-        return empty_alpha, empty_alpha, 0
+        return empty_alpha, empty_alpha, empty_alpha, 0
     if masks.ndim == 2:
         masks = masks[None]
     combined = np.zeros((height, width), dtype=np.uint8)
@@ -1627,10 +1774,12 @@ def combine_masks(
 
     raw_combined = combined.copy()
     combined = fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill)
+    fill_overlap_combined = combined.copy()
     combined = postprocess_mask(combined, sam_mask_close_kernel, sam_mask_border_shift)
     return (
         combined.astype(np.float32) / 255.0,
         raw_combined.astype(np.float32) / 255.0,
+        fill_overlap_combined.astype(np.float32) / 255.0,
         present_count,
     )
 
