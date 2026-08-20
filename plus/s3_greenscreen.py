@@ -6,7 +6,6 @@ import ast
 import gc
 import re
 import json
-import shutil
 import tempfile
 import cv2
 import torch
@@ -51,7 +50,7 @@ def main(
     sam_mask_close_kernel: int = 9,
     sam_mask_dilate_kernel: int = 3,
     sam_mask_border_shift: int = 0,
-    sam_mask_overlap_gap_fill: int = 50,
+    sam_mask_overlap_gap_fill: int = 40,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
@@ -333,96 +332,104 @@ def main(
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
-            predictor = create_sam_predictor(
-                sam_model_id,
-                sam_compile,
-            )
-            try:
-                with torch.inference_mode(), torch.autocast(
-                    "cuda", dtype=torch.bfloat16
+            pending_sam_eyes = []
+            for eye in ("L", "R"):
+                sam_step = f"sam_{eye}"
+                if is_completed_sam_eye(
+                    state,
+                    sam_step,
+                    eye,
+                    eye_green_paths[eye],
+                    eye_alpha_paths[eye],
+                    eye_sam_mask_paths[eye],
+                    output_alpha_video,
+                    output_instance_videos,
                 ):
-                    for eye in ("L", "R"):
-                        sam_step = f"sam_{eye}"
-                        if is_completed_sam_eye(
-                            state,
-                            sam_step,
-                            eye,
-                            eye_green_paths[eye],
-                            eye_alpha_paths[eye],
-                            eye_sam_mask_paths[eye],
-                            output_alpha_video,
-                        ):
-                            sidecar["eyes"][eye] = state["eyes"][eye]
-                            continue
-                        remove_if_exists(get_temp_path(eye_green_paths[eye]))
-                        remove_if_exists(get_temp_path(eye_alpha_paths[eye]))
-                        remove_if_exists(get_temp_path(eye_sam_mask_paths[eye]))
-                        eye_data = process_eye_with_sam(
-                            predictor,
-                            eye_video_paths[eye],
-                            input_video_path,
-                            get_temp_path(eye_green_paths[eye]),
-                            get_temp_path(eye_alpha_paths[eye]),
-                            get_temp_path(eye_sam_mask_paths[eye]),
-                            state,
-                            state_path,
-                            input_video_path,
-                            config,
-                            output_dir,
-                            output_stem,
-                            eye,
-                            prompts,
-                            fps,
-                            sam_chunk_seconds,
-                            sam_chunk_overlap_seconds,
-                            output_alpha_video,
-                            output_instance_videos,
-                            sam_mask_close_kernel,
-                            sam_mask_dilate_kernel,
-                            sam_mask_border_shift,
-                            sam_mask_overlap_gap_fill,
-                            qc_frame_interval,
-                            qc_area_jump_threshold,
-                            greenscreen_crf,
-                            greenscreen_preset,
-                            depth_mask_paths.get(eye),
-                            depth_foreground_threshold,
-                            depth_mask_border_shift,
-                        )
-                        os.replace(
-                            get_temp_path(eye_green_paths[eye]), eye_green_paths[eye]
-                        )
-                        if output_alpha_video:
-                            os.replace(
+                    sidecar["eyes"][eye] = state["eyes"][eye]
+                else:
+                    pending_sam_eyes.append(eye)
+
+            if len(pending_sam_eyes) > 0:
+                predictor = create_sam_predictor(
+                    sam_model_id,
+                    sam_compile,
+                )
+                try:
+                    with torch.inference_mode(), torch.autocast(
+                        "cuda", dtype=torch.bfloat16
+                    ):
+                        for eye in pending_sam_eyes:
+                            sam_step = f"sam_{eye}"
+                            remove_if_exists(get_temp_path(eye_green_paths[eye]))
+                            remove_if_exists(get_temp_path(eye_alpha_paths[eye]))
+                            remove_if_exists(get_temp_path(eye_sam_mask_paths[eye]))
+                            eye_data = process_eye_with_sam(
+                                predictor,
+                                eye_video_paths[eye],
+                                input_video_path,
+                                get_temp_path(eye_green_paths[eye]),
                                 get_temp_path(eye_alpha_paths[eye]),
-                                eye_alpha_paths[eye],
+                                get_temp_path(eye_sam_mask_paths[eye]),
+                                state,
+                                state_path,
+                                input_video_path,
+                                config,
+                                output_dir,
+                                output_stem,
+                                eye,
+                                prompts,
+                                fps,
+                                sam_chunk_seconds,
+                                sam_chunk_overlap_seconds,
+                                output_alpha_video,
+                                output_instance_videos,
+                                sam_mask_close_kernel,
+                                sam_mask_dilate_kernel,
+                                sam_mask_border_shift,
+                                sam_mask_overlap_gap_fill,
+                                qc_frame_interval,
+                                qc_area_jump_threshold,
+                                greenscreen_crf,
+                                greenscreen_preset,
+                                depth_mask_paths.get(eye),
+                                depth_foreground_threshold,
+                                depth_mask_border_shift,
                             )
-                        os.replace(
-                            get_temp_path(eye_sam_mask_paths[eye]),
-                            eye_sam_mask_paths[eye],
-                        )
-                        sidecar["eyes"][eye] = eye_data
-                        sidecar["eyes"][eye]["depth_mask"] = os.path.basename(
-                            eye_depth_mask_paths[eye]
-                        )
-                        sidecar["eyes"][eye]["sam_mask"] = os.path.basename(
-                            eye_sam_mask_paths[eye]
-                        )
-                        state.setdefault("eyes", {})[eye] = eye_data
-                        mark_completed(state, sam_step)
-                        save_resume_state(
-                            state_path, state, input_video_path, output_stem, config
-                        )
-                        print(
-                            f"==> eye {eye}: {eye_data['max_instances']} max instances, "
-                            f"{len(eye_data['qc_flags'])} QC flags",
-                            flush=True,
-                        )
-            finally:
-                del predictor
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                            os.replace(
+                                get_temp_path(eye_green_paths[eye]),
+                                eye_green_paths[eye],
+                            )
+                            if output_alpha_video:
+                                os.replace(
+                                    get_temp_path(eye_alpha_paths[eye]),
+                                    eye_alpha_paths[eye],
+                                )
+                            os.replace(
+                                get_temp_path(eye_sam_mask_paths[eye]),
+                                eye_sam_mask_paths[eye],
+                            )
+                            sidecar["eyes"][eye] = eye_data
+                            sidecar["eyes"][eye]["depth_mask"] = os.path.basename(
+                                eye_depth_mask_paths[eye]
+                            )
+                            sidecar["eyes"][eye]["sam_mask"] = os.path.basename(
+                                eye_sam_mask_paths[eye]
+                            )
+                            state.setdefault("eyes", {})[eye] = eye_data
+                            mark_completed(state, sam_step)
+                            save_resume_state(
+                                state_path, state, input_video_path, output_stem, config
+                            )
+                            print(
+                                f"==> eye {eye}: {eye_data['max_instances']} max instances, "
+                                f"{len(eye_data['qc_flags'])} QC flags",
+                                flush=True,
+                            )
+                finally:
+                    del predictor
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         except Exception as error:
             sidecar["failures"].append(f"SAM 3 processing crashed: {error}")
             print(f"==> SAM 3 processing crashed: {error}", flush=True)
@@ -452,7 +459,8 @@ def main(
         pipeline_complete = len(sidecar["failures"]) == 0
     finally:
         if pipeline_complete and os.path.isdir(work_dir):
-            shutil.rmtree(work_dir, ignore_errors=True)
+            # shutil.rmtree(work_dir, ignore_errors=True)
+            pass
 
 
 def get_video_properties(video):
@@ -530,8 +538,12 @@ def save_resume_state(state_path, state, input_video_path, output_stem, config):
     state["config"] = config
     state.setdefault("completed", {})
     state.setdefault("eyes", {})
-    with open(state_path, "w", encoding="utf-8") as file:
+    temp_state_path = get_temp_path(state_path)
+    with open(temp_state_path, "w", encoding="utf-8") as file:
         json.dump(state, file, indent=2, default=str)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp_state_path, state_path)
 
 
 def restore_sidecar_from_state(sidecar, state):
@@ -567,7 +579,10 @@ def is_completed_sam_eye(
     alpha_video_path,
     sam_mask_video_path,
     output_alpha_video,
+    output_instance_videos,
 ):
+    if output_instance_videos:
+        return False
     if not is_completed_file(state, step, green_video_path):
         return False
     if output_alpha_video and not os.path.isfile(alpha_video_path):
@@ -994,7 +1009,7 @@ def process_eye_with_sam(
     resume_input_video_path,
     config,
     output_dir,
-    video_stem,
+    output_stem,
     eye,
     prompts,
     fps,
@@ -1063,7 +1078,9 @@ def process_eye_with_sam(
         if output_alpha_video:
             chunk_alpha_paths.append(chunk_paths["alpha"])
         chunk_sam_mask_paths.append(chunk_paths["sam_mask"])
-        if sam_chunk_is_complete(chunk_record, chunk_paths, output_alpha_video):
+        if not output_instance_videos and sam_chunk_is_complete(
+            chunk_record, chunk_paths, output_alpha_video
+        ):
             max_instances = max(max_instances, chunk_record.get("max_instances", 0))
             qc_flags.extend(chunk_record.get("qc_flags", []))
             previous_area = chunk_record.get("last_area", previous_area)
@@ -1197,7 +1214,7 @@ def process_eye_with_sam(
                             instance_writers,
                             instance_records,
                             output_dir,
-                            video_stem,
+                            output_stem,
                             eye,
                             frame_rgb,
                             masks,
@@ -1275,7 +1292,7 @@ def process_eye_with_sam(
             },
         )
         save_resume_state(
-            state_path, state, resume_input_video_path, video_stem, config
+            state_path, state, resume_input_video_path, output_stem, config
         )
 
     concat_videos(chunk_green_paths, green_video_path)
@@ -1695,7 +1712,8 @@ def write_mp4_metadata(video_path, green_color):
         os.replace(temp_output_path, video_path)
     finally:
         if os.path.exists(temp_output_path):
-            os.remove(temp_output_path)
+            # os.remove(temp_output_path)
+            pass
 
 
 def save_sidecar(sidecar_path, sidecar):
