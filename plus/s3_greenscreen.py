@@ -44,7 +44,6 @@ def main(
     sam_video_preset: str = "veryfast",
     sam_compile: bool = False,
     output_alpha_video: bool = True,
-    output_instance_videos: bool = False,
     sam_mask_close_kernel: int = 9,
     sam_mask_border_shift: int = 1,
     sam_mask_overlap_gap_fill: int = 30,
@@ -126,7 +125,6 @@ def main(
         "sam_video_preset": sam_video_preset,
         "sam_compile": sam_compile,
         "output_alpha_video": output_alpha_video,
-        "output_instance_videos": output_instance_videos,
         "sam_mask_close_kernel": sam_mask_close_kernel,
         "sam_mask_border_shift": sam_mask_border_shift,
         "sam_mask_overlap_gap_fill": sam_mask_overlap_gap_fill,
@@ -384,7 +382,6 @@ def main(
                         depth_foreground_threshold,
                     ),
                     output_alpha_video,
-                    output_instance_videos,
                 ):
                     sidecar["eyes"][eye] = state["eyes"][eye]
                 else:
@@ -467,7 +464,6 @@ def main(
                                 sam_chunk_seconds,
                                 sam_chunk_overlap_seconds,
                                 output_alpha_video,
-                                output_instance_videos,
                                 sam_mask_close_kernel,
                                 sam_mask_border_shift,
                                 sam_mask_overlap_gap_fill,
@@ -712,10 +708,7 @@ def is_completed_sam_eye(
     alpha_video_path,
     debug_video_paths,
     output_alpha_video,
-    output_instance_videos,
 ):
-    if output_instance_videos:
-        return False
     if not is_completed_file(state, step, green_video_path):
         return False
     if output_alpha_video and not os.path.isfile(alpha_video_path):
@@ -1075,56 +1068,72 @@ def compute_eye_depth_mask_video(
         raise ValueError(f"Could not open cropped eye video: {eye_video_path}")
     try:
         _, width, height, _ = get_video_properties(video)
-        mask_writer = g.RawVideoWriter(
-            depth_mask_path,
-            width,
-            height,
-            fps,
-            codec="libx264",
-            crf=0,
-            preset="veryfast",
-            pixel_format="yuv444p",
-        )
-        depth_writer = g.RawVideoWriter(
-            depth_path,
-            width,
-            height,
-            fps,
-            codec="libx264",
-            crf=18,
-            preset="medium",
-            pixel_format="yuv420p",
-        )
-        try:
-            while True:
-                success, frame_bgr = video.read()
-                if not success:
-                    break
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                frame_tensor = torch.from_numpy(
-                    frame_rgb.astype(np.float32) / 255.0
-                ).permute(2, 0, 1)
-                depth = depth_model.infer(frame_tensor.to(depth_model.device))
-                depth = depth_model.minmax_normalize_chw(depth)
-                depth_np = depth.squeeze(0).cpu().numpy()
-                if depth_np.shape != (height, width):
-                    depth_np = cv2.resize(
-                        depth_np, (width, height), interpolation=cv2.INTER_LINEAR
-                    )
-                mask = (depth_np >= 1.0 - depth_foreground_threshold).astype(np.uint8)
-                depth_u8 = np.round(depth_np * 255.0).clip(0, 255).astype(np.uint8)
-                depth_writer.write(
-                    cv2.cvtColor(
-                        cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET),
-                        cv2.COLOR_BGR2RGB,
-                    )
+        raw_depths = []
+        while True:
+            success, frame_bgr = video.read()
+            if not success:
+                break
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_tensor = torch.from_numpy(
+                frame_rgb.astype(np.float32) / 255.0
+            ).permute(2, 0, 1)
+            depth = depth_model.infer(frame_tensor.to(depth_model.device))
+            depth_np = depth.squeeze(0).cpu().numpy()
+            if depth_np.shape != (height, width):
+                depth_np = cv2.resize(
+                    depth_np, (width, height), interpolation=cv2.INTER_LINEAR
                 )
-                mask_writer.write(np.repeat(mask[:, :, None] * 255, 3, axis=2))
-        finally:
-            mask_writer.close()
-            depth_writer.close()
+            raw_depths.append(depth_np)
     finally:
         video.release()
+
+    if len(raw_depths) == 0:
+        return
+
+    global_min = float("inf")
+    global_max = float("-inf")
+    for depth_np in raw_depths:
+        global_min = min(global_min, float(depth_np.min()))
+        global_max = max(global_max, float(depth_np.max()))
+    depth_range = max(global_max - global_min, 1e-6)
+
+    mask_writer = g.RawVideoWriter(
+        depth_mask_path,
+        width,
+        height,
+        fps,
+        codec="libx264",
+        crf=0,
+        preset="veryfast",
+        pixel_format="yuv444p",
+    )
+    depth_writer = g.RawVideoWriter(
+        depth_path,
+        width,
+        height,
+        fps,
+        codec="libx264",
+        crf=18,
+        preset="medium",
+        pixel_format="yuv420p",
+    )
+    try:
+        for depth_np in raw_depths:
+            depth_normalized = (depth_np - global_min) / depth_range
+            mask = (depth_normalized >= 1.0 - depth_foreground_threshold).astype(
+                np.uint8
+            )
+            depth_u8 = np.round(depth_normalized * 255.0).clip(0, 255).astype(np.uint8)
+            depth_writer.write(
+                cv2.cvtColor(
+                    cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET),
+                    cv2.COLOR_BGR2RGB,
+                )
+            )
+            mask_writer.write(np.repeat(mask[:, :, None] * 255, 3, axis=2))
+    finally:
+        mask_writer.close()
+        depth_writer.close()
 
 
 def apply_depth_mask(
@@ -1231,7 +1240,6 @@ def process_eye_with_sam(
     sam_chunk_seconds,
     sam_chunk_overlap_seconds,
     output_alpha_video,
-    output_instance_videos,
     sam_mask_close_kernel,
     sam_mask_border_shift,
     sam_mask_overlap_gap_fill,
@@ -1305,9 +1313,7 @@ def process_eye_with_sam(
             chunk_alpha_paths.append(chunk_paths["alpha"])
         for debug_name in chunk_debug_paths:
             chunk_debug_paths[debug_name].append(chunk_paths[debug_name])
-        if not output_instance_videos and sam_chunk_is_complete(
-            chunk_record, chunk_paths, output_alpha_video
-        ):
+        if sam_chunk_is_complete(chunk_record, chunk_paths, output_alpha_video):
             max_instances = max(max_instances, chunk_record.get("max_instances", 0))
             qc_flags.extend(chunk_record.get("qc_flags", []))
             previous_area = chunk_record.get("last_area", previous_area)
@@ -1459,20 +1465,6 @@ def process_eye_with_sam(
                     write_green_and_alpha(
                         green_writer, alpha_writer, frame_rgb, combined_alpha
                     )
-                    if output_instance_videos and masks is not None:
-                        write_instance_frames(
-                            instance_writers,
-                            instance_records,
-                            output_dir,
-                            output_stem,
-                            eye,
-                            frame_rgb,
-                            masks,
-                            object_ids,
-                            width,
-                            height,
-                            fps,
-                        )
                     if frame_index % qc_frame_interval == 0:
                         area = float((combined_alpha > 0.05).mean())
                         present_count = len(object_ids) if object_ids is not None else 0
