@@ -2,10 +2,11 @@ import os
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
-import ast
 import gc
 import re
+import ast
 import json
+import shutil
 import tempfile
 import cv2
 import torch
@@ -35,9 +36,6 @@ def main(
     vlm_max_new_tokens: int = 768,
     vlm_max_long_side: int = 1024,
     sam_model_id: str = "facebook/sam3",
-    sam_repo_dir: str = None,
-    sam_checkpoint_path: str = None,
-    sam_bpe_path: str = None,
     sam_prompt_groups: int = 4,
     sam_max_long_side: int = 720,
     sam_chunk_seconds: float = 1.0,
@@ -48,8 +46,7 @@ def main(
     output_alpha_video: bool = True,
     output_instance_videos: bool = False,
     sam_mask_close_kernel: int = 9,
-    sam_mask_dilate_kernel: int = 3,
-    sam_mask_border_shift: int = 0,
+    sam_mask_border_shift: int = 1,
     sam_mask_overlap_gap_fill: int = 40,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
@@ -105,9 +102,6 @@ def main(
         "vlm_max_new_tokens": vlm_max_new_tokens,
         "vlm_max_long_side": vlm_max_long_side,
         "sam_model_id": sam_model_id,
-        "sam_repo_dir": sam_repo_dir,
-        "sam_checkpoint_path": sam_checkpoint_path,
-        "sam_bpe_path": sam_bpe_path,
         "sam_prompt_groups": sam_prompt_groups,
         "sam_max_long_side": sam_max_long_side,
         "sam_chunk_seconds": sam_chunk_seconds,
@@ -118,7 +112,6 @@ def main(
         "output_alpha_video": output_alpha_video,
         "output_instance_videos": output_instance_videos,
         "sam_mask_close_kernel": sam_mask_close_kernel,
-        "sam_mask_dilate_kernel": sam_mask_dilate_kernel,
         "sam_mask_border_shift": sam_mask_border_shift,
         "sam_mask_overlap_gap_fill": sam_mask_overlap_gap_fill,
         "qc_frame_interval": qc_frame_interval,
@@ -384,7 +377,6 @@ def main(
                                 output_alpha_video,
                                 output_instance_videos,
                                 sam_mask_close_kernel,
-                                sam_mask_dilate_kernel,
                                 sam_mask_border_shift,
                                 sam_mask_overlap_gap_fill,
                                 qc_frame_interval,
@@ -459,8 +451,7 @@ def main(
         pipeline_complete = len(sidecar["failures"]) == 0
     finally:
         if pipeline_complete and os.path.isdir(work_dir):
-            # shutil.rmtree(work_dir, ignore_errors=True)
-            pass
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def get_video_properties(video):
@@ -1018,7 +1009,6 @@ def process_eye_with_sam(
     output_alpha_video,
     output_instance_videos,
     sam_mask_close_kernel,
-    sam_mask_dilate_kernel,
     sam_mask_border_shift,
     sam_mask_overlap_gap_fill,
     qc_frame_interval,
@@ -1192,7 +1182,6 @@ def process_eye_with_sam(
                         height,
                         width,
                         sam_mask_close_kernel,
-                        sam_mask_dilate_kernel,
                         sam_mask_border_shift,
                         sam_mask_overlap_gap_fill,
                     )
@@ -1436,7 +1425,6 @@ def combine_masks(
     height,
     width,
     sam_mask_close_kernel,
-    sam_mask_dilate_kernel,
     sam_mask_border_shift,
     sam_mask_overlap_gap_fill,
 ):
@@ -1468,9 +1456,7 @@ def combine_masks(
         combined = np.maximum(combined, mask_u8)
 
     combined = fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill)
-    combined = postprocess_mask(
-        combined, sam_mask_close_kernel, sam_mask_dilate_kernel, sam_mask_border_shift
-    )
+    combined = postprocess_mask(combined, sam_mask_close_kernel, sam_mask_border_shift)
     return combined.astype(np.float32) / 255.0, present_count
 
 
@@ -1493,19 +1479,12 @@ def fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill):
     return combined
 
 
-def postprocess_mask(
-    mask_u8, sam_mask_close_kernel, sam_mask_dilate_kernel, sam_mask_border_shift
-):
+def postprocess_mask(mask_u8, sam_mask_close_kernel, sam_mask_border_shift):
     if sam_mask_close_kernel > 1:
         close_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (sam_mask_close_kernel, sam_mask_close_kernel)
         )
         mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, close_kernel)
-    if sam_mask_dilate_kernel > 1:
-        dilate_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (sam_mask_dilate_kernel, sam_mask_dilate_kernel)
-        )
-        mask_u8 = cv2.dilate(mask_u8, dilate_kernel, iterations=1)
     if sam_mask_border_shift != 0:
         border_shift = abs(int(sam_mask_border_shift))
         border_kernel = cv2.getStructuringElement(
@@ -1712,8 +1691,7 @@ def write_mp4_metadata(video_path, green_color):
         os.replace(temp_output_path, video_path)
     finally:
         if os.path.exists(temp_output_path):
-            # os.remove(temp_output_path)
-            pass
+            os.remove(temp_output_path)
 
 
 def save_sidecar(sidecar_path, sidecar):
