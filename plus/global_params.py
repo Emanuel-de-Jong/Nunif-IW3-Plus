@@ -10,6 +10,10 @@ OUTPUTS_DIR = BASE_PATH / "_out"
 PLUS_DIR = BASE_PATH / "plus"
 VIDEO2X_PATH = PLUS_DIR / "Video2X" / "Video2X-x86_64.AppImage"
 
+CHECKPOINTS_DIR = PLUS_DIR / "checkpoints"
+SVD_CHECKPOINTS_PATH = CHECKPOINTS_DIR / "stable-video-diffusion-img2vid-xt-1-1"
+DEPTHCRAFTER_UNET_PATH = CHECKPOINTS_DIR / "DepthCrafter"
+
 
 def should_skip_output(output_path, overwrite=False):
     if Path(output_path).exists() and not overwrite:

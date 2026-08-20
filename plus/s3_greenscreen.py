@@ -14,7 +14,12 @@ import numpy as np
 import imageio_ffmpeg
 import plus.global_params as g
 from fire import Fire
-from iw3.zoedepth_model import ZoeDepthModel
+from plus.DepthCrafter.depthcrafter.depth_crafter_ppl import (
+    DepthCrafterPipeline,
+)
+from plus.DepthCrafter.depthcrafter.unet import (
+    DiffusersUNetSpatioTemporalConditionModelDepthCrafter,
+)
 from transformers import (
     Qwen3VLForConditionalGeneration,
     AutoProcessor,
@@ -44,15 +49,22 @@ def main(
     sam_video_preset: str = "veryfast",
     sam_compile: bool = False,
     output_alpha_video: bool = True,
-    sam_mask_close_kernel: int = 9,
+    sam_mask_close_kernel: int = 0, # 9
     sam_mask_border_shift: int = 1,
     sam_mask_overlap_gap_fill: int = 30,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
     greenscreen_preset: str = "medium",
-    depth_foreground_threshold: float = 0.15,
-    depth_mask_border_shift: int = -10,
+    depth_foreground_threshold: float = 0.2,
+    depth_mask_border_shift: int = -4,
+    depthcrafter_unet_path: str = str(g.DEPTHCRAFTER_UNET_PATH),
+    depthcrafter_pre_trained_path: str = str(g.SVD_CHECKPOINTS_PATH),
+    depthcrafter_num_denoising_steps: int = 5,
+    depthcrafter_guidance_scale: float = 1.0,
+    depthcrafter_window_size: int = 56,
+    depthcrafter_overlap: int = 16,
+    depthcrafter_decode_chunk_size: int = 8,
     prompt_override: str = None,
     overwrite: bool = False,
 ):
@@ -134,6 +146,13 @@ def main(
         "greenscreen_preset": greenscreen_preset,
         "depth_foreground_threshold": depth_foreground_threshold,
         "depth_mask_border_shift": depth_mask_border_shift,
+        "depthcrafter_unet_path": depthcrafter_unet_path,
+        "depthcrafter_pre_trained_path": depthcrafter_pre_trained_path,
+        "depthcrafter_num_denoising_steps": depthcrafter_num_denoising_steps,
+        "depthcrafter_guidance_scale": depthcrafter_guidance_scale,
+        "depthcrafter_window_size": depthcrafter_window_size,
+        "depthcrafter_overlap": depthcrafter_overlap,
+        "depthcrafter_decode_chunk_size": depthcrafter_decode_chunk_size,
         "prompt_override": prompt_override,
         "device": device,
     }
@@ -332,7 +351,10 @@ def main(
                 if depth_foreground_threshold > 0:
                     depth_mask_paths[eye] = eye_depth_binary_paths[eye]
             if len(pending_depth_eyes) > 0:
-                depth_model = create_depth_model()
+                depth_crafter = create_depth_crafter(
+                    depthcrafter_unet_path,
+                    depthcrafter_pre_trained_path,
+                )
                 try:
                     for eye in pending_depth_eyes:
                         print(f"==> computing depth for eye {eye}", flush=True)
@@ -342,12 +364,17 @@ def main(
                         )
                         remove_if_exists(temp_depth_mask_path)
                         compute_eye_depth_mask_video(
-                            depth_model,
+                            depth_crafter,
                             eye_video_paths[eye],
                             temp_depth_mask_path,
                             get_temp_path(eye_depth_paths[eye]),
                             depth_foreground_threshold,
                             fps,
+                            depthcrafter_num_denoising_steps,
+                            depthcrafter_guidance_scale,
+                            depthcrafter_window_size,
+                            depthcrafter_overlap,
+                            depthcrafter_decode_chunk_size,
                         )
                         os.replace(temp_depth_mask_path, eye_depth_binary_paths[eye])
                         os.replace(
@@ -358,7 +385,7 @@ def main(
                             state_path, state, input_video_path, output_stem, config
                         )
                 finally:
-                    del depth_model
+                    del depth_crafter
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1048,54 +1075,87 @@ def prompt_matches_scene(concept, include_concepts, specific_include_concepts):
     return False
 
 
-def create_depth_model():
-    print("Loading ZoeD_Any_N depth model", flush=True)
-    depth_model = ZoeDepthModel("ZoeD_Any_N")
-    depth_model.load(gpu=0)
-    return depth_model
+def create_depth_crafter(unet_path, pre_trained_path):
+    print("Loading DepthCrafter model", flush=True)
+    unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
+        unet_path,
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
+    )
+    pipe = DepthCrafterPipeline.from_pretrained(
+        pre_trained_path,
+        unet=unet,
+        torch_dtype=torch.float16,
+        variant="fp16",
+    )
+    pipe.enable_model_cpu_offload()
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception as error:
+        print(error, flush=True)
+        print("Xformers is not enabled", flush=True)
+    pipe.enable_attention_slicing()
+    return pipe
 
 
 def compute_eye_depth_mask_video(
-    depth_model,
+    depth_crafter,
     eye_video_path,
     depth_mask_path,
     depth_path,
     depth_foreground_threshold,
     fps,
+    num_denoising_steps,
+    guidance_scale,
+    window_size,
+    overlap,
+    decode_chunk_size,
 ):
     video = cv2.VideoCapture(eye_video_path)
     if not video.isOpened():
         raise ValueError(f"Could not open cropped eye video: {eye_video_path}")
     try:
         _, width, height, _ = get_video_properties(video)
-        raw_depths = []
+        padded_height = round(height / 64) * 64
+        padded_width = round(width / 64) * 64
+        frames = []
         while True:
             success, frame_bgr = video.read()
             if not success:
                 break
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frame_tensor = torch.from_numpy(
-                frame_rgb.astype(np.float32) / 255.0
-            ).permute(2, 0, 1)
-            depth = depth_model.infer(frame_tensor.to(depth_model.device))
-            depth_np = depth.squeeze(0).cpu().numpy()
-            if depth_np.shape != (height, width):
-                depth_np = cv2.resize(
-                    depth_np, (width, height), interpolation=cv2.INTER_LINEAR
+            if (height, width) != (padded_height, padded_width):
+                frame_rgb = cv2.resize(
+                    frame_rgb,
+                    (padded_width, padded_height),
+                    interpolation=cv2.INTER_LINEAR,
                 )
-            raw_depths.append(depth_np)
+            frames.append(frame_rgb.astype(np.float32) / 255.0)
     finally:
         video.release()
 
-    if len(raw_depths) == 0:
+    if len(frames) == 0:
         return
 
-    global_min = float("inf")
-    global_max = float("-inf")
-    for depth_np in raw_depths:
-        global_min = min(global_min, float(depth_np.min()))
-        global_max = max(global_max, float(depth_np.max()))
-    depth_range = max(global_max - global_min, 1e-6)
+    frames_array = np.stack(frames, axis=0)
+
+    with torch.inference_mode():
+        depth = depth_crafter(
+            frames_array,
+            height=padded_height,
+            width=padded_width,
+            output_type="np",
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_denoising_steps,
+            window_size=min(window_size, len(frames_array)),
+            overlap=min(overlap, max(len(frames_array) - 1, 0)),
+            decode_chunk_size=decode_chunk_size,
+        ).frames[0]
+    depth = depth.sum(-1) / depth.shape[-1]
+
+    depth_min = float(depth.min())
+    depth_range = max(float(depth.max()) - depth_min, 1e-6)
+    depth = ((depth - depth_min) / depth_range).astype(np.float32)
 
     mask_writer = g.RawVideoWriter(
         depth_mask_path,
@@ -1118,12 +1178,13 @@ def compute_eye_depth_mask_video(
         pixel_format="yuv420p",
     )
     try:
-        for depth_np in raw_depths:
-            depth_normalized = (depth_np - global_min) / depth_range
-            mask = (depth_normalized >= 1.0 - depth_foreground_threshold).astype(
-                np.uint8
-            )
-            depth_u8 = np.round(depth_normalized * 255.0).clip(0, 255).astype(np.uint8)
+        for frame_depth in depth:
+            if (padded_height, padded_width) != (height, width):
+                frame_depth = cv2.resize(
+                    frame_depth, (width, height), interpolation=cv2.INTER_LINEAR
+                )
+            mask = (frame_depth >= 1.0 - depth_foreground_threshold).astype(np.uint8)
+            depth_u8 = np.round(frame_depth * 255.0).clip(0, 255).astype(np.uint8)
             depth_writer.write(
                 cv2.cvtColor(
                     cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET),
@@ -1769,22 +1830,83 @@ def combine_masks(
 
 
 def fill_overlap_gaps(combined, instance_masks, sam_mask_overlap_gap_fill):
-    if sam_mask_overlap_gap_fill <= 0 or len(instance_masks) < 2:
+    radius = int(sam_mask_overlap_gap_fill)
+    if radius <= 0 or len(instance_masks) < 2:
         return combined
 
-    kernel_size = int(sam_mask_overlap_gap_fill) * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    overlap_count = np.zeros(combined.shape, dtype=np.uint16)
-    for instance_mask in instance_masks:
-        dilated = cv2.dilate(instance_mask, kernel, iterations=1)
-        overlap_count += (dilated > 0).astype(np.uint16)
+    contact_kernel_size = radius * 2 + 1
+    contact_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (contact_kernel_size, contact_kernel_size),
+    )
 
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-    gap_mask = (combined == 0) & (overlap_count >= 2) & (closed > 0)
-    if np.any(gap_mask):
-        combined = combined.copy()
-        combined[gap_mask] = 255
-    return combined
+    boundary_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    roi_radius = max(1, radius // 2)
+    roi_kernel_size = roi_radius * 2 + 1
+    roi_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (roi_kernel_size, roi_kernel_size),
+    )
+
+    combined_bin = (combined > 0).astype(np.uint8) * 255
+    filled = combined_bin.copy()
+
+    normalized_masks = []
+    boundaries = []
+    for mask in instance_masks:
+        mask_bin = (mask > 0).astype(np.uint8) * 255
+        if mask_bin.max() == 0:
+            continue
+
+        eroded = cv2.erode(mask_bin, boundary_kernel, iterations=1)
+        boundary = cv2.subtract(mask_bin, eroded)
+
+        normalized_masks.append(mask_bin)
+        boundaries.append(boundary)
+
+    if len(normalized_masks) < 2:
+        return combined
+
+    fill_pixels = np.zeros_like(combined_bin, dtype=np.uint8)
+
+    for i in range(len(normalized_masks)):
+        mask_a = normalized_masks[i]
+        boundary_a = boundaries[i]
+
+        for j in range(i + 1, len(normalized_masks)):
+            mask_b = normalized_masks[j]
+            boundary_b = boundaries[j]
+
+            near_contact = (
+                cv2.dilate(boundary_a, contact_kernel, iterations=1) > 0
+            ) & (cv2.dilate(boundary_b, contact_kernel, iterations=1) > 0)
+
+            if not np.any(near_contact):
+                continue
+
+            local_roi = (
+                cv2.dilate(
+                    near_contact.astype(np.uint8) * 255,
+                    roi_kernel,
+                    iterations=1,
+                )
+                > 0
+            )
+
+            pair_union = np.maximum(mask_a, mask_b)
+            pair_closed = cv2.morphologyEx(pair_union, cv2.MORPH_CLOSE, contact_kernel)
+            pair_gap = (
+                (combined_bin == 0) & (pair_union == 0) & (pair_closed > 0) & local_roi
+            )
+
+            if np.any(pair_gap):
+                fill_pixels[pair_gap] = 255
+
+    if np.any(fill_pixels):
+        filled[fill_pixels > 0] = 255
+
+    return filled
 
 
 def postprocess_mask(mask_u8, sam_mask_close_kernel, sam_mask_border_shift):
@@ -1811,46 +1933,6 @@ def composite_green(frame_rgb, alpha):
     green = np.array([0.0, 255.0, 0.0], dtype=np.float32).reshape(1, 1, 3)
     composite = frame * alpha + green * (1.0 - alpha)
     return composite.clip(0, 255).astype(np.uint8)
-
-
-def write_instance_frames(
-    instance_writers,
-    instance_records,
-    output_dir,
-    video_stem,
-    eye,
-    frame_rgb,
-    masks,
-    object_ids,
-    width,
-    height,
-    fps,
-):
-    masks = np.asarray(masks)
-    for position, object_id in enumerate(object_ids):
-        object_id = int(object_id)
-        if object_id not in instance_writers:
-            output_path = os.path.join(
-                output_dir, f"{video_stem}_{eye}_obj{object_id:03d}.mov"
-            )
-            instance_writers[object_id] = g.RawAlphaVideoWriter(
-                output_path, width, height, fps
-            )
-            instance_records[object_id] = {
-                "id": object_id,
-                "concept": "SAM 3 object",
-                "output": os.path.basename(output_path),
-            }
-        mask = np.squeeze(masks[position])
-        if mask.shape[:2] != (height, width):
-            mask = cv2.resize(
-                mask.astype(np.uint8),
-                (width, height),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        alpha16 = (mask > 0).astype(np.uint16) * 65535
-        rgba = np.dstack([frame_rgb.astype(np.uint16) * 257, alpha16])
-        instance_writers[object_id].write(rgba)
 
 
 def collect_qc_flags(
