@@ -2,6 +2,7 @@ import os
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+import ast
 import gc
 import re
 import json
@@ -57,6 +58,7 @@ def main(
     greenscreen_preset: str = "medium",
     depth_foreground_threshold: float = 0.2,
     depth_mask_border_shift: int = -10,
+    prompt_override: str = None,
     overwrite: bool = False,
 ):
     device = "cuda"
@@ -73,8 +75,6 @@ def main(
     qc_log_path = os.path.join(output_dir, f"{output_stem}_qc.log")
     greenscreen_path = output_video_path
 
-    if g.should_skip_output(greenscreen_path, overwrite):
-        return
     if not os.path.isfile(input_video_path):
         raise FileNotFoundError(f"Input video not found: {input_video_path}")
 
@@ -88,22 +88,15 @@ def main(
     if width % 2 != 0:
         raise ValueError(f"SBS video width must be even, got: {width}")
 
-    qwen_prompts_path = g.PLUS_DIR / "greenscreen_prompts.json"
-    if not qwen_prompts_path.exists():
-        print("greenscreen_prompts.json couldn't be found!.")
-        print(
-            "Make a copy of plus/greenscreen_prompts_example.json and name it greenscreen_prompts.json."
-        )
-        print("Exiting...")
-        return
-
-    with open(qwen_prompts_path, "r", encoding="utf-8") as qwen_prompts_file:
-        qwen_prompts = json.load(qwen_prompts_file)
-
     eye_width = width // 2
     os.makedirs(output_dir, exist_ok=True)
     work_dir = os.path.join(output_dir, f".{output_stem}_work")
     os.makedirs(work_dir, exist_ok=True)
+    state_path = os.path.join(work_dir, "state.json")
+    if not os.path.isfile(state_path) and g.should_skip_output(
+        greenscreen_path, overwrite
+    ):
+        return
 
     config = {
         "vlm_model_id": vlm_model_id,
@@ -135,8 +128,10 @@ def main(
         "greenscreen_preset": greenscreen_preset,
         "depth_foreground_threshold": depth_foreground_threshold,
         "depth_mask_border_shift": depth_mask_border_shift,
+        "prompt_override": prompt_override,
         "device": device,
     }
+    state = load_resume_state(state_path, input_video_path, output_stem, config)
     sidecar = {
         "input_video_path": input_video_path,
         "fps": fps,
@@ -153,6 +148,8 @@ def main(
         "outputs": {},
         "failures": [],
     }
+    restore_sidecar_from_state(sidecar, state)
+    pipeline_complete = False
 
     try:
         sampled_frame_indices = get_sampled_frame_indices(
@@ -161,14 +158,25 @@ def main(
         sidecar["sampled_frame_indices"] = [
             int(index) for index in sampled_frame_indices
         ]
+        save_resume_state(state_path, state, input_video_path, output_stem, config)
         frames_dir = os.path.join(work_dir, "samples")
-        image_paths = extract_sample_frames(
-            input_video_path,
-            sampled_frame_indices,
-            eye_width,
-            frames_dir,
-            vlm_max_long_side,
+        image_paths = get_completed_sample_frames(
+            state, frames_dir, len(sampled_frame_indices)
         )
+        if image_paths is None:
+            image_paths = extract_sample_frames(
+                input_video_path,
+                sampled_frame_indices,
+                eye_width,
+                frames_dir,
+                vlm_max_long_side,
+            )
+            if len(image_paths) > 0:
+                state["image_paths"] = image_paths
+                mark_completed(state, "sample_frames")
+                save_resume_state(
+                    state_path, state, input_video_path, output_stem, config
+                )
         if len(image_paths) == 0:
             sidecar["failures"].append("frame sampling produced no frames")
             print("==> frame sampling produced no frames", flush=True)
@@ -177,24 +185,54 @@ def main(
             return
 
         print(f"==> sampled {len(image_paths)} frames for VLM", flush=True)
-        include_concepts, specific_include_concepts, exclude_concepts = (
-            identify_foreground(
-                vlm_model_id,
-                device,
-                image_paths,
-                num_vote_runs,
-                vlm_temperature,
-                vlm_max_new_tokens,
-                sidecar,
+        if prompt_override is not None:
+            prompts = parse_prompt_override(prompt_override)
+            include_concepts = []
+            specific_include_concepts = prompts
+            exclude_concepts = []
+            sidecar["prompt_source"] = "override"
+            state["prompt_source"] = "override"
+            state["include"] = include_concepts
+            state["specific_include"] = specific_include_concepts
+            state["exclude"] = exclude_concepts
+            state["sam_prompts"] = prompts
+            mark_completed(state, "prompts")
+            save_resume_state(state_path, state, input_video_path, output_stem, config)
+        elif is_completed(state, "prompts") and "sam_prompts" in state:
+            include_concepts = state.get("include", [])
+            specific_include_concepts = state.get("specific_include", [])
+            exclude_concepts = state.get("exclude", [])
+            prompts = state["sam_prompts"]
+            sidecar["prompt_source"] = state.get("prompt_source", "qwen")
+        else:
+            qwen_prompts = load_qwen_prompts()
+            include_concepts, specific_include_concepts, exclude_concepts = (
+                identify_foreground(
+                    vlm_model_id,
+                    device,
+                    image_paths,
+                    num_vote_runs,
+                    vlm_temperature,
+                    vlm_max_new_tokens,
+                    sidecar,
+                    qwen_prompts,
+                )
+            )
+            prompts = build_sam_prompts(
+                include_concepts,
+                specific_include_concepts,
+                sam_prompt_groups,
                 qwen_prompts,
             )
-        )
-        prompts = build_sam_prompts(
-            include_concepts,
-            specific_include_concepts,
-            sam_prompt_groups,
-            qwen_prompts,
-        )
+            sidecar["prompt_source"] = "qwen"
+            state["prompt_source"] = "qwen"
+            state["include"] = include_concepts
+            state["specific_include"] = specific_include_concepts
+            state["exclude"] = exclude_concepts
+            state["sam_prompts"] = prompts
+            mark_completed(state, "prompts")
+            save_resume_state(state_path, state, input_video_path, output_stem, config)
+
         sidecar["include"] = include_concepts
         sidecar["specific_include"] = specific_include_concepts
         sidecar["exclude"] = exclude_concepts
@@ -227,40 +265,73 @@ def main(
             "R": os.path.join(work_dir, "alpha_R.mp4"),
         }
         eye_depth_mask_paths = {
-            "L": os.path.join(work_dir, "depth_L.mkv"),
-            "R": os.path.join(work_dir, "depth_R.mkv"),
+            "L": os.path.join(output_dir, f"{output_stem}_depth_L.mkv"),
+            "R": os.path.join(output_dir, f"{output_stem}_depth_R.mkv"),
+        }
+        eye_sam_mask_paths = {
+            "L": os.path.join(output_dir, f"{output_stem}_sam_L.mp4"),
+            "R": os.path.join(output_dir, f"{output_stem}_sam_R.mp4"),
         }
 
         try:
             for eye in ("L", "R"):
-                crop_eye_video(
-                    input_video_path,
-                    eye,
-                    eye_video_paths[eye],
-                    sam_max_long_side,
-                    sam_video_crf,
-                    sam_video_preset,
-                )
+                crop_step = f"crop_{eye}"
+                if not is_completed_file(state, crop_step, eye_video_paths[eye]):
+                    temp_eye_video_path = get_temp_path(eye_video_paths[eye])
+                    remove_if_exists(temp_eye_video_path)
+                    crop_eye_video(
+                        input_video_path,
+                        eye,
+                        temp_eye_video_path,
+                        sam_max_long_side,
+                        sam_video_crf,
+                        sam_video_preset,
+                    )
+                    os.replace(temp_eye_video_path, eye_video_paths[eye])
+                    mark_completed(state, crop_step)
+                    save_resume_state(
+                        state_path, state, input_video_path, output_stem, config
+                    )
 
             depth_mask_paths = {}
             if depth_foreground_threshold > 0:
-                depth_model = create_depth_model()
-                try:
-                    for eye in ("L", "R"):
-                        print(f"==> computing depth masks for eye {eye}", flush=True)
-                        compute_eye_depth_mask_video(
-                            depth_model,
-                            eye_video_paths[eye],
-                            eye_depth_mask_paths[eye],
-                            depth_foreground_threshold,
-                            fps,
-                        )
-                        depth_mask_paths[eye] = eye_depth_mask_paths[eye]
-                finally:
-                    del depth_model
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                pending_depth_eyes = []
+                for eye in ("L", "R"):
+                    depth_step = f"depth_{eye}"
+                    if not is_completed_file(
+                        state, depth_step, eye_depth_mask_paths[eye]
+                    ):
+                        pending_depth_eyes.append(eye)
+                    depth_mask_paths[eye] = eye_depth_mask_paths[eye]
+                if len(pending_depth_eyes) > 0:
+                    depth_model = create_depth_model()
+                    try:
+                        for eye in pending_depth_eyes:
+                            print(
+                                f"==> computing depth masks for eye {eye}", flush=True
+                            )
+                            depth_step = f"depth_{eye}"
+                            temp_depth_mask_path = get_temp_path(
+                                eye_depth_mask_paths[eye]
+                            )
+                            remove_if_exists(temp_depth_mask_path)
+                            compute_eye_depth_mask_video(
+                                depth_model,
+                                eye_video_paths[eye],
+                                temp_depth_mask_path,
+                                depth_foreground_threshold,
+                                fps,
+                            )
+                            os.replace(temp_depth_mask_path, eye_depth_mask_paths[eye])
+                            mark_completed(state, depth_step)
+                            save_resume_state(
+                                state_path, state, input_video_path, output_stem, config
+                            )
+                    finally:
+                        del depth_model
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
             predictor = create_sam_predictor(
                 sam_model_id,
@@ -271,12 +342,32 @@ def main(
                     "cuda", dtype=torch.bfloat16
                 ):
                     for eye in ("L", "R"):
+                        sam_step = f"sam_{eye}"
+                        if is_completed_sam_eye(
+                            state,
+                            sam_step,
+                            eye,
+                            eye_green_paths[eye],
+                            eye_alpha_paths[eye],
+                            eye_sam_mask_paths[eye],
+                            output_alpha_video,
+                        ):
+                            sidecar["eyes"][eye] = state["eyes"][eye]
+                            continue
+                        remove_if_exists(get_temp_path(eye_green_paths[eye]))
+                        remove_if_exists(get_temp_path(eye_alpha_paths[eye]))
+                        remove_if_exists(get_temp_path(eye_sam_mask_paths[eye]))
                         eye_data = process_eye_with_sam(
                             predictor,
                             eye_video_paths[eye],
                             input_video_path,
-                            eye_green_paths[eye],
-                            eye_alpha_paths[eye],
+                            get_temp_path(eye_green_paths[eye]),
+                            get_temp_path(eye_alpha_paths[eye]),
+                            get_temp_path(eye_sam_mask_paths[eye]),
+                            state,
+                            state_path,
+                            input_video_path,
+                            config,
                             output_dir,
                             output_stem,
                             eye,
@@ -298,7 +389,30 @@ def main(
                             depth_foreground_threshold,
                             depth_mask_border_shift,
                         )
+                        os.replace(
+                            get_temp_path(eye_green_paths[eye]), eye_green_paths[eye]
+                        )
+                        if output_alpha_video:
+                            os.replace(
+                                get_temp_path(eye_alpha_paths[eye]),
+                                eye_alpha_paths[eye],
+                            )
+                        os.replace(
+                            get_temp_path(eye_sam_mask_paths[eye]),
+                            eye_sam_mask_paths[eye],
+                        )
                         sidecar["eyes"][eye] = eye_data
+                        sidecar["eyes"][eye]["depth_mask"] = os.path.basename(
+                            eye_depth_mask_paths[eye]
+                        )
+                        sidecar["eyes"][eye]["sam_mask"] = os.path.basename(
+                            eye_sam_mask_paths[eye]
+                        )
+                        state.setdefault("eyes", {})[eye] = eye_data
+                        mark_completed(state, sam_step)
+                        save_resume_state(
+                            state_path, state, input_video_path, output_stem, config
+                        )
                         print(
                             f"==> eye {eye}: {eye_data['max_instances']} max instances, "
                             f"{len(eye_data['qc_flags'])} QC flags",
@@ -335,8 +449,9 @@ def main(
         save_sidecar(sidecar_path, sidecar)
         write_qc_log(qc_log_path, sidecar)
         print(f"==> saved matte sidecar: {sidecar_path}", flush=True)
+        pipeline_complete = len(sidecar["failures"]) == 0
     finally:
-        if os.path.isdir(work_dir):
+        if pipeline_complete and os.path.isdir(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -359,6 +474,163 @@ def get_sampled_frame_indices(frame_count, num_sampled_frames):
         raise ValueError("num_sampled_frames must be at least 1")
     positions = np.linspace(0, frame_count - 1, num_sampled_frames)
     return np.unique(np.rint(positions).astype(np.int64))
+
+
+def load_qwen_prompts():
+    qwen_prompts_path = g.PLUS_DIR / "greenscreen_prompts.json"
+    if not qwen_prompts_path.exists():
+        print("greenscreen_prompts.json couldn't be found!.")
+        print(
+            "Make a copy of plus/greenscreen_prompts_example.json and name it greenscreen_prompts.json."
+        )
+        print("Exiting...")
+        raise FileNotFoundError("greenscreen_prompts.json couldn't be found")
+
+    with open(qwen_prompts_path, "r", encoding="utf-8") as qwen_prompts_file:
+        return json.load(qwen_prompts_file)
+
+
+def parse_prompt_override(prompt_override):
+    try:
+        prompts = ast.literal_eval(prompt_override)
+    except (SyntaxError, ValueError) as error:
+        raise ValueError(f"Could not parse prompt_override: {error}") from error
+    if not isinstance(prompts, (list, tuple)):
+        raise ValueError("prompt_override must be a Python list of strings")
+    prompts = [prompt.strip() for prompt in prompts if isinstance(prompt, str)]
+    prompts = [prompt for prompt in prompts if prompt != ""]
+    if len(prompts) == 0:
+        raise ValueError("prompt_override must contain at least one non-empty string")
+    return prompts
+
+
+def load_resume_state(state_path, input_video_path, output_stem, config):
+    if os.path.isfile(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as file:
+                state = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            state = {}
+        if resume_state_matches(state, input_video_path, output_stem, config):
+            return state
+    return {"completed": {}, "eyes": {}}
+
+
+def resume_state_matches(state, input_video_path, output_stem, config):
+    if state.get("input_video_path") != input_video_path:
+        return False
+    if state.get("output_stem") != output_stem:
+        return False
+    return state.get("config") == config
+
+
+def save_resume_state(state_path, state, input_video_path, output_stem, config):
+    state["input_video_path"] = input_video_path
+    state["output_stem"] = output_stem
+    state["config"] = config
+    state.setdefault("completed", {})
+    state.setdefault("eyes", {})
+    with open(state_path, "w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2, default=str)
+
+
+def restore_sidecar_from_state(sidecar, state):
+    for key in (
+        "include",
+        "specific_include",
+        "exclude",
+        "sam_prompts",
+        "prompt_source",
+    ):
+        if key in state:
+            sidecar[key] = state[key]
+    sidecar["eyes"].update(state.get("eyes", {}))
+
+
+def mark_completed(state, step):
+    state.setdefault("completed", {})[step] = True
+
+
+def is_completed(state, step):
+    return state.get("completed", {}).get(step) is True
+
+
+def is_completed_file(state, step, path):
+    return is_completed(state, step) and os.path.isfile(path)
+
+
+def is_completed_sam_eye(
+    state,
+    step,
+    eye,
+    green_video_path,
+    alpha_video_path,
+    sam_mask_video_path,
+    output_alpha_video,
+):
+    if not is_completed_file(state, step, green_video_path):
+        return False
+    if output_alpha_video and not os.path.isfile(alpha_video_path):
+        return False
+    if not os.path.isfile(sam_mask_video_path):
+        return False
+    return eye in state.get("eyes", {})
+
+
+def get_sam_chunk_record(state, eye, chunk_key):
+    return state.get("sam_chunks", {}).get(eye, {}).get(chunk_key)
+
+
+def set_sam_chunk_record(state, eye, chunk_key, chunk_record):
+    state.setdefault("sam_chunks", {}).setdefault(eye, {})[chunk_key] = chunk_record
+
+
+def get_sam_chunk_paths(chunk_dir, range_index, output_alpha_video):
+    chunk_base = f"chunk_{range_index:06d}"
+    paths = {
+        "green": os.path.join(chunk_dir, f"{chunk_base}_green.mp4"),
+        "sam_mask": os.path.join(chunk_dir, f"{chunk_base}_sam.mp4"),
+    }
+    if output_alpha_video:
+        paths["alpha"] = os.path.join(chunk_dir, f"{chunk_base}_alpha.mp4")
+    return paths
+
+
+def sam_chunk_is_complete(chunk_record, chunk_paths, output_alpha_video):
+    if not isinstance(chunk_record, dict):
+        return False
+    for key, chunk_path in chunk_paths.items():
+        if chunk_record.get(key) != chunk_path:
+            return False
+        if not os.path.isfile(chunk_path):
+            return False
+    if output_alpha_video and "alpha" not in chunk_record:
+        return False
+    return True
+
+
+def get_completed_sample_frames(state, frames_dir, expected_count):
+    if not is_completed(state, "sample_frames"):
+        return None
+    image_paths = state.get("image_paths", [])
+    if len(image_paths) != expected_count:
+        return None
+    for image_path in image_paths:
+        if not os.path.isfile(image_path):
+            return None
+    return image_paths
+
+
+def get_temp_path(path):
+    directory = os.path.dirname(path)
+    file_name = os.path.basename(path)
+    stem, extension = os.path.splitext(file_name)
+    return os.path.join(directory, f".{stem}.tmp{extension}")
+
+
+def remove_if_exists(path):
+    if os.path.exists(path):
+        os.remove(path)
 
 
 def extract_sample_frames(
@@ -716,6 +988,11 @@ def process_eye_with_sam(
     input_video_path,
     green_video_path,
     alpha_video_path,
+    sam_mask_video_path,
+    state,
+    state_path,
+    resume_input_video_path,
+    config,
     output_dir,
     video_stem,
     eye,
@@ -762,29 +1039,6 @@ def process_eye_with_sam(
     device = predictor["device"]
     dtype = predictor["dtype"]
 
-    green_writer = g.RawVideoWriter(
-        green_video_path,
-        width,
-        height,
-        fps,
-        codec="libx264",
-        crf=greenscreen_crf,
-        preset=greenscreen_preset,
-        pixel_format="yuv420p",
-    )
-    alpha_writer = None
-    if output_alpha_video:
-        alpha_writer = g.RawVideoWriter(
-            alpha_video_path,
-            width,
-            height,
-            fps,
-            codec="libx264",
-            crf=12,
-            preset="veryfast",
-            pixel_format="yuv420p",
-        )
-
     instance_writers = {}
     instance_records = {}
     previous_area = None
@@ -795,8 +1049,67 @@ def process_eye_with_sam(
     ranges = get_sam_chunk_ranges(
         frame_count, fps, sam_chunk_seconds, sam_chunk_overlap_seconds
     )
-    try:
-        for chunk_start, chunk_end, output_start in ranges:
+    chunk_dir = os.path.join(os.path.dirname(green_video_path), f"sam_{eye}_chunks")
+    os.makedirs(chunk_dir, exist_ok=True)
+    chunk_green_paths = []
+    chunk_alpha_paths = []
+    chunk_sam_mask_paths = []
+
+    for range_index, (chunk_start, chunk_end, output_start) in enumerate(ranges):
+        chunk_key = str(range_index)
+        chunk_record = get_sam_chunk_record(state, eye, chunk_key)
+        chunk_paths = get_sam_chunk_paths(chunk_dir, range_index, output_alpha_video)
+        chunk_green_paths.append(chunk_paths["green"])
+        if output_alpha_video:
+            chunk_alpha_paths.append(chunk_paths["alpha"])
+        chunk_sam_mask_paths.append(chunk_paths["sam_mask"])
+        if sam_chunk_is_complete(chunk_record, chunk_paths, output_alpha_video):
+            max_instances = max(max_instances, chunk_record.get("max_instances", 0))
+            qc_flags.extend(chunk_record.get("qc_flags", []))
+            previous_area = chunk_record.get("last_area", previous_area)
+            previous_present_count = chunk_record.get(
+                "last_present_count", previous_present_count
+            )
+            continue
+
+        for chunk_path in chunk_paths.values():
+            remove_if_exists(get_temp_path(chunk_path))
+
+        green_writer = g.RawVideoWriter(
+            get_temp_path(chunk_paths["green"]),
+            width,
+            height,
+            fps,
+            codec="libx264",
+            crf=greenscreen_crf,
+            preset=greenscreen_preset,
+            pixel_format="yuv420p",
+        )
+        alpha_writer = None
+        if output_alpha_video:
+            alpha_writer = g.RawVideoWriter(
+                get_temp_path(chunk_paths["alpha"]),
+                width,
+                height,
+                fps,
+                codec="libx264",
+                crf=12,
+                preset="veryfast",
+                pixel_format="yuv420p",
+            )
+        sam_mask_writer = g.RawVideoWriter(
+            get_temp_path(chunk_paths["sam_mask"]),
+            width,
+            height,
+            fps,
+            codec="libx264",
+            crf=12,
+            preset="veryfast",
+            pixel_format="yuv420p",
+        )
+        chunk_qc_flags = []
+        chunk_max_instances = 0
+        try:
             print(
                 f"==> eye {eye}: SAM frames {chunk_start}-{chunk_end - 1}, "
                 f"writing from {output_start}",
@@ -838,12 +1151,14 @@ def process_eye_with_sam(
                         skipped_local_frame_index = next_output_frame - chunk_start
                         skipped_frame_rgb = output_frames[skipped_local_frame_index]
                         depth_mask = read_depth_mask(depth_video, height, width)
+                        empty_sam_alpha = np.zeros((height, width), dtype=np.float32)
                         empty_alpha = apply_depth_mask(
-                            np.zeros((height, width), dtype=np.float32),
+                            empty_sam_alpha,
                             depth_mask,
                             depth_foreground_threshold,
                             depth_mask_border_shift,
                         )
+                        write_mask_frame(sam_mask_writer, empty_sam_alpha)
                         write_green_and_alpha(
                             green_writer, alpha_writer, skipped_frame_rgb, empty_alpha
                         )
@@ -855,7 +1170,7 @@ def process_eye_with_sam(
                     )
                     masks = tensor_to_numpy(processed_outputs.get("masks", None))
                     object_ids = tensor_to_list(processed_outputs.get("object_ids", []))
-                    combined_alpha, present_count = combine_masks(
+                    sam_alpha, present_count = combine_masks(
                         masks,
                         height,
                         width,
@@ -864,6 +1179,8 @@ def process_eye_with_sam(
                         sam_mask_border_shift,
                         sam_mask_overlap_gap_fill,
                     )
+                    write_mask_frame(sam_mask_writer, sam_alpha)
+                    combined_alpha = sam_alpha
                     combined_alpha = apply_depth_mask(
                         combined_alpha,
                         depth_mask,
@@ -871,6 +1188,7 @@ def process_eye_with_sam(
                         depth_mask_border_shift,
                     )
                     max_instances = max(max_instances, present_count)
+                    chunk_max_instances = max(chunk_max_instances, present_count)
                     write_green_and_alpha(
                         green_writer, alpha_writer, frame_rgb, combined_alpha
                     )
@@ -898,7 +1216,7 @@ def process_eye_with_sam(
                             previous_area,
                             previous_present_count,
                             qc_area_jump_threshold,
-                            qc_flags,
+                            chunk_qc_flags,
                         )
                         previous_area = area
                         previous_present_count = present_count
@@ -907,12 +1225,14 @@ def process_eye_with_sam(
                     skipped_local_frame_index = next_output_frame - chunk_start
                     skipped_frame_rgb = output_frames[skipped_local_frame_index]
                     depth_mask = read_depth_mask(depth_video, height, width)
+                    empty_sam_alpha = np.zeros((height, width), dtype=np.float32)
                     empty_alpha = apply_depth_mask(
-                        np.zeros((height, width), dtype=np.float32),
+                        empty_sam_alpha,
                         depth_mask,
                         depth_foreground_threshold,
                         depth_mask_border_shift,
                     )
+                    write_mask_frame(sam_mask_writer, empty_sam_alpha)
                     write_green_and_alpha(
                         green_writer, alpha_writer, skipped_frame_rgb, empty_alpha
                     )
@@ -926,13 +1246,46 @@ def process_eye_with_sam(
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-    finally:
-        green_writer.close()
-        if alpha_writer is not None:
-            alpha_writer.close()
-        for writer in instance_writers.values():
-            writer.close()
-        gc.collect()
+        finally:
+            green_writer.close()
+            if alpha_writer is not None:
+                alpha_writer.close()
+            sam_mask_writer.close()
+
+        os.replace(get_temp_path(chunk_paths["green"]), chunk_paths["green"])
+        if output_alpha_video:
+            os.replace(get_temp_path(chunk_paths["alpha"]), chunk_paths["alpha"])
+        os.replace(get_temp_path(chunk_paths["sam_mask"]), chunk_paths["sam_mask"])
+        qc_flags.extend(chunk_qc_flags)
+        set_sam_chunk_record(
+            state,
+            eye,
+            chunk_key,
+            {
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+                "output_start": output_start,
+                "green": chunk_paths["green"],
+                "alpha": chunk_paths.get("alpha"),
+                "sam_mask": chunk_paths["sam_mask"],
+                "max_instances": chunk_max_instances,
+                "qc_flags": chunk_qc_flags,
+                "last_area": previous_area,
+                "last_present_count": previous_present_count,
+            },
+        )
+        save_resume_state(
+            state_path, state, resume_input_video_path, video_stem, config
+        )
+
+    concat_videos(chunk_green_paths, green_video_path)
+    if output_alpha_video:
+        concat_videos(chunk_alpha_paths, alpha_video_path)
+    concat_videos(chunk_sam_mask_paths, sam_mask_video_path)
+
+    for writer in instance_writers.values():
+        writer.close()
+    gc.collect()
 
     return {
         "max_instances": max_instances,
@@ -1036,6 +1389,11 @@ def write_green_and_alpha(green_writer, alpha_writer, frame_rgb, alpha):
         return
     alpha_u8 = np.round(alpha * 255.0).clip(0, 255).astype(np.uint8)
     alpha_writer.write(cv2.cvtColor(alpha_u8, cv2.COLOR_GRAY2RGB))
+
+
+def write_mask_frame(mask_writer, alpha):
+    alpha_u8 = np.round(alpha * 255.0).clip(0, 255).astype(np.uint8)
+    mask_writer.write(cv2.cvtColor(alpha_u8, cv2.COLOR_GRAY2RGB))
 
 
 def tensor_to_numpy(value):
@@ -1249,6 +1607,33 @@ def hstack_videos(left_path, right_path, output_path, overwrite=False):
         output_path,
     ]
     g.run_command(command)
+
+
+def concat_videos(input_paths, output_path):
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    directory = os.path.dirname(output_path) or "."
+    file_name = os.path.basename(output_path)
+    list_path = os.path.join(directory, f".{os.path.splitext(file_name)[0]}_concat.txt")
+    with open(list_path, "w", encoding="utf-8") as file:
+        for input_path in input_paths:
+            file.write(f"file '{os.path.abspath(input_path)}'\n")
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        list_path,
+        "-c",
+        "copy",
+        output_path,
+    ]
+    try:
+        g.run_command(command)
+    finally:
+        remove_if_exists(list_path)
 
 
 def get_hex_color(green_color):

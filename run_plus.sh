@@ -98,6 +98,7 @@ run_greenscreen() {
 			continue
 		fi
 		python -m plus.s3_greenscreen --input_video_path "$input_path" --output_dir "$TMP_DIR" --output_video_path "$output_path"
+		# python -m plus.s3_greenscreen --input_video_path "$input_path" --output_dir "$TMP_DIR" --output_video_path "$output_path" --prompt_override "['person', 'cat', 'chair']"
 	done
 	advance_inputs 3_green
 }
