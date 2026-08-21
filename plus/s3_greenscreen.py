@@ -49,14 +49,14 @@ def main(
     sam_video_preset: str = "veryfast",
     sam_compile: bool = False,
     output_alpha_video: bool = True,
-    sam_mask_close_kernel: int = 0, # 9
+    sam_mask_close_kernel: int = 0,  # 9
     sam_mask_border_shift: int = 1,
     sam_mask_overlap_gap_fill: int = 30,
     qc_frame_interval: int = 15,
     qc_area_jump_threshold: float = 0.40,
     greenscreen_crf: int = 18,
     greenscreen_preset: str = "medium",
-    depth_foreground_threshold: float = 0.2,
+    depth_foreground_threshold: float = 0.0,
     depth_mask_border_shift: int = -4,
     depthcrafter_unet_path: str = str(g.DEPTHCRAFTER_UNET_PATH),
     depthcrafter_pre_trained_path: str = str(g.SVD_CHECKPOINTS_PATH),
@@ -1424,7 +1424,8 @@ def process_eye_with_sam(
         chunk_max_instances = 0
         try:
             print(
-                f"==> eye {eye}: SAM frames {chunk_start}-{chunk_end - 1}, "
+                f"==> eye {eye}: SAM chunk {range_index + 1}/{len(ranges)} "
+                f"frames {chunk_start}-{chunk_end - 1}, "
                 f"writing from {output_start}",
                 flush=True,
             )
@@ -1458,6 +1459,19 @@ def process_eye_with_sam(
                 ):
                     local_frame_index = int(model_outputs.frame_idx)
                     frame_index = chunk_start + local_frame_index
+                    processed = local_frame_index + 1
+                    chunk_total = len(video_frames)
+                    if (
+                        processed == 1
+                        or processed == chunk_total
+                        or processed % 10 == 0
+                    ):
+                        print(
+                            f"==> eye {eye}: SAM chunk {range_index + 1}/{len(ranges)} "
+                            f"frame {processed}/{chunk_total} "
+                            f"(video frame {frame_index + 1}/{frame_count})",
+                            flush=True,
+                        )
                     if frame_index < output_start:
                         continue
                     while next_output_frame < frame_index:
